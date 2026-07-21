@@ -81,6 +81,11 @@ pub fn build(b: *std.Build) !void {
     const resources = try buildpkg.GhosttyResources.init(b, &config, &deps);
     const i18n = if (config.i18n) try buildpkg.GhosttyI18n.init(b, &config) else null;
 
+    // Settings schema for the macOS Settings window. Bundled via the
+    // existing zig-out/share/ghostty folder reference in the pbxproj.
+    const settings_data = try buildpkg.GhosttySettingsData.init(b, &deps);
+    settings_data.install();
+
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
 
@@ -233,6 +238,7 @@ pub fn build(b: *std.Build) !void {
                 .docs = &docs,
                 .i18n = if (i18n) |v| &v else null,
                 .resources = &resources,
+                .settings_data = &settings_data,
             },
         );
         if (config.emit_macos_app) {
@@ -280,6 +286,7 @@ pub fn build(b: *std.Build) !void {
                     .docs = &docs,
                     .i18n = if (i18n) |v| &v else null,
                     .resources = &resources,
+                    .settings_data = &settings_data,
                 },
             );
 

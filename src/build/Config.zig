@@ -688,6 +688,7 @@ pub const ExeEntrypoint = enum {
     webgen_config,
     webgen_actions,
     webgen_commands,
+    settingsgen,
 };
 
 /// The release channel for the build.

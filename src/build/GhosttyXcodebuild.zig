@@ -7,6 +7,7 @@ const Config = @import("Config.zig");
 const Docs = @import("GhosttyDocs.zig");
 const I18n = @import("GhosttyI18n.zig");
 const Resources = @import("GhosttyResources.zig");
+const SettingsData = @import("GhosttySettingsData.zig");
 const XCFramework = @import("GhosttyXCFramework.zig");
 
 build: *std.Build.Step.Run,
@@ -19,6 +20,7 @@ pub const Deps = struct {
     docs: *const Docs,
     i18n: ?*const I18n,
     resources: *const Resources,
+    settings_data: *const SettingsData,
 };
 
 pub fn init(
@@ -81,6 +83,7 @@ pub fn init(
         // We also need all these resources because the xcode project
         // references them via symlinks.
         deps.resources.addStepDependencies(&step.step);
+        deps.settings_data.addStepDependencies(&step.step);
         if (deps.i18n) |v| v.addStepDependencies(&step.step);
         deps.docs.installDummy(&step.step);
 
@@ -115,6 +118,7 @@ pub fn init(
         // We also need all these resources because the xcode project
         // references them via symlinks.
         deps.resources.addStepDependencies(&step.step);
+        deps.settings_data.addStepDependencies(&step.step);
         if (deps.i18n) |v| v.addStepDependencies(&step.step);
         deps.docs.installDummy(&step.step);
 
