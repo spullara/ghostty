@@ -34,6 +34,10 @@ pub fn main() !void {
 
     try ws.objectField("options");
     try ws.beginArray();
+    // Emitting option metadata walks every Config field at comptime via this
+    // inline for. The quota was picked by trial and error to cover today's
+    // roughly 200-field Config with headroom. If Zig reports "evaluation
+    // exceeded backwards branches" here after adding config fields, raise it.
     @setEvalBranchQuota(200_000);
     inline for (@typeInfo(Config).@"struct".fields) |field| {
         if (field.name[0] != '_') try emitOption(alloc, &ws, &cfg, field);
