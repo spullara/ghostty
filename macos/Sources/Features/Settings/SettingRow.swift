@@ -13,8 +13,9 @@ struct SettingRow: View {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text(option.name)
-                            .font(.system(.body, design: .monospaced))
+                        Text(option.displayName)
+                            .font(.body)
+                            .help(option.name)
                         if model.isOverridden(option) {
                             Circle()
                                 .fill(Color.accentColor)
@@ -29,6 +30,15 @@ struct SettingRow: View {
                                 .clipShape(Capsule())
                                 .foregroundStyle(.secondary)
                                 .help("This option only applies to \(badge).")
+                        }
+                        if SettingsViewModel.isSurfaceOnly(option.name) {
+                            Text("New window")
+                                .font(.caption2).fontWeight(.medium)
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(Color.blue.opacity(0.15))
+                                .clipShape(Capsule())
+                                .foregroundStyle(.blue)
+                                .help("Changes to this setting only take effect for new terminals.")
                         }
                     }
                     if !option.docs.isEmpty {

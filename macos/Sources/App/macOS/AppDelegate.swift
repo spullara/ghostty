@@ -175,6 +175,10 @@ class AppDelegate: NSObject,
         vm.onOverlayChange = { [weak self] in
             self?.ghostty.reloadConfig()
         }
+        vm.onRequestNewWindow = { [weak self] in
+            guard let self else { return }
+            _ = TerminalController.newWindow(self.ghostty)
+        }
         _settingsViewModel = vm
         return vm
     }

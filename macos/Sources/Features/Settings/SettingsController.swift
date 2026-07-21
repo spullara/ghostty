@@ -42,6 +42,7 @@ final class SettingsController: NSWindowController, NSWindowDelegate {
             let vm = appDelegate.settingsViewModel(schema: schema)
             vm.refreshEffectiveValues(config: appDelegate.ghostty.config)
             vm.updateDiagnostics(from: appDelegate.ghostty.config)
+            vm.acknowledgeRestartHint()
         }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)

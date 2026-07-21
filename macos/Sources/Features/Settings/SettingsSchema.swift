@@ -87,7 +87,58 @@ struct SettingsSchema: Decodable {
             self.signed = try c.decodeIfPresent(Bool.self, forKey: .signed)
             self.specialValues = try c.decodeIfPresent([String].self, forKey: .specialValues)
         }
+
+        /// A human-readable rendering of ``name`` suitable for row
+        /// labels. Derived by title-casing the dashed key and applying
+        /// a small acronym override table so `macos-titlebar-style`
+        /// becomes "macOS Titlebar Style" rather than "Macos Titlebar
+        /// Style". The raw ``name`` is still the authoritative key and
+        /// should remain accessible on hover.
+        var displayName: String {
+            SettingsSchema.humanize(name)
+        }
     }
+
+    /// Convert a dashed config key such as `macos-titlebar-style` into
+    /// a human-readable title such as "macOS Titlebar Style". Known
+    /// acronyms and product names keep their canonical casing.
+    static func humanize(_ key: String) -> String {
+        key.split(separator: "-").map { part -> String in
+            let lower = part.lowercased()
+            if let override = acronymOverrides[lower] { return override }
+            guard let first = part.first else { return "" }
+            return first.uppercased() + part.dropFirst().lowercased()
+        }.joined(separator: " ")
+    }
+
+    /// Lowercased dashed-segment overrides applied by ``humanize``.
+    private static let acronymOverrides: [String: String] = [
+        "macos": "macOS",
+        "ios": "iOS",
+        "gtk": "GTK",
+        "kde": "KDE",
+        "x11": "X11",
+        "osc": "OSC",
+        "vt": "VT",
+        "csi": "CSI",
+        "sgr": "SGR",
+        "utf8": "UTF-8",
+        "url": "URL",
+        "ui": "UI",
+        "cli": "CLI",
+        "tls": "TLS",
+        "ssh": "SSH",
+        "cwd": "CWD",
+        "id": "ID",
+        "ipc": "IPC",
+        "api": "API",
+        "http": "HTTP",
+        "png": "PNG",
+        "rgb": "RGB",
+        "rgba": "RGBA",
+        "dpi": "DPI",
+        "srgb": "sRGB",
+    ]
 
     /// The classification used to pick a UI control for a given option.
     /// Must stay in sync with the `kind` strings emitted by

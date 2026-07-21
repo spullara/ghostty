@@ -24,6 +24,12 @@ struct SettingsRootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            SettingsSearchBar(
+                text: $model.search,
+                focused: $searchFocused
+            )
+            Divider()
+
             NavigationSplitView {
                 sidebar
             } detail: {
@@ -32,6 +38,10 @@ struct SettingsRootView: View {
             }
             .navigationSplitViewStyle(.balanced)
             .frame(minWidth: 820, minHeight: 560)
+
+            if !model.pendingSurfaceOnlyChanges.isEmpty {
+                RestartHintBar(model: model)
+            }
 
             if !model.diagnostics.isEmpty {
                 DiagnosticsBar(diagnostics: model.diagnostics)
@@ -72,19 +82,128 @@ struct SettingsRootView: View {
 
     @ViewBuilder
     private var detail: some View {
-        switch model.selectedItem {
-        case .category:
-            SettingsCategoryDetail(model: model, searchFocused: $searchFocused)
-        case .configFile:
-            ConfigFilePaneView(model: model, ghostty: appDelegate.ghostty)
+        if !model.activeQuery.isEmpty {
+            SettingsSearchResultsView(model: model)
+        } else {
+            switch model.selectedItem {
+            case .category:
+                SettingsCategoryDetail(model: model)
+            case .configFile:
+                ConfigFilePaneView(model: model, ghostty: appDelegate.ghostty)
+            }
         }
     }
 }
 
-/// Right-hand pane: category title + search bar + scrolling list.
+/// Persistent search bar shown at the top of the Settings window so
+/// it's reachable from every pane (including the Configuration File
+/// editor). Typing here switches the detail pane to a global
+/// results view that spans every category.
+struct SettingsSearchBar: View {
+    @Binding var text: String
+    var focused: FocusState<Bool>.Binding
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Search all settings", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .focused(focused)
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Clear search")
+            }
+            // Hidden button that binds Cmd+F to focus the search field.
+            Button("Focus Search") { focused.wrappedValue = true }
+                .keyboardShortcut("f", modifiers: [.command])
+                .opacity(0)
+                .frame(width: 0, height: 0)
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+}
+
+/// Detail pane shown when the search field has text. Groups the hits
+/// by category so users can see where each option lives; category
+/// headers are click-through so they can jump straight to that
+/// category's full list.
+struct SettingsSearchResultsView: View {
+    @ObservedObject var model: SettingsViewModel
+
+    var body: some View {
+        let groups = model.globalSearchResults
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Search results for \u{201C}\(model.search)\u{201D}")
+                    .font(.title3).fontWeight(.semibold)
+                Spacer()
+                let total = groups.reduce(0) { $0 + $1.1.count }
+                Text("\(total) match\(total == 1 ? "" : "es")")
+                    .foregroundStyle(.secondary)
+                    .font(.callout)
+            }
+            .padding([.horizontal, .top])
+
+            Divider().padding(.top, 8)
+
+            if groups.isEmpty {
+                VStack(spacing: 8) {
+                    Text("No settings match your search.")
+                        .foregroundStyle(.secondary)
+                    Button("Clear search") { model.search = "" }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding()
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(groups, id: \.0) { (cat, options) in
+                            Button {
+                                model.selectedItem = .category(cat)
+                                model.search = ""
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: cat.systemImage)
+                                        .foregroundStyle(.secondary)
+                                    Text(cat.title).font(.headline)
+                                    Text("(\(options.count))")
+                                        .foregroundStyle(.secondary)
+                                        .font(.subheadline)
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .foregroundStyle(.tertiary)
+                                        .font(.caption)
+                                }
+                                .contentShape(Rectangle())
+                                .padding(.horizontal)
+                                .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Jump to \(cat.title)")
+                            Divider()
+                            ForEach(options) { option in
+                                SettingRow(option: option, model: model)
+                                Divider()
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+    }
+}
+
+/// Right-hand pane: category title + scrolling list of options.
 struct SettingsCategoryDetail: View {
     @ObservedObject var model: SettingsViewModel
-    var searchFocused: FocusState<Bool>.Binding
 
     @State private var showResetConfirm = false
 
@@ -99,36 +218,13 @@ struct SettingsCategoryDetail: View {
             }
             .padding([.horizontal, .top])
 
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search settings", text: $model.search)
-                    .textFieldStyle(.roundedBorder)
-                    .focused(searchFocused)
-                if !model.search.isEmpty {
-                    Button {
-                        model.search = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                }
-                // Hidden button that binds Cmd+F to focus the search field.
-                Button("Focus Search") { searchFocused.wrappedValue = true }
-                    .keyboardShortcut("f", modifiers: [.command])
-                    .opacity(0)
-                    .frame(width: 0, height: 0)
-            }
-            .padding(.horizontal)
-            .padding(.top, 8)
-
-            Divider()
+            Divider().padding(.top, 8)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     let options = model.visibleOptions
                     if options.isEmpty {
-                        Text("No settings match your search.")
+                        Text("This category is empty.")
                             .foregroundStyle(.secondary)
                             .padding()
                     } else {
@@ -158,6 +254,41 @@ struct SettingsCategoryDetail: View {
     private var currentCategory: SettingsCategory? {
         if case .category(let c) = model.selectedItem { return c }
         return nil
+    }
+}
+
+/// Bottom bar shown when the user has changed one or more settings
+/// that only take effect for new terminals/windows. Offers a button
+/// that opens a fresh terminal so the change becomes visible without
+/// the user having to quit the app.
+struct RestartHintBar: View {
+    @ObservedObject var model: SettingsViewModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    let count = model.pendingSurfaceOnlyChanges.count
+                    Text("\(count) change\(count == 1 ? "" : "s") need a new terminal")
+                        .font(.callout).fontWeight(.medium)
+                    Text(model.pendingSurfaceOnlyChanges.sorted().joined(separator: ", "))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(2).truncationMode(.tail)
+                }
+                Spacer()
+                Button("Dismiss") { model.acknowledgeRestartHint() }
+                Button("Open New Window") {
+                    model.onRequestNewWindow?()
+                    model.acknowledgeRestartHint()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(8)
+            .background(Color.blue.opacity(0.08))
+        }
     }
 }
 
