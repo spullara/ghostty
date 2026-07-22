@@ -106,30 +106,30 @@ struct SettingsEditorTests {
         store.set("theme", valueText: "theme = Dracula\n")
         store.set("font-family", valueText: "font-family = Menlo\nfont-family = Fira Code\n")
 
-        let reparsed = OverlayConfigStore.parse(url: tmp)
-        #expect(reparsed["theme"] == "theme = Dracula\n")
-        #expect(reparsed["font-family"] == "font-family = Menlo\nfont-family = Fira Code\n")
+        let reparsed = OverlayConfigStore(url: tmp)
+        #expect(reparsed.entries["theme"] == "theme = Dracula\n")
+        #expect(reparsed.entries["font-family"] == "font-family = Menlo\nfont-family = Fira Code\n")
 
         store.remove("theme")
-        let after = OverlayConfigStore.parse(url: tmp)
-        #expect(after["theme"] == nil)
-        #expect(after["font-family"] != nil)
+        let after = OverlayConfigStore(url: tmp)
+        #expect(after.entries["theme"] == nil)
+        #expect(after.entries["font-family"] != nil)
 
         try? FileManager.default.removeItem(at: tmp)
     }
 
-    @Test func overlaySerializationIsDeterministic() {
-        let entries = [
-            "z-key": "z-key = zzz\n",
-            "a-key": "a-key = aaa\n",
-            "m-key": "m-key = mmm\n",
+    @Test func overlaySerializationPreservesOrder() {
+        let entries: [OverlayConfigStore.Block] = [
+            .entry(key: "z-key", text: "z-key = zzz\n"),
+            .entry(key: "a-key", text: "a-key = aaa\n"),
+            .entry(key: "m-key", text: "m-key = mmm\n"),
         ]
         let out = OverlayConfigStore.serialize(entries: entries)
-        // Alphabetical order — critical for stable diffs.
+        // File order is critical for preserving hand-edited overlays.
         let a = out.range(of: "a-key")!.lowerBound
         let m = out.range(of: "m-key")!.lowerBound
         let z = out.range(of: "z-key")!.lowerBound
+        #expect(z < a)
         #expect(a < m)
-        #expect(m < z)
     }
 }

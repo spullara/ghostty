@@ -9,21 +9,45 @@ import OSLog
 /// ``Ghostty.Config.loadConfig`` so its values always win — matching
 /// the plan's GUI-wins policy.
 ///
-/// Each entry is a single logical setting whose text value is the
+/// Each entry block is a single logical setting whose text value is the
 /// canonical form produced by `ghostty_config_get_value_text`
 /// (possibly multiple `key = ...` lines for repeatable options). We
 /// only track which keys the GUI is overriding; unset keys fall
 /// through to the user's `config.ghostty` (or defaults).
 final class OverlayConfigStore: ObservableObject {
+    /// A line-preserving representation of the overlay file.
+    enum Block: Equatable {
+        case entry(key: String, text: String)
+        case comment(text: String)
+        case blank
+    }
+
     /// Shared instance used both by the Settings UI and by
     /// ``Ghostty.Config.loadConfig`` so both sides see the same
     /// entries without threading through the app delegate.
     static let shared = OverlayConfigStore()
 
-    /// Per-key text as it will be written to the overlay file. The
-    /// value must already be in canonical config-file form (i.e.
-    /// end with a newline; multi-line for repeatable types).
-    @Published private(set) var entries: [String: String] = [:]
+    /// File blocks as they will be written to the overlay file. Entry
+    /// values must already be in canonical config-file form (i.e. end
+    /// with a newline; multi-line for repeatable types).
+    @Published private(set) var blocks: [Block] = []
+
+    /// Whether the on-disk file ended with a trailing newline. Preserved
+    /// so that a parse/serialize round-trip is byte-exact for
+    /// hand-edited files that omit the final newline. New files written
+    /// by ``persist()`` always include the trailing newline.
+    private var hasTrailingNewline: Bool = true
+
+    /// Per-key text grouped for callers that need the old dictionary
+    /// interface. Repeatable keys are concatenated in file order.
+    var entries: [String: String] {
+        var out: [String: String] = [:]
+        for block in blocks {
+            guard case let .entry(key, text) = block else { continue }
+            out[key, default: ""] += text
+        }
+        return out
+    }
 
     /// Absolute path to the overlay file. Resolved lazily on first
     /// access so tests can stub it.
@@ -46,7 +70,9 @@ final class OverlayConfigStore: ObservableObject {
 
     init(url: URL = OverlayConfigStore.defaultURL()) {
         self.url = url
-        self.entries = Self.parse(url: url)
+        let parsed = Self.parseFile(url: url)
+        self.blocks = parsed.blocks
+        self.hasTrailingNewline = parsed.hasTrailingNewline
     }
 
     /// The default overlay path, matching Ghostty's own default
@@ -70,22 +96,50 @@ final class OverlayConfigStore: ObservableObject {
     /// output of `ghostty_config_get_value_text` (already includes
     /// the trailing newline and any repeated `key = ...` lines).
     func set(_ key: String, valueText: String) {
-        entries[key] = valueText
+        var didReplace = false
+        var next: [Block] = []
+        for block in blocks {
+            guard case let .entry(existingKey, _) = block, existingKey == key else {
+                next.append(block)
+                continue
+            }
+
+            if !didReplace, !valueText.isEmpty {
+                next.append(.entry(key: key, text: valueText))
+            }
+            didReplace = true
+        }
+
+        if !didReplace, !valueText.isEmpty {
+            next.append(.entry(key: key, text: valueText))
+        }
+
+        guard next != blocks else { return }
+        blocks = next
         persist()
     }
 
     /// Remove any override for `key`, restoring the value from the
     /// user's primary config (or the built-in default).
     func remove(_ key: String) {
-        guard entries.removeValue(forKey: key) != nil else { return }
+        let next = blocks.filter { block in
+            guard case let .entry(existingKey, _) = block else { return true }
+            return existingKey != key
+        }
+        guard next.count != blocks.count else { return }
+        blocks = next
         persist()
     }
 
     /// Drop all overrides. Primarily useful for a "reset all"
     /// affordance and tests.
     func removeAll() {
-        guard !entries.isEmpty else { return }
-        entries.removeAll()
+        let next = blocks.filter { block in
+            guard case .entry = block else { return true }
+            return false
+        }
+        guard next.count != blocks.count else { return }
+        blocks = next
         persist()
     }
 
@@ -97,8 +151,11 @@ final class OverlayConfigStore: ObservableObject {
     /// overlay file forgiving without polluting the diagnostics bar
     /// with our own noise. Used by ``Ghostty.Config.loadConfig``.
     func loadText() -> String {
-        let parsed = Self.parse(url: url)
-        return Self.serialize(entries: parsed)
+        let parsed = Self.parseFile(url: url)
+        return Self.serialize(
+            entries: parsed.blocks,
+            trailingNewline: parsed.hasTrailingNewline
+        )
     }
 
     /// Serialize `entries` and write to disk. Best-effort: I/O
@@ -110,7 +167,11 @@ final class OverlayConfigStore: ObservableObject {
             try FileManager.default.createDirectory(
                 at: dir, withIntermediateDirectories: true
             )
-            let body = Self.header + Self.serialize(entries: entries)
+            // Any GUI-driven write normalizes to a trailing newline so
+            // the file stays well-formed even if it was hand-edited
+            // without one previously.
+            hasTrailingNewline = true
+            let body = Self.bodyWithHeader(for: blocks)
             try body.data(using: .utf8)?.write(to: url, options: .atomic)
         } catch {
             Self.logger.error(
@@ -119,43 +180,87 @@ final class OverlayConfigStore: ObservableObject {
         }
     }
 
-    /// Deterministic serialization: keys sorted alphabetically so
-    /// diffs stay stable. Values are already canonical text and end
-    /// with a newline.
-    static func serialize(entries: [String: String]) -> String {
+    /// Serialize blocks in file order. Entry values are already
+    /// canonical text and should end with a newline. Pass
+    /// `trailingNewline: false` to reproduce a source file whose last
+    /// line lacked a newline (used by ``loadText`` to preserve
+    /// hand-edited files byte-for-byte).
+    static func serialize(
+        entries blocks: [Block],
+        trailingNewline: Bool = true
+    ) -> String {
         var out = ""
-        for key in entries.keys.sorted() {
-            let text = entries[key] ?? ""
-            out += text
-            if !text.hasSuffix("\n") { out += "\n" }
+        for block in blocks {
+            switch block {
+            case let .entry(_, text):
+                out += text
+                if !text.hasSuffix("\n") { out += "\n" }
+            case let .comment(text):
+                out += text
+                if !text.hasSuffix("\n") { out += "\n" }
+            case .blank:
+                out += "\n"
+            }
+        }
+        if !trailingNewline, out.hasSuffix("\n") {
+            out.removeLast()
         }
         return out
     }
 
-    /// Parse an overlay file back into `[key: canonical text]`. We
-    /// intentionally do a minimal line-oriented parse here — Zig's
-    /// config loader is authoritative for actual value validation;
-    /// this only needs to reproduce what we wrote so the GUI can
-    /// tell which keys are overridden.
-    static func parse(url: URL) -> [String: String] {
+    /// Include Ghostty's managed-file header unless the file already
+    /// starts with it. This avoids duplicating the header on every save.
+    private static func bodyWithHeader(for blocks: [Block]) -> String {
+        let text = Self.serialize(entries: blocks)
+        guard !text.hasPrefix(Self.header) else { return text }
+        return Self.header + text
+    }
+
+    /// Read and parse an overlay file, returning both the block list
+    /// and whether the on-disk file ended with a trailing newline. The
+    /// latter is preserved so ``loadText`` can round-trip hand-edited
+    /// files that omit the final newline.
+    static func parseFile(url: URL) -> (blocks: [Block], hasTrailingNewline: Bool) {
         guard let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else {
-            return [:]
+            return ([], true)
         }
-        var out: [String: String] = [:]
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = String(rawLine)
+        return (parse(text: text), text.isEmpty || text.hasSuffix("\n"))
+    }
+
+    /// Parse overlay text into blocks. We intentionally do a minimal
+    /// line-oriented parse here — Zig's config loader is authoritative
+    /// for actual value validation; this only needs to reproduce valid
+    /// config lines and file structure so the GUI can tell which keys
+    /// are overridden without discarding comments or blank lines.
+    static func parse(text: String) -> [Block] {
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        if text.hasSuffix("\n"), !lines.isEmpty {
+            lines.removeLast()
+        }
+
+        var out: [Block] = []
+        for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            if trimmed.isEmpty {
+                out.append(.blank)
+                continue
+            }
+            if trimmed.hasPrefix("#") {
+                out.append(.comment(text: line))
+                continue
+            }
             guard let eq = line.firstIndex(of: "=") else { continue }
             let key = line[..<eq].trimmingCharacters(in: .whitespaces)
             guard !key.isEmpty else { continue }
             let entry = line + "\n"
-            if var existing = out[key] {
-                existing += entry
-                out[key] = existing
+            if let last = out.last,
+               case let .entry(previousKey, text) = last,
+               previousKey == key {
+                out[out.count - 1] = .entry(key: key, text: text + entry)
             } else {
-                out[key] = entry
+                out.append(.entry(key: key, text: entry))
             }
         }
         return out

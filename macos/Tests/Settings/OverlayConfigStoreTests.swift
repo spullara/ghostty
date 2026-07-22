@@ -57,15 +57,61 @@ struct OverlayConfigStoreTests {
         #expect(store.loadText().isEmpty)
     }
 
-    /// Deterministic serialisation: entries are emitted in
-    /// alphabetical key order so overlay-file diffs stay stable.
-    @Test func serializeSortsKeys() {
-        let text = OverlayConfigStore.serialize(entries: [
-            "theme": "theme = GruvboxDark\n",
-            "font-size": "font-size = 14\n",
-        ])
-        let lines = text.split(separator: "\n").map(String.init)
-        #expect(lines == ["font-size = 14", "theme = GruvboxDark"])
+    /// Serialisation preserves file order, comments, and blank lines.
+    @Test func parseSerializePreservesStructure() throws {
+        let url = Self.tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let original = """
+        # Custom note
+
+        theme = Dracula
+        # Keybindings
+        keybind = ctrl+a=copy_to_clipboard
+        keybind = ctrl+v=paste_from_clipboard
+        font-size = 14
+        """
+        try original.write(to: url, atomically: true, encoding: .utf8)
+
+        let parsed = OverlayConfigStore.parseFile(url: url)
+        #expect(OverlayConfigStore.serialize(
+            entries: parsed.blocks,
+            trailingNewline: parsed.hasTrailingNewline
+        ) == original)
+
+        let reloaded = OverlayConfigStore(url: url)
+        // Entry values are canonical config text and always terminate
+        // with a newline, regardless of whether the source file did.
+        let keybinds = """
+        keybind = ctrl+a=copy_to_clipboard
+        keybind = ctrl+v=paste_from_clipboard
+
+        """
+        #expect(reloaded.entries["keybind"] == keybinds)
+    }
+
+    /// New GUI-written entries are appended instead of reordering the
+    /// whole file alphabetically.
+    @Test func setAppendsNewEntryWithoutSorting() throws {
+        let url = Self.tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let original = """
+        z-key = zzz
+        # Keep this comment with the existing entry.
+
+        """
+        try original.write(to: url, atomically: true, encoding: .utf8)
+
+        let store = OverlayConfigStore(url: url)
+        store.set("a-key", valueText: "a-key = aaa\n")
+
+        let saved = try String(contentsOf: url, encoding: .utf8)
+        let z = saved.range(of: "z-key = zzz")!.lowerBound
+        let comment = saved.range(of: "# Keep this comment")!.lowerBound
+        let a = saved.range(of: "a-key = aaa")!.lowerBound
+        #expect(z < comment)
+        #expect(comment < a)
     }
 
     private static func tempURL() -> URL {
