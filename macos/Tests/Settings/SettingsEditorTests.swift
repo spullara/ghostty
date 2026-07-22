@@ -30,6 +30,19 @@ struct SettingsEditorTests {
         #expect(parsed.count == 3)
     }
 
+    @Test func paletteParsesZigColorSyntax() {
+        let text = """
+        palette = 5=red
+        palette = 6=rgb:0/f/0
+        """
+        let parsed = PaletteEditorView.parsePaletteLines(text, key: "palette")
+        #expect(parsed.count == 2)
+        #expect(parsed[0].0 == 5)
+        #expect(ColorSettingControl.hex(from: parsed[0].1) == "#ff0000")
+        #expect(parsed[1].0 == 6)
+        #expect(ColorSettingControl.hex(from: parsed[1].1) == "#00ff00")
+    }
+
     @Test func paletteIgnoresOtherKeys() {
         let text = """
         background = #ff00ff
