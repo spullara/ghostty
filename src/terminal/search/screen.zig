@@ -928,7 +928,8 @@ pub const ScreenSearch = struct {
 
 test "simple search" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 2 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 2 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -972,7 +973,8 @@ test "simple search" {
 
 test "simple search with history" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1013,7 +1015,8 @@ test "simple search with history" {
 
 test "reload active with history change" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1099,7 +1102,8 @@ test "reload active with history change" {
 
 test "active change contents" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 5 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 5 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1139,7 +1143,8 @@ test "active change contents" {
 
 test "select next" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 2 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 2 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1198,7 +1203,8 @@ test "select next" {
 
 test "select after resize resets stale flattened results" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 3,
         .max_scrollback = std.math.maxInt(usize),
@@ -1232,7 +1238,8 @@ test "select after resize resets stale flattened results" {
 
 test "select in active changes contents completely" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 5 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 5 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1296,7 +1303,8 @@ test "select in active changes contents completely" {
 
 test "select into history" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1368,7 +1376,8 @@ test "select into history" {
 
 test "select prev" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 2 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 2 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1427,7 +1436,8 @@ test "select prev" {
 
 test "select prev then next" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 2 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 2 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1471,7 +1481,8 @@ test "select prev then next" {
 
 test "select prev with history" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1525,7 +1536,8 @@ test "select prev wraps when all matches are in history" {
     // has none, so active_len == 0), selecting prev from index 0 must wrap
     // to the last result without underflowing `active_len - 1`.
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1561,7 +1573,8 @@ test "select after all matches disappear drops the selection" {
     // reload/prune empties the results, the selection is dropped, so the next
     // select() hits the "no matches" guard instead of the wrap arithmetic.
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 2 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 2 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1588,7 +1601,8 @@ test "select after all matches disappear drops the selection" {
 
 test "select after partial history erase drops a pruned selection" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1620,7 +1634,8 @@ test "select after partial history erase drops a pruned selection" {
 
 test "select after history compaction ignores replaced results" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1654,7 +1669,8 @@ test "select after history compaction ignores replaced results" {
 
 test "select after partial history page erase ignores shifted results" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1687,7 +1703,8 @@ test "select after partial history page erase ignores shifted results" {
 
 test "reload defers pruning unselected history results" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1721,7 +1738,8 @@ test "reload defers pruning unselected history results" {
 
 test "reload after partial history page erase drops shifted selection first" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1759,7 +1777,8 @@ test "reload after partial history page erase drops shifted selection first" {
 
 test "select after history page split ignores moved results" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1792,7 +1811,8 @@ test "select after history page split ignores moved results" {
 
 test "screen search no scrollback has no history" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = 0,
@@ -1828,7 +1848,8 @@ test "reloadActive partial history cleanup on appendSlice error" {
     // This test verifies that when reloadActive fails at appendSlice (after
     // the loop), all FlattenedHighlight items are properly cleaned up.
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1875,7 +1896,8 @@ test "reloadActive partial history cleanup on loop append error" {
     // (after some items have been appended), all FlattenedHighlight items
     // are properly cleaned up.
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),
@@ -1921,7 +1943,8 @@ test "select after clearing scrollback" {
     // Regression test for: https://github.com/ghostty-org/ghostty/issues/11957
     // After clearing scrollback (CSI 3J), selecting next/prev should not crash.
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
         .max_scrollback = std.math.maxInt(usize),

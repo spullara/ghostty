@@ -14,10 +14,8 @@ const KeyRemapSet = @import("../../input/key_mods.zig").RemapSet;
 const formatter = @import("../../config/formatter.zig");
 const help_strings = @import("help_strings");
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.arena.allocator();
 
     // Real default config so formatEntry produces canonical text for
     // every field.
@@ -25,7 +23,7 @@ pub fn main() !void {
     defer cfg.deinit();
 
     var buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&buffer);
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &buffer);
     const stdout = &stdout_writer.interface;
 
     var ws: std.json.Stringify = .{ .writer = stdout, .options = .{} };

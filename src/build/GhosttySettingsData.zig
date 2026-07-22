@@ -27,12 +27,15 @@ pub fn init(
             .omit_frame_pointer = false,
             .unwind_tables = .sync,
         }),
+        // The self-hosted x86_64 backend currently crashes when compiling
+        // this comptime-heavy generator on the 0.16.0 toolchain.
+        .use_llvm = true,
     });
     deps.help_strings.addImport(exe);
 
-    // Iterating @typeInfo(KeybindAction) forces analysis of the full
-    // Binding.zig file which references the uucode module.
-    deps.addUucode(b, exe.root_module, target, optimize);
+    // The uucode module is now automatically added by deps.add() below,
+    // but we need to ensure deps.add() is called for this exe.
+    exe.root_module.addImport("uucode", deps.uucode_mod);
 
     {
         const buildconfig = config: {
@@ -47,7 +50,7 @@ pub fn init(
     }
 
     const run = b.addRunArtifact(exe);
-    const schema = run.captureStdOut();
+    const schema = run.captureStdOut(.{});
     const schema_check = b.addCheckFile(schema, .{
         .expected_exact = @embedFile("settingsgen/test-schema-golden.json"),
     });
