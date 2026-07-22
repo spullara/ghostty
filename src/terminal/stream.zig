@@ -579,8 +579,30 @@ pub fn Stream(comptime H: type) type {
                         continue;
                     }
 
+                    // Find the end of the printable run. This is an
+                    // early-exit search loop that LLVM won't
+                    // auto-vectorize, and printable runs dominate real
+                    // input, so scan several codepoints at a time
+                    // manually (same idiom as the printSliceFill run
+                    // scan).
                     var end = i + 1;
-                    while (end < cps.len and cps[end] > 0xF) end += 1;
+                    scan: {
+                        if (simd.lanes(u32)) |lanes| {
+                            const V = @Vector(lanes, u32);
+                            const threshold: V = @splat(0xF);
+                            while (end + lanes <= cps.len) {
+                                const v: V = cps[end..][0..lanes].*;
+                                const gt = v > threshold;
+                                if (!@reduce(.And, gt)) {
+                                    const bits: std.meta.Int(.unsigned, lanes) = @bitCast(gt);
+                                    end += @ctz(~bits);
+                                    break :scan;
+                                }
+                                end += lanes;
+                            }
+                        }
+                        while (end < cps.len and cps[end] > 0xF) end += 1;
+                    }
                     self.handler.vt(.print_slice, .{ .cps = cps[i..end] });
                     i = end;
                 }
@@ -1323,7 +1345,7 @@ pub fn Stream(comptime H: type) type {
 
                     const mode_: ?csi.EraseDisplay = switch (input.params.len) {
                         0 => .below,
-                        1 => std.meta.intToEnum(csi.EraseDisplay, input.params[0]) catch null,
+                        1 => std.enums.fromInt(csi.EraseDisplay, input.params[0]),
                         else => null,
                     };
 
@@ -1652,7 +1674,7 @@ pub fn Stream(comptime H: type) type {
                 'g' => switch (input.intermediates.len) {
                     0 => {
                         const mode: csi.TabClear = switch (input.params.len) {
-                            1 => std.meta.intToEnum(csi.TabClear, input.params[0]) catch {
+                            1 => std.enums.fromInt(csi.TabClear, input.params[0]) orelse {
                                 log.warn("invalid tab clear mode: {}", .{input.params[0]});
                                 return;
                             },

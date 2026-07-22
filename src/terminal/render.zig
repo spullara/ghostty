@@ -1180,7 +1180,7 @@ const RowBuilder = struct {
                             .b = page_cell.content.color_rgb.b,
                         } } },
                         .bg_color_palette => .{ .bg_color = .{
-                            .palette = page_cell.content.color_palette,
+                            .palette = page_cell.content.color_palette.data,
                         } },
                         else => unreachable,
                     };
@@ -1216,8 +1216,9 @@ const RowBuilder = struct {
 test "styled" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 80,
         .rows = 24,
     });
@@ -1234,8 +1235,9 @@ test "styled" {
 test "basic text" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1270,8 +1272,9 @@ test "basic text" {
 test "styled text" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1415,12 +1418,13 @@ fn testCompareStates(
 test "incremental updates match full rebuild" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
     // Deterministic so failures are reproducible.
     var prng = std.Random.DefaultPrng.init(0xB0BA_CAFE);
     const rand = prng.random();
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 20,
         .rows = 8,
         .max_scrollback = 500,
@@ -1551,8 +1555,9 @@ test "incremental updates match full rebuild" {
 test "begin and end update" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1599,8 +1604,9 @@ test "begin and end update" {
 test "bg color cells" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1641,8 +1647,9 @@ test "bg color cells" {
 test "grapheme" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1688,8 +1695,9 @@ test "grapheme" {
 test "cursor state in viewport" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 5,
     });
@@ -1730,8 +1738,9 @@ test "cursor state in viewport" {
 test "cursor state out of viewport" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 2,
     });
@@ -1764,8 +1773,9 @@ test "cursor state out of viewport" {
 test "dirty state" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 5,
     });
@@ -1813,8 +1823,9 @@ test "dirty state" {
 test "colors" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 5,
     });
@@ -1850,8 +1861,9 @@ test "colors" {
 test "selection single line" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t: Terminal = try .init(alloc, .{
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1885,8 +1897,9 @@ test "selection single line" {
 test "selection multiple lines" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t: Terminal = try .init(alloc, .{
+    var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
@@ -1921,8 +1934,9 @@ test "selection multiple lines" {
 test "linkCells" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 5,
     });
@@ -1957,8 +1971,9 @@ test "linkCells" {
 test "string" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 5,
         .rows = 2,
     });
@@ -1987,11 +2002,12 @@ test "string" {
 test "linkCells with scrollback spanning pages" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
     const viewport_rows: size.CellCountInt = 10;
     const tail_rows: size.CellCountInt = 5;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = page.std_capacity.cols,
         .rows = viewport_rows,
         .max_scrollback = 10_000,
@@ -2029,8 +2045,9 @@ test "linkCells with scrollback spanning pages" {
 test "linkCells with invalid viewport point" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 5,
     });
@@ -2067,8 +2084,9 @@ test "linkCells with invalid viewport point" {
 test "flattened highlights require matching page serial" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
@@ -2134,8 +2152,9 @@ test "flattened highlights require matching page serial" {
 test "dirty row resets highlights" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(io, alloc, .{
         .cols = 10,
         .rows = 3,
     });
