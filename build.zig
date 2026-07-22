@@ -85,6 +85,9 @@ pub fn build(b: *std.Build) !void {
     // existing zig-out/share/ghostty folder reference in the pbxproj.
     const settings_data = try buildpkg.GhosttySettingsData.init(b, &deps);
     settings_data.install();
+    if (testFilterMatches(test_filters, "settingsgen schema golden")) {
+        settings_data.addTestStepDependencies(test_step);
+    }
 
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
@@ -396,4 +399,12 @@ pub fn build(b: *std.Build) !void {
     } else {
         try translations_step.addError("cannot update translations when i18n is disabled", .{});
     }
+}
+
+fn testFilterMatches(filters: []const []const u8, test_name: []const u8) bool {
+    if (filters.len == 0) return true;
+    for (filters) |filter| {
+        if (std.mem.indexOf(u8, test_name, filter) != null) return true;
+    }
+    return false;
 }

@@ -6,6 +6,7 @@ const std = @import("std");
 const SharedDeps = @import("SharedDeps.zig");
 
 steps: []*std.Build.Step,
+check_step: *std.Build.Step,
 
 pub fn init(
     b: *std.Build,
@@ -46,12 +47,20 @@ pub fn init(
     }
 
     const run = b.addRunArtifact(exe);
+    const schema = run.captureStdOut();
+    const schema_check = b.addCheckFile(schema, .{
+        .expected_exact = @embedFile("settingsgen/test-schema-golden.json"),
+    });
+    schema_check.setName("settingsgen schema matches golden file");
     try steps.append(b.allocator, &b.addInstallFile(
-        run.captureStdOut(),
+        schema,
         "share/ghostty/settings-schema.json",
     ).step);
 
-    return .{ .steps = steps.items };
+    return .{
+        .steps = steps.items,
+        .check_step = &schema_check.step,
+    };
 }
 
 pub fn install(self: *const GhosttySettingsData) void {
@@ -64,4 +73,11 @@ pub fn addStepDependencies(
     other_step: *std.Build.Step,
 ) void {
     for (self.steps) |step| other_step.dependOn(step);
+}
+
+pub fn addTestStepDependencies(
+    self: *const GhosttySettingsData,
+    other_step: *std.Build.Step,
+) void {
+    other_step.dependOn(self.check_step);
 }
