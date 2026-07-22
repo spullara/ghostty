@@ -362,7 +362,7 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: Xcode Select
-        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
 
       - name: Build XCFramework
         run: nix develop -c zig build -Demit-lib-vt -Doptimize=ReleaseFast
@@ -454,7 +454,7 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: XCode Select
-        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
 
       - name: Xcode Version
         run: xcodebuild -version
@@ -710,7 +710,7 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: XCode Select
-        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
 
       - name: Xcode Version
         run: xcodebuild -version
@@ -907,7 +907,7 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: XCode Select
-        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
 
       - name: Xcode Version
         run: xcodebuild -version

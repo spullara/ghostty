@@ -29,9 +29,9 @@ pub fn init(
     });
     deps.help_strings.addImport(exe);
 
-    // Iterating @typeInfo(KeybindAction) forces analysis of the full
-    // Binding.zig file which references the uucode module.
-    deps.addUucode(b, exe.root_module, target, optimize);
+    // The uucode module is now automatically added by deps.add() below,
+    // but we need to ensure deps.add() is called for this exe.
+    exe.root_module.addImport("uucode", deps.uucode_mod);
 
     {
         const buildconfig = config: {
@@ -47,7 +47,7 @@ pub fn init(
 
     const run = b.addRunArtifact(exe);
     try steps.append(b.allocator, &b.addInstallFile(
-        run.captureStdOut(),
+        run.captureStdOut(.{}),
         "share/ghostty/settings-schema.json",
     ).step);
 
