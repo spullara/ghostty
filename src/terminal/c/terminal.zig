@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const testing = std.testing;
 const build_options = @import("terminal_options");
@@ -26,8 +27,11 @@ const style_c = @import("style.zig");
 const color = @import("../color.zig");
 const clipboard = @import("../clipboard.zig");
 const Result = @import("result.zig").Result;
+const assert = @import("../../quirks.zig").inlineAssert;
 
 const Handler = @import("../stream_terminal.zig").Handler;
+
+const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
 
 const log = std.log.scoped(.terminal_c);
 
@@ -35,10 +39,28 @@ const log = std.log.scoped(.terminal_c);
 /// such as the persistent VT stream needed to handle escape sequences split
 /// across multiple vt_write calls.
 const TerminalWrapper = struct {
+    const IoImpl = if (builtin.os.tag != .freestanding) *std.Io.Threaded else void;
+
     terminal: *ZigTerminal,
+    /// We need to keep an I/O instance here as part of the terminal since we
+    /// have no way of taking it in the C API. This is set up in `new` and
+    /// destroyed on `free`.
+    ///
+    /// This is set to null on freestanding platforms, which get std.Io.failing
+    /// instead.
+    io_impl: IoImpl,
+    /// We also need to store a temp dir path for some operations (e.g., kitty
+    /// graphics). This provides stable storage for the API calls.
+    tmp_dir_path: [max_path_bytes]u8,
     stream: Stream,
     effects: Effects = .{},
     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
+
+    /// Fetches a `TerminalWrapper` reference from a `Handler`.
+    fn fromHandler(handler: *Handler) *TerminalWrapper {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        return @alignCast(@fieldParentPtr("stream", stream_ptr));
+    }
 };
 
 /// A single MIME representation in a clipboard write.
@@ -149,22 +171,19 @@ const Effects = struct {
     };
 
     fn writePtyTrampoline(handler: *Handler, data: [:0]const u8) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.write_pty orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
     }
 
     fn bellTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.bell orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
     fn clipboardWriteTrampoline(handler: *Handler, write: clipboard.Write) clipboard.WriteResult {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.clipboard_write orelse return .unsupported;
 
         // Most protocols currently produce one representation, so keep that
@@ -201,8 +220,7 @@ const Effects = struct {
     }
 
     fn colorSchemeTrampoline(handler: *Handler) ?device_status.ColorScheme {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.color_scheme orelse return null;
         var scheme: device_status.ColorScheme = undefined;
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &scheme)) return scheme;
@@ -210,8 +228,7 @@ const Effects = struct {
     }
 
     fn deviceAttributesTrampoline(handler: *Handler) device_attributes.Attributes {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.device_attributes_cb orelse return .{};
 
         // Get our attributes from the callback.
@@ -241,8 +258,7 @@ const Effects = struct {
     }
 
     fn enquiryTrampoline(handler: *Handler) []const u8 {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.enquiry orelse return "";
         const result = func(@ptrCast(wrapper), wrapper.effects.userdata);
         if (result.len == 0) return "";
@@ -250,8 +266,7 @@ const Effects = struct {
     }
 
     fn xtversionTrampoline(handler: *Handler) []const u8 {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.xtversion orelse return "";
         const result = func(@ptrCast(wrapper), wrapper.effects.userdata);
         if (result.len == 0) return "";
@@ -259,22 +274,19 @@ const Effects = struct {
     }
 
     fn titleChangedTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.title_changed orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
     fn pwdChangedTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.pwd_changed orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
     fn sizeTrampoline(handler: *Handler) ?size_report.Size {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.size_cb orelse return null;
         var s: size_report.Size = undefined;
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &s)) return s;
@@ -338,12 +350,24 @@ fn new_(
         return error.OutOfMemory;
     errdefer alloc.destroy(wrapper);
 
+    const has_nonfailing_io = builtin.os.tag != .freestanding;
+    const io_impl: TerminalWrapper.IoImpl = if (has_nonfailing_io) io_impl: {
+        const ptr = try alloc.create(std.Io.Threaded);
+        ptr.* = .init_single_threaded;
+        break :io_impl ptr;
+    } else {};
+    errdefer if (has_nonfailing_io) alloc.destroy(io_impl);
+
     // Setup our terminal
-    t.* = try .init(alloc, .{
-        .cols = opts.cols,
-        .rows = opts.rows,
-        .max_scrollback = opts.max_scrollback,
-    });
+    t.* = try .init(
+        if (has_nonfailing_io) io_impl.io() else std.Io.failing,
+        alloc,
+        .{
+            .cols = opts.cols,
+            .rows = opts.rows,
+            .max_scrollback = opts.max_scrollback,
+        },
+    );
     errdefer t.deinit(alloc);
 
     // libghostty-vt embedders don't necessarily install Ghostty's shell
@@ -369,6 +393,8 @@ fn new_(
 
     wrapper.* = .{
         .terminal = t,
+        .io_impl = io_impl,
+        .tmp_dir_path = undefined, // Only used if temporary directory is set with API calls
         .stream = .initAlloc(alloc, handler),
     };
 
@@ -401,9 +427,7 @@ pub fn compress(
 ) callconv(lib.calling_conv) Result {
     const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
     const out_result = out_result_ orelse return .invalid_value;
-    const mode = std.meta.intToEnum(CompressionMode, mode_) catch
-        return .invalid_value;
-
+    const mode = std.enums.fromInt(CompressionMode, mode_) orelse return .invalid_value;
     out_result.* = t.compress(mode);
     return .success;
 }
@@ -457,10 +481,10 @@ pub const Option = enum(c_int) {
             .color_palette => ?*const color.PaletteC,
             .kitty_image_storage_limit => ?*const u64,
             .kitty_image_medium_file,
-            .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             .glyph_protocol,
             => ?*const bool,
+            .kitty_image_medium_temp_file => ?*const lib.String,
             .apc_max_bytes, .apc_max_bytes_kitty => ?*const usize,
             .selection => ?*const selection_c.CSelection,
             .default_cursor_style => ?*const TerminalCursorStyle,
@@ -475,7 +499,7 @@ pub fn set(
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(Option, @intFromEnum(option)) catch {
+        _ = std.enums.fromInt(Option, @intFromEnum(option)) orelse {
             log.warn("terminal_set invalid option value={d}", .{@intFromEnum(option)});
             return .invalid_value;
         };
@@ -541,11 +565,10 @@ fn setTyped(
             var it = wrapper.terminal.screens.all.iterator();
             while (it.next()) |entry| {
                 const screen = entry.value.*;
-                screen.kitty_images.setLimit(screen.alloc, screen, limit) catch return .out_of_memory;
+                screen.kitty_images.setLimit(screen.io, screen.alloc, screen, limit) catch return .out_of_memory;
             }
         },
         .kitty_image_medium_file,
-        .kitty_image_medium_temp_file,
         .kitty_image_medium_shared_mem,
         => {
             if (comptime !build_options.kitty_graphics) return .success;
@@ -555,9 +578,28 @@ fn setTyped(
                 const screen = entry.value.*;
                 switch (option) {
                     .kitty_image_medium_file => screen.kitty_images.image_limits.file = val,
-                    .kitty_image_medium_temp_file => screen.kitty_images.image_limits.temporary_file = val,
                     .kitty_image_medium_shared_mem => screen.kitty_images.image_limits.shared_memory = val,
                     else => unreachable,
+                }
+            }
+        },
+        .kitty_image_medium_temp_file => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            if (value) |v| {
+                if (v.len > wrapper.tmp_dir_path.len) return .out_of_memory;
+                @memcpy(&wrapper.tmp_dir_path, v.ptr[0..v.len]);
+                var it = wrapper.terminal.screens.all.iterator();
+                while (it.next()) |entry| {
+                    const screen = entry.value.*;
+                    screen.kitty_images.image_limits.temporary_file = .{
+                        .enabled = .{ .directory = wrapper.tmp_dir_path[0..v.len] },
+                    };
+                }
+            } else {
+                var it = wrapper.terminal.screens.all.iterator();
+                while (it.next()) |entry| {
+                    const screen = entry.value.*;
+                    screen.kitty_images.image_limits.temporary_file = .disabled;
                 }
             }
         },
@@ -763,9 +805,9 @@ pub const TerminalData = enum(c_int) {
             .color_palette, .color_palette_default => color.PaletteC,
             .kitty_image_storage_limit => u64,
             .kitty_image_medium_file,
-            .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             => bool,
+            .kitty_image_medium_temp_file => lib.String,
             .kitty_graphics => KittyGraphics,
             .selection => selection_c.CSelection,
         };
@@ -778,7 +820,7 @@ pub fn get(
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(TerminalData, @intFromEnum(data)) catch {
+        _ = std.enums.fromInt(TerminalData, @intFromEnum(data)) orelse {
             log.warn("terminal_get invalid data value={d}", .{@intFromEnum(data)});
             return .invalid_value;
         };
@@ -868,7 +910,11 @@ fn getTyped(
         },
         .kitty_image_medium_temp_file => {
             if (comptime !build_options.kitty_graphics) return .no_value;
-            out.* = t.screens.active.kitty_images.image_limits.temporary_file;
+            const dir = switch (t.screens.active.kitty_images.image_limits.temporary_file) {
+                .enabled => |d| d.directory,
+                .disabled => "",
+            };
+            out.* = .{ .ptr = dir.ptr, .len = dir.len };
         },
         .kitty_image_medium_shared_mem => {
             if (comptime !build_options.kitty_graphics) return .no_value;
@@ -967,6 +1013,11 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
     wrapper.tracked_grid_refs.deinit(alloc);
     wrapper.stream.deinit();
     t.deinit(alloc);
+    if (builtin.os.tag != .freestanding) {
+        // Deinit is always safe to call, even for single-threaded instances
+        wrapper.io_impl.deinit();
+        alloc.destroy(wrapper.io_impl);
+    }
     alloc.destroy(t);
     alloc.destroy(wrapper);
 }
