@@ -70,8 +70,24 @@ fn AutoHashMapUnmanaged(
 
 fn AutoContext(comptime K: type) type {
     return struct {
-        pub const hash = std.hash_map.getAutoHashFn(K, @This());
         pub const eql = std.hash_map.getAutoEqlFn(K, @This());
+
+        pub fn hash(_: @This(), key: K) u64 {
+            if (comptime std.meta.hasUniqueRepresentation(K)) {
+                // LLVM 21 (Zig 0.16) failed to inline this which resulted
+                // in a measurable almost 2x slowdown on our hyperlink map
+                // benchmark. So, force it.
+                return @call(
+                    .always_inline,
+                    std.hash.Wyhash.hash,
+                    .{ 0, std.mem.asBytes(&key) },
+                );
+            }
+
+            var hasher = std.hash.Wyhash.init(0);
+            std.hash.autoHash(&hasher, key);
+            return hasher.final();
+        }
     };
 }
 
