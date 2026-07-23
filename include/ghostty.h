@@ -520,6 +520,11 @@ typedef struct {
   ghostty_config_color_s colors[256];
 } ghostty_config_palette_s;
 
+typedef struct {
+  uint8_t index;
+  ghostty_config_color_s color;
+} ghostty_config_palette_entry_s;
+
 // config.QuickTerminalSize
 typedef enum {
   GHOSTTY_QUICK_TERMINAL_SIZE_NONE,
@@ -1089,6 +1094,11 @@ GHOSTTY_API ghostty_string_s ghostty_config_get_value_text(ghostty_config_t,
 GHOSTTY_API bool ghostty_config_load_string(ghostty_config_t,
                                             const char*,
                                             uintptr_t);
+GHOSTTY_API bool ghostty_config_palette_parse_entry(const char*,
+                                                    uintptr_t,
+                                                    ghostty_config_palette_entry_s*);
+GHOSTTY_API ghostty_string_s ghostty_config_palette_format_entry(uint8_t,
+                                                                 ghostty_config_color_s);
 
 GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);

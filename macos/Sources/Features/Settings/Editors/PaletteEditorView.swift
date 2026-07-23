@@ -1,3 +1,5 @@
+import AppKit
+import GhosttyKit
 import SwiftUI
 
 /// 16×16 grid of the 256 terminal color palette entries. Each
@@ -137,8 +139,13 @@ struct PaletteEditorView: View {
 
     private func emit(entries: [Int: Color]) {
         let sorted = entries.sorted { $0.key < $1.key }
-        let values = sorted.map { "\($0.key)=\(hexString(color: $0.value))" }
-        model.setValue(option, valueText: SettingsValueText.format(key: option.name, values: values))
+        let values = sorted.compactMap {
+            Self.formatPaletteEntry(index: $0.key, color: $0.value)
+        }
+        model.setValue(
+            option,
+            valueText: SettingsValueText.format(key: option.name, values: values)
+        )
     }
 
     // MARK: - Parsing helpers (internal — exposed for tests)
@@ -150,12 +157,8 @@ struct PaletteEditorView: View {
             // Value may be either a single "N=#rrggbb" entry or a
             // comma-separated color list; support both formats.
             for token in value.split(separator: ",") {
-                let parts = token.split(separator: "=", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
-                guard parts.count == 2,
-                      let idx = parseIndex(parts[0]),
-                      let color = ColorSettingControl.color(from: parts[1])
-                else { continue }
-                out.append((idx, color))
+                guard let entry = parsePaletteEntry(String(token)) else { continue }
+                out.append((Int(entry.index), color(from: entry.color)))
             }
         }
         return out
@@ -165,11 +168,37 @@ struct PaletteEditorView: View {
         Self.parsePaletteLines(text, key: option.name)
     }
 
-    private static func parseIndex(_ s: String) -> Int? {
-        if s.hasPrefix("0x") || s.hasPrefix("0X") { return Int(s.dropFirst(2), radix: 16) }
-        if s.hasPrefix("0o") || s.hasPrefix("0O") { return Int(s.dropFirst(2), radix: 8) }
-        if s.hasPrefix("0b") || s.hasPrefix("0B") { return Int(s.dropFirst(2), radix: 2) }
-        return Int(s)
+    private static func parsePaletteEntry(
+        _ text: String
+    ) -> ghostty_config_palette_entry_s? {
+        var entry = ghostty_config_palette_entry_s()
+        let ok = text.withCString { ptr in
+            ghostty_config_palette_parse_entry(ptr, UInt(text.utf8.count), &entry)
+        }
+        return ok ? entry : nil
+    }
+
+    static func formatPaletteEntry(index: Int, color: Color) -> String? {
+        guard let index = UInt8(exactly: index),
+              let color = configColor(from: color) else { return nil }
+        let raw = ghostty_config_palette_format_entry(index, color)
+        return Ghostty.AllocatedString(raw).string
+    }
+
+    private static func color(from color: ghostty_config_color_s) -> Color {
+        Color(.sRGB,
+              red: Double(color.r) / 255.0,
+              green: Double(color.g) / 255.0,
+              blue: Double(color.b) / 255.0,
+              opacity: 1)
+    }
+
+    private static func configColor(from color: Color) -> ghostty_config_color_s? {
+        let ns = NSColor(color).usingColorSpace(.deviceRGB) ?? NSColor(color)
+        let r = UInt8(clamping: Int(round(ns.redComponent * 255)))
+        let g = UInt8(clamping: Int(round(ns.greenComponent * 255)))
+        let b = UInt8(clamping: Int(round(ns.blueComponent * 255)))
+        return ghostty_config_color_s(r: r, g: g, b: b)
     }
 
     private func hexString(color: Color) -> String {

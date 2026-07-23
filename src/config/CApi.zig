@@ -4,6 +4,7 @@ const cli = @import("../cli.zig");
 const inputpkg = @import("../input.zig");
 const global = @import("../global.zig");
 const String = @import("../main_c.zig").String;
+const terminal_color = @import("../terminal/color.zig");
 
 const Config = @import("Config.zig");
 const c_get = @import("c_get.zig");
@@ -189,6 +190,38 @@ export fn ghostty_config_load_string(
     return loadString(global.alloc(), self, str[0..len]);
 }
 
+/// Parse a single palette entry ("N=COLOR") using Ghostty's config parser.
+export fn ghostty_config_palette_parse_entry(
+    str: [*]const u8,
+    len: usize,
+    out: *PaletteEntry,
+) bool {
+    const entry = terminal_color.parsePaletteEntry(str[0..len]) catch return false;
+    out.* = .{
+        .index = entry.index,
+        .color = .{ .r = entry.color.r, .g = entry.color.g, .b = entry.color.b },
+    };
+    return true;
+}
+
+/// Format a single palette entry in canonical config syntax ("N=#rrggbb").
+/// Caller must free the returned string with ghostty_string_free.
+export fn ghostty_config_palette_format_entry(index: u8, color: Config.Color.C) String {
+    const bytes = formatPaletteEntry(global.alloc(), index, color) catch |err| {
+        log.err("error formatting palette entry err={}", .{err});
+        return .empty;
+    };
+    return .fromSlice(bytes);
+}
+
+fn formatPaletteEntry(alloc: std.mem.Allocator, index: u8, color: Config.Color.C) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "{d}=#{x:0>2}{x:0>2}{x:0>2}",
+        .{ index, color.r, color.g, color.b },
+    );
+}
+
 fn loadString(alloc: std.mem.Allocator, self: *Config, bytes: []const u8) bool {
     var reader: std.Io.Reader = .fixed(bytes);
     var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "" };
@@ -202,6 +235,12 @@ fn loadString(alloc: std.mem.Allocator, self: *Config, bytes: []const u8) bool {
 /// Sync with ghostty_diagnostic_s
 const Diagnostic = extern struct {
     message: [*:0]const u8 = "",
+};
+
+/// Sync with ghostty_config_palette_entry_s.
+const PaletteEntry = extern struct {
+    index: u8,
+    color: Config.Color.C,
 };
 
 test "ghostty_config_get: bool" {
@@ -391,6 +430,30 @@ test "loadString: round-trip via getValueText" {
     try testing.expect(loadString(alloc, &cfg, text));
     try testing.expectEqual(@as(u32, 0), ghostty_config_diagnostics_count(&cfg));
     try testing.expectEqual(@as(f32, 17), cfg.@"font-size");
+}
+
+test "palette entry parse and format C API" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var entry: PaletteEntry = undefined;
+    const named = "5=red";
+    try testing.expect(ghostty_config_palette_parse_entry(named, named.len, &entry));
+    try testing.expectEqual(@as(u8, 5), entry.index);
+    try testing.expectEqual(@as(u8, 255), entry.color.r);
+    try testing.expectEqual(@as(u8, 0), entry.color.g);
+    try testing.expectEqual(@as(u8, 0), entry.color.b);
+
+    const rgb = "6=rgb:0/f/0";
+    try testing.expect(ghostty_config_palette_parse_entry(rgb, rgb.len, &entry));
+    try testing.expectEqual(@as(u8, 6), entry.index);
+    try testing.expectEqual(@as(u8, 0), entry.color.r);
+    try testing.expectEqual(@as(u8, 255), entry.color.g);
+    try testing.expectEqual(@as(u8, 0), entry.color.b);
+
+    const formatted = try formatPaletteEntry(alloc, 6, entry.color);
+    defer alloc.free(formatted);
+    try testing.expectEqualStrings("6=#00ff00", formatted);
 }
 
 test "ghostty_config_trigger: default keybind" {
