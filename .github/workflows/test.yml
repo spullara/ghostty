@@ -618,7 +618,23 @@ jobs:
   build-libghostty-vt-macos:
     strategy:
       matrix:
-        target: [aarch64-macos, x86_64-macos, aarch64-ios]
+        include:
+          - target: aarch64-macos
+            platform: 1
+            arch: arm64
+            expect_encryption: false
+          - target: x86_64-macos
+            platform: 1
+            arch: x86_64
+            expect_encryption: false
+          - target: aarch64-ios
+            platform: 2
+            arch: arm64
+            expect_encryption: true
+          - target: aarch64-ios-simulator
+            platform: 7
+            arch: arm64
+            expect_encryption: false
     runs-on: namespace-profile-ghostty-macos-tahoe
     needs: test
     env:
@@ -652,6 +668,14 @@ jobs:
         run: |
           nix develop -c zig build -Demit-lib-vt \
             -Dtarget=${{ matrix.target }}
+
+      - name: Verify Apple dylib
+        run: |
+          nix develop -c nu .github/scripts/check-apple-libghostty-vt.nu \
+            zig-out/lib/libghostty-vt.dylib \
+            --expect-platform ${{ matrix.platform }} \
+            --expect-arch ${{ matrix.arch }} \
+            ${{ matrix.expect_encryption && '--expect-encryption' || '' }}
 
   # lib-vt requires the Android NDK for Android builds
   build-libghostty-vt-android:
