@@ -6,6 +6,7 @@ const std = @import("std");
 const SharedDeps = @import("SharedDeps.zig");
 
 steps: []*std.Build.Step,
+check_step: *std.Build.Step,
 
 pub fn init(
     b: *std.Build,
@@ -26,6 +27,9 @@ pub fn init(
             .omit_frame_pointer = false,
             .unwind_tables = .sync,
         }),
+        // The self-hosted x86_64 backend currently crashes when compiling
+        // this comptime-heavy generator on the 0.16.0 toolchain.
+        .use_llvm = true,
     });
     deps.help_strings.addImport(exe);
 
@@ -46,12 +50,43 @@ pub fn init(
     }
 
     const run = b.addRunArtifact(exe);
+    const schema = run.captureStdOut(.{});
+    // Ghostty's Config defaults are OS-conditional (keybinds, font size,
+    // etc.), so the generated schema differs per host and each supported
+    // build host gets its own golden snapshot. Unsupported hosts must
+    // capture their own snapshot rather than silently reusing another
+    // platform's file.
+    const schema_check: *std.Build.Step = switch (target.result.os.tag) {
+        .macos => macos: {
+            const check = b.addCheckFile(schema, .{
+                .expected_exact = @embedFile("settingsgen/test-schema-golden.macos.json"),
+            });
+            check.setName("settingsgen schema matches golden file");
+            break :macos &check.step;
+        },
+        .linux => linux: {
+            const check = b.addCheckFile(schema, .{
+                .expected_exact = @embedFile("settingsgen/test-schema-golden.linux.json"),
+            });
+            check.setName("settingsgen schema matches golden file");
+            break :linux &check.step;
+        },
+        else => &b.addFail(b.fmt(
+            "settingsgen: no golden schema snapshot for host OS '{s}'. " ++
+                "Capture one at src/build/settingsgen/test-schema-golden.<os>.json " ++
+                "and add a branch to GhosttySettingsData.zig.",
+            .{@tagName(target.result.os.tag)},
+        )).step,
+    };
     try steps.append(b.allocator, &b.addInstallFile(
-        run.captureStdOut(.{}),
+        schema,
         "share/ghostty/settings-schema.json",
     ).step);
 
-    return .{ .steps = steps.items };
+    return .{
+        .steps = steps.items,
+        .check_step = schema_check,
+    };
 }
 
 pub fn install(self: *const GhosttySettingsData) void {
@@ -64,4 +99,11 @@ pub fn addStepDependencies(
     other_step: *std.Build.Step,
 ) void {
     for (self.steps) |step| other_step.dependOn(step);
+}
+
+pub fn addTestStepDependencies(
+    self: *const GhosttySettingsData,
+    other_step: *std.Build.Step,
+) void {
+    other_step.dependOn(self.check_step);
 }

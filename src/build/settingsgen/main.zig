@@ -8,14 +8,14 @@
 const std = @import("std");
 const Config = @import("../../config/Config.zig");
 const RepeatableStringMap = @import("../../config/RepeatableStringMap.zig");
+const RepeatableReadableIO = @import("../../config/io.zig").RepeatableReadableIO;
 const KeybindAction = @import("../../input/Binding.zig").Action;
+const KeyRemapSet = @import("../../input/key_mods.zig").RemapSet;
 const formatter = @import("../../config/formatter.zig");
 const help_strings = @import("help_strings");
 
 pub fn main(init: std.process.Init) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    const alloc = init.arena.allocator();
 
     // Real default config so formatEntry produces canonical text for
     // every field.
@@ -102,6 +102,18 @@ fn emitInnerTypeDescriptor(
     if (T == Config.FontStyle) return writeKind(ws, "font-style");
     if (T == Config.Theme) return writeKind(ws, "theme");
 
+    // These named Config structs intentionally render as free-text rows.
+    // Future unregistered structs fall through to the compile log below.
+    if (T == Config.SelectionWordChars) return writeKind(ws, "custom");
+    if (T == Config.RepeatableFontVariation) return writeKind(ws, "custom");
+    if (T == Config.RepeatableClipboardCodepointMap) return writeKind(ws, "custom");
+    if (T == Config.RepeatableLink) return writeKind(ws, "custom");
+    if (T == Config.MouseScrollMultiplier) return writeKind(ws, "custom");
+    if (T == Config.QuickTerminalSize) return writeKind(ws, "custom");
+    if (T == Config.WindowPadding) return writeKind(ws, "custom");
+    if (T == RepeatableReadableIO) return writeKind(ws, "custom");
+    if (T == KeyRemapSet) return writeKind(ws, "custom");
+
     // Generic fallbacks by @typeInfo.
     switch (@typeInfo(T)) {
         .bool => return writeKind(ws, "bool"),
@@ -134,10 +146,26 @@ fn emitInnerTypeDescriptor(
                 }
                 try ws.endArray();
             },
-            else => try writeKind(ws, "custom"),
+            else => {
+                logCustomStructFallback(T);
+                try writeKind(ws, "custom");
+            },
         },
         else => try writeKind(ws, "custom"),
     }
+}
+
+fn logCustomStructFallback(comptime T: type) void {
+    @compileLog("settingsgen: falling back to 'custom' for type " ++ settingsgenTypeName(T));
+}
+
+fn settingsgenTypeName(comptime T: type) []const u8 {
+    const name = @typeName(T);
+    const config_marker = ".Config.";
+    if (std.mem.indexOf(u8, name, config_marker)) |i| {
+        return "Config." ++ name[i + config_marker.len ..];
+    }
+    return name;
 }
 
 fn writeKind(ws: *std.json.Stringify, comptime k: []const u8) !void {
