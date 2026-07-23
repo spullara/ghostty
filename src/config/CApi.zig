@@ -158,6 +158,10 @@ export fn ghostty_config_get_value_text(
 }
 
 fn getValueText(alloc: std.mem.Allocator, self: *Config, name: []const u8) ?[]u8 {
+    // Formatting by key switches over every Config field at comptime. The
+    // quota was picked by trial and error to cover today's roughly 200-field
+    // Config with headroom. If Zig reports "evaluation exceeded backwards
+    // branches" here after adding config fields, raise it.
     @setEvalBranchQuota(100_000);
     const key = std.meta.stringToEnum(Key, name) orelse return null;
     var buf: std.Io.Writer.Allocating = .init(alloc);
