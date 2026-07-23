@@ -230,15 +230,24 @@ private final class RecorderNSView: NSView {
 
     override func keyDown(with event: NSEvent) {
         guard recording else { super.keyDown(with: event); return }
+        guard let trigger = KeybindRecorder.trigger(
+            keyCode: event.keyCode,
+            modifierFlags: event.modifierFlags)
+        else { return }
+
+        onCapture?(trigger)
+    }
+}
+
+enum KeybindRecorder {
+    static func trigger(keyCode: UInt16, modifierFlags flags: NSEvent.ModifierFlags) -> String? {
+        guard let key = Ghostty.Input.Key(keyCode: keyCode), !key.isModifierOnlyKey else { return nil }
         var parts: [String] = []
-        let flags = event.modifierFlags
         if flags.contains(.control) { parts.append("ctrl") }
         if flags.contains(.option) { parts.append("alt") }
         if flags.contains(.shift) { parts.append("shift") }
         if flags.contains(.command) { parts.append("cmd") }
-        if let key = event.charactersIgnoringModifiers?.lowercased(), !key.isEmpty {
-            parts.append(key)
-        }
-        onCapture?(parts.joined(separator: "+"))
+        parts.append(key.configName)
+        return parts.joined(separator: "+")
     }
 }
