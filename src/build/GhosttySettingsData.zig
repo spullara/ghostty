@@ -51,10 +51,33 @@ pub fn init(
 
     const run = b.addRunArtifact(exe);
     const schema = run.captureStdOut(.{});
-    const schema_check = b.addCheckFile(schema, .{
-        .expected_exact = @embedFile("settingsgen/test-schema-golden.json"),
-    });
-    schema_check.setName("settingsgen schema matches golden file");
+    // Ghostty's Config defaults are OS-conditional (keybinds, font size,
+    // etc.), so the generated schema differs per host and each supported
+    // build host gets its own golden snapshot. Unsupported hosts must
+    // capture their own snapshot rather than silently reusing another
+    // platform's file.
+    const schema_check: *std.Build.Step = switch (target.result.os.tag) {
+        .macos => macos: {
+            const check = b.addCheckFile(schema, .{
+                .expected_exact = @embedFile("settingsgen/test-schema-golden.macos.json"),
+            });
+            check.setName("settingsgen schema matches golden file");
+            break :macos &check.step;
+        },
+        .linux => linux: {
+            const check = b.addCheckFile(schema, .{
+                .expected_exact = @embedFile("settingsgen/test-schema-golden.linux.json"),
+            });
+            check.setName("settingsgen schema matches golden file");
+            break :linux &check.step;
+        },
+        else => &b.addFail(b.fmt(
+            "settingsgen: no golden schema snapshot for host OS '{s}'. " ++
+                "Capture one at src/build/settingsgen/test-schema-golden.<os>.json " ++
+                "and add a branch to GhosttySettingsData.zig.",
+            .{@tagName(target.result.os.tag)},
+        )).step,
+    };
     try steps.append(b.allocator, &b.addInstallFile(
         schema,
         "share/ghostty/settings-schema.json",
@@ -62,7 +85,7 @@ pub fn init(
 
     return .{
         .steps = steps.items,
-        .check_step = &schema_check.step,
+        .check_step = schema_check,
     };
 }
 
