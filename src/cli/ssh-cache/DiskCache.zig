@@ -411,9 +411,9 @@ pub fn isValidCacheKey(key: []const u8) bool {
 fn isValidHost(host: []const u8) bool {
     // First check for valid hostnames because this is assumed to be the more
     // likely ssh host format.
-    if (internal_os.hostname.isValid(host)) {
+    if (std.Io.net.HostName.validate(host)) |_| {
         return true;
-    }
+    } else |_| {}
 
     // We also accept valid IP addresses. In practice, IPv4 addresses are also
     // considered valid hostnames due to their overlapping syntax, so we can

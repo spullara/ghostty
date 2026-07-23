@@ -587,7 +587,7 @@ fn setTyped(
             if (comptime !build_options.kitty_graphics) return .success;
             if (value) |v| {
                 if (v.len > wrapper.tmp_dir_path.len) return .out_of_memory;
-                @memcpy(&wrapper.tmp_dir_path, v.ptr[0..v.len]);
+                @memcpy(wrapper.tmp_dir_path[0..v.len], v.ptr[0..v.len]);
                 var it = wrapper.terminal.screens.all.iterator();
                 while (it.next()) |entry| {
                     const screen = entry.value.*;
