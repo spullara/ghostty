@@ -783,6 +783,36 @@ extension Ghostty.Input {
             return nil
         }
 
+        var configName: String {
+            switch self {
+            case .a, .b, .c, .d, .e, .f, .g, .h, .i, .j, .k, .l, .m,
+                 .n, .o, .p, .q, .r, .s, .t, .u, .v, .w, .x, .y, .z:
+                return rawValue
+
+            case .digit0, .digit1, .digit2, .digit3, .digit4,
+                 .digit5, .digit6, .digit7, .digit8, .digit9:
+                return String(rawValue.suffix(1))
+
+            case .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10,
+                 .f11, .f12, .f13, .f14, .f15, .f16, .f17, .f18, .f19,
+                 .f20, .f21, .f22, .f23, .f24, .f25:
+                return rawValue
+
+            default:
+                return rawValue.keyNameSnakeCased()
+            }
+        }
+
+        var isModifierOnlyKey: Bool {
+            switch self {
+            case .altLeft, .altRight, .capsLock, .controlLeft, .controlRight,
+                 .fn, .fnLock, .metaLeft, .metaRight, .shiftLeft, .shiftRight:
+                return true
+            default:
+                return false
+            }
+        }
+
         var cKey: ghostty_input_key_e {
             switch self {
             // Writing System Keys
@@ -1314,4 +1344,26 @@ extension Ghostty.Input.Key: AppEnum {
         // Other
         .contextMenu: "Context Menu"
     ]
+}
+
+private extension String {
+    func keyNameSnakeCased() -> String {
+        var result = ""
+        var previousWasSeparator = false
+
+        for character in self {
+            if character.isUppercase || character.isNumber {
+                if !result.isEmpty, !previousWasSeparator {
+                    result.append("_")
+                }
+                result.append(character.lowercased())
+            } else {
+                result.append(character)
+            }
+
+            previousWasSeparator = character == "_"
+        }
+
+        return result
+    }
 }
