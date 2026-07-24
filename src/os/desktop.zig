@@ -114,32 +114,55 @@ pub fn desktopEnvironment(environ_map: *const std.process.Environ.Map) DesktopEn
 test "desktop environment" {
     const testing = std.testing;
 
+    // Always run these tests with a blank evironment map so that we don't get any
+    // failures from values in the "real" evironment leaking in.
     switch (builtin.os.tag) {
         inline .macos, .windows => |tag| {
-            var environ_map = try testing.environ.createMap(testing.allocator);
+            var environ_map: std.process.Environ.Map = .init(testing.allocator);
             defer environ_map.deinit();
             try testing.expectEqual(@tagName(tag), @tagName(desktopEnvironment(&environ_map)));
         },
         .linux, .freebsd => {
-            var environ_map = try testing.environ.createMap(testing.allocator);
-            defer environ_map.deinit();
+            {
+                var environ_map: std.process.Environ.Map = .init(testing.allocator);
+                defer environ_map.deinit();
+                try environ_map.put("XDG_SESSION_DESKTOP", "gnome");
+                try testing.expectEqual(.gnome, desktopEnvironment(&environ_map));
+            }
 
-            try environ_map.put("XDG_SESSION_DESKTOP", "gnome");
-            try testing.expectEqual(.gnome, desktopEnvironment(&environ_map));
-            try environ_map.put("XDG_SESSION_DESKTOP", "gnome-xorg");
-            try testing.expectEqual(.gnome, desktopEnvironment(&environ_map));
-            try environ_map.put("XDG_SESSION_DESKTOP", "foobar");
-            try testing.expectEqual(.other, desktopEnvironment(&environ_map));
+            {
+                var environ_map: std.process.Environ.Map = .init(testing.allocator);
+                defer environ_map.deinit();
+                try environ_map.put("XDG_SESSION_DESKTOP", "gnome-xorg");
+                try testing.expectEqual(.gnome, desktopEnvironment(&environ_map));
+            }
 
-            _ = environ_map.orderedRemove("XDG_SESSION_DESKTOP");
-            try testing.expectEqual(.other, desktopEnvironment(&environ_map));
+            {
+                var environ_map: std.process.Environ.Map = .init(testing.allocator);
+                defer environ_map.deinit();
+                try environ_map.put("XDG_SESSION_DESKTOP", "foobar");
+                try testing.expectEqual(.other, desktopEnvironment(&environ_map));
+            }
 
-            try environ_map.put("XDG_CURRENT_DESKTOP", "GNOME");
-            try testing.expectEqual(.gnome, desktopEnvironment(&environ_map));
-            try environ_map.put("XDG_CURRENT_DESKTOP", "FOOBAR");
-            try testing.expectEqual(.other, desktopEnvironment(&environ_map));
-            _ = environ_map.orderedRemove("XDG_CURRENT_DESKTOP");
-            try testing.expectEqual(.other, desktopEnvironment(&environ_map));
+            {
+                var environ_map: std.process.Environ.Map = .init(testing.allocator);
+                defer environ_map.deinit();
+                try environ_map.put("XDG_CURRENT_DESKTOP", "GNOME");
+                try testing.expectEqual(.gnome, desktopEnvironment(&environ_map));
+            }
+
+            {
+                var environ_map: std.process.Environ.Map = .init(testing.allocator);
+                defer environ_map.deinit();
+                try environ_map.put("XDG_CURRENT_DESKTOP", "FOOBAR");
+                try testing.expectEqual(.other, desktopEnvironment(&environ_map));
+            }
+
+            {
+                var environ_map: std.process.Environ.Map = .init(testing.allocator);
+                defer environ_map.deinit();
+                try testing.expectEqual(.other, desktopEnvironment(&environ_map));
+            }
         },
         else => try testing.expectEqual(.other, DesktopEnvironment()),
     }
