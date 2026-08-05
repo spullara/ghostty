@@ -81,6 +81,18 @@ extension Ghostty {
             }
 
             ghostty_config_load_recursive_files(cfg)
+
+            // Load the Settings-window overlay last so GUI edits win
+            // over any conflicting values from the user's config file
+            // or CLI args. The store returns an empty string when the
+            // overlay file is missing or unreadable, in which case
+            // `ghostty_config_load_string` is a no-op.
+            let overlay = OverlayConfigStore.shared.loadText()
+            if !overlay.isEmpty {
+                overlay.withCString { cStr in
+                    _ = ghostty_config_load_string(cfg, cStr, UInt(overlay.utf8.count))
+                }
+            }
 #endif
 
             // TODO: we'd probably do some config loading here... for now we'd
