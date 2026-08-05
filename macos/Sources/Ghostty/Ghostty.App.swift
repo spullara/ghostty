@@ -12,6 +12,11 @@ protocol GhosttyAppDelegate: AnyObject {
     /// Called when a callback needs access to a specific surface. This should return nil
     /// when the surface is no longer valid.
     func findSurface(forUUID uuid: UUID) -> Ghostty.SurfaceView?
+
+    /// Called when the Ghostty core wants to surface the app-level Settings UI
+    /// (e.g. GHOSTTY_ACTION_OPEN_CONFIG). The delegate is responsible for
+    /// showing the appropriate window/view.
+    @MainActor func ghosttyOpenSettings()
     #endif
 }
 
@@ -126,7 +131,20 @@ extension Ghostty {
         private static func openConfig(_ app: ghostty_app_t) {
             guard let app_ud = ghostty_app_userdata(app) else { return }
             let app = Unmanaged<App>.fromOpaque(app_ud).takeUnretainedValue()
+            #if os(macOS)
+            // Prefer the app-level Settings window when a delegate is
+            // installed; fall back to opening the raw config file if
+            // no delegate is available.
+            MainActor.assumeIsolated {
+                if let delegate = app.delegate {
+                    delegate.ghosttyOpenSettings()
+                } else {
+                    app.openConfig()
+                }
+            }
+            #else
             app.openConfig()
+            #endif
         }
 
         func openConfig() {
