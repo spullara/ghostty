@@ -163,6 +163,26 @@ class AppDelegate: NSObject,
 
     @MainActor private lazy var menuShortcutManager = Ghostty.MenuShortcutManager()
 
+    /// Lazily-created controller for the Settings window.
+    @MainActor private lazy var settingsController: SettingsController =
+        SettingsController(appDelegate: self)
+
+    /// Lazily-created view model backing the Settings window.
+    @MainActor private var _settingsViewModel: SettingsViewModel?
+    @MainActor func settingsViewModel(schema: SettingsSchema) -> SettingsViewModel {
+        if let existing = _settingsViewModel { return existing }
+        let vm = SettingsViewModel(schema: schema)
+        vm.onOverlayChange = { [weak self] in
+            self?.ghostty.reloadConfig()
+        }
+        vm.onRequestNewWindow = { [weak self] in
+            guard let self else { return }
+            _ = TerminalController.newWindow(self.ghostty)
+        }
+        _settingsViewModel = vm
+        return vm
+    }
+
     override init() {
 #if DEBUG
         ghostty = Ghostty.App(configPath: ProcessInfo.processInfo.environment["GHOSTTY_CONFIG_PATH"])
@@ -902,6 +922,10 @@ class AppDelegate: NSObject,
         return nil
     }
 
+    func ghosttyOpenSettings() {
+        settingsController.show()
+    }
+
     // MARK: - Global State
 
     func setSecureInput(_ mode: Ghostty.SetSecureInput) {
@@ -921,6 +945,10 @@ class AppDelegate: NSObject,
     }
 
     // MARK: - IB Actions
+
+    @IBAction func showSettings(_ sender: Any?) {
+        settingsController.show()
+    }
 
     @IBAction func openConfig(_ sender: Any?) {
         ghostty.openConfig()
