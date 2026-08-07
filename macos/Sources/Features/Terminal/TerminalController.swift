@@ -344,13 +344,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         confirmUndo: Bool = true,
         inheritBackgroundOpacity: Bool? = nil
     ) -> TerminalController {
+        // Calculate the target frame based on the tree's view bounds
+        // before moving into the new window
+        let treeSize: CGSize? = tree.root?.viewBounds()
+
         let c = TerminalController.init(ghostty, withSurfaceTree: tree)
         if let inheritBackgroundOpacity {
             c.isBackgroundOpaque = inheritBackgroundOpacity
         }
-
-        // Calculate the target frame based on the tree's view bounds
-        let treeSize: CGSize? = tree.root?.viewBounds()
 
         c.scheduleInitialPresentation {
             c.showWindow(self)
@@ -1159,6 +1160,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         super.showWindow(sender)
+
+        syncAppearance()
     }
 
     // Shows the "+" button in the tab bar, responds to that click.
