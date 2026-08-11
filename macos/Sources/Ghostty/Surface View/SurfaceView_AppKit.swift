@@ -48,6 +48,7 @@ extension Ghostty {
                     // needle is less than 3 chars, we debounce it for a few hundred ms to
                     // avoid kicking off expensive searches.
                     searchNeedleCancellable = searchState.$needle
+                        .map(\.text)
                         .removeDuplicates()
                         .map { needle -> AnyPublisher<String, Never> in
                             if needle.isEmpty || needle.count >= 3 {
