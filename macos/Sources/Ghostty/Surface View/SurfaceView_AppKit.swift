@@ -109,6 +109,13 @@ extension Ghostty {
         /// True when the bell is active. This is set inactive on focus or event.
         @Published private(set) var bell: Bool = false
 
+        /// A clipboard confirmation waiting to be handled by its controller.
+        @Published var pendingClipboardConfirmation: ClipboardConfirmationRequest? {
+            didSet {
+                pendingClipboardConfirmationDidChange(from: oldValue)
+            }
+        }
+
         // An initial size to request for a window. This will only affect
         // then the view is moved to a new window.
         var initialSize: NSSize?
@@ -397,6 +404,11 @@ extension Ghostty {
         }
 
         deinit {
+            // Resolve clipboard callback state while surfaceModel is still
+            // alive. The request's weak SurfaceView reference is already nil
+            // during deinit, so didSet passes this instance explicitly.
+            pendingClipboardConfirmation = nil
+
             // Remove all of our notificationcenter subscriptions
             let center = NotificationCenter.default
             center.removeObserver(self)
@@ -1880,6 +1892,18 @@ extension Ghostty {
             try container.encode(title, forKey: .title)
             try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)
         }
+    }
+}
+
+// MARK: Clipboard Confirmation
+
+extension Ghostty.SurfaceView {
+    /// Cancel the request that a new published value replaces or clears.
+    private func pendingClipboardConfirmationDidChange(
+        from previous: Ghostty.ClipboardConfirmationRequest?
+    ) {
+        guard previous !== pendingClipboardConfirmation else { return }
+        previous?.cancel(from: self)
     }
 }
 
