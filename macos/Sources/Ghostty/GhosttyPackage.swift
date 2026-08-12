@@ -216,7 +216,6 @@ extension Ghostty {
     }
 }
 
-#if canImport(AppKit)
 // MARK: SplitFocusDirection Extensions
 
 extension Ghostty.SplitFocusDirection {
@@ -243,7 +242,6 @@ extension Ghostty.SplitFocusDirection {
         }
     }
 }
-#endif
 
 extension Ghostty {
     struct ClipboardContent {

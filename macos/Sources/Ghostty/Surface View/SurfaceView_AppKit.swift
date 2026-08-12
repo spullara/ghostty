@@ -2043,7 +2043,7 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             x += cellSize.width * Double(range.location + range.length)
         }
         // Ghostty coordinates are in top-left (0, 0) so we have to convert to
-        // bottom-left since that is what UIKit expects
+        // bottom-left since that is what AppKit expects
         // when there's is no characters selected,
         // width should be 0 so that dictation indicator
         // can start in the right place
