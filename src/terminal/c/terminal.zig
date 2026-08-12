@@ -1355,6 +1355,7 @@ pub const TerminalData = enum(c_int) {
     continuation_max_bytes = 36,
     mode = 37,
     vt_ground = 38,
+    cursor_at_prompt = 39,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1367,6 +1368,7 @@ pub const TerminalData = enum(c_int) {
             .viewport_active,
             .vt_processing_error,
             .vt_ground,
+            .cursor_at_prompt,
             => bool,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
@@ -1533,6 +1535,7 @@ fn getTyped(
             const mode = out.toMode() orelse return .invalid_value;
             out.value = t.modes.get(mode);
         },
+        .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
     }
 
     return .success;
@@ -2862,6 +2865,31 @@ test "get cursor_visible" {
     try testing.expectEqual(Result.success, set(t, .mode, @ptrCast(&config)));
     try testing.expectEqual(Result.success, get(t, .cursor_visible, @ptrCast(&visible)));
     try testing.expect(!visible);
+}
+
+test "get cursor_at_prompt" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var at_prompt: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_at_prompt, @ptrCast(&at_prompt)));
+    try testing.expect(!at_prompt);
+
+    const prompt_start = "\x1b]133;A\x07";
+    vt_write(t, prompt_start, prompt_start.len);
+    try testing.expectEqual(Result.success, get(t, .cursor_at_prompt, @ptrCast(&at_prompt)));
+    try testing.expect(at_prompt);
+
+    const alternate_screen = "\x1b[?1049h";
+    vt_write(t, alternate_screen, alternate_screen.len);
+    try testing.expectEqual(Result.success, get(t, .cursor_at_prompt, @ptrCast(&at_prompt)));
+    try testing.expect(!at_prompt);
 }
 
 test "get active_screen" {
