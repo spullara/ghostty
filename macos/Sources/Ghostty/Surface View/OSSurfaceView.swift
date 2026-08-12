@@ -138,9 +138,9 @@ extension Ghostty.OSSurfaceView {
 
         init(
             from startSearch: Ghostty.Action.StartSearch,
-            pasteboard: NSPasteboard = NSPasteboard.find
+            pasteboard: NSPasteboard? = nil
         ) {
-            self.pasteboard = pasteboard
+            self.pasteboard = pasteboard ?? .find
             if let needle = startSearch.needle, !needle.isEmpty {
                 setNeedle(needle)
                 writePasteboardNeedle()

@@ -1787,26 +1787,25 @@ extension Ghostty {
 
             // Note the callback may be executed on a background thread as documented
             // so we need @MainActor since we're reading/writing view state.
-            UNUserNotificationCenter.current().add(request) { @MainActor error in
-                if let error = error {
-                    AppDelegate.logger.error("Error scheduling user notification: \(error, privacy: .public)")
-                    return
-                }
+            Task { @MainActor in
+                do {
+                    try await UNUserNotificationCenter.current().add(request)
 
-                // We need to keep track of this notification so we can remove it
-                // under certain circumstances
-                self.notificationIdentifiers.insert(uuid)
+                    // We need to keep track of this notification so we can remove it
+                    // under certain circumstances
+                    notificationIdentifiers.insert(uuid)
 
-                // If we're focused then we schedule to remove the notification
-                // after a few seconds. If we gain focus we automatically remove it
-                // in focusDidChange.
-                if self.focused {
-                    Task { @MainActor [weak self] in
+                    // If we're focused then we schedule to remove the notification
+                    // after a few seconds. If we gain focus we automatically remove it
+                    // in focusDidChange.
+                    if self.focused {
                         try await Task.sleep(for: .seconds(3))
-                        self?.notificationIdentifiers.remove(uuid)
+                        notificationIdentifiers.remove(uuid)
                         UNUserNotificationCenter.current()
                             .removeDeliveredNotifications(withIdentifiers: [uuid])
                     }
+                } catch {
+                    AppDelegate.logger.error("Error scheduling user notification: \(error, privacy: .public)")
                 }
             }
         }
