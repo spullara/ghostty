@@ -106,6 +106,25 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
             result = b.resolveTargetQuery(query);
         }
 
+        // On wasm, default to enabling the simd128 feature. Every
+        // browser engine has supported it since 2023 or earlier
+        // (Chrome 91, Firefox 89, Safari 16.4) and it is a large
+        // performance win for the terminal hot paths (50%+ on
+        // print-heavy VT streams). Only apply when no explicit CPU
+        // was requested; targets for exotic non-browser runtimes
+        // can opt out with `-Dcpu=generic`.
+        if (result.result.cpu.arch.isWasm() and
+            result.query.cpu_model == .determined_by_arch_os and
+            result.query.cpu_features_add.isEmpty() and
+            result.query.cpu_features_sub.isEmpty())
+        {
+            var query = result.query;
+            query.cpu_features_add.addFeature(
+                @intFromEnum(std.Target.wasm.Feature.simd128),
+            );
+            result = b.resolveTargetQuery(query);
+        }
+
         // The full Ghostty build no longer supports iOS; Fail early
         // with a clear message rather than partway through the build.
         if (result.result.os.tag == .ios and !emit_lib_vt) {
