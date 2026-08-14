@@ -155,16 +155,27 @@ pub fn paletteCvalSlice(src: []const RGB, dst: []RGB.C) void {
         // (pointer cast) because a value-level @bitCast of packed
         // structs operates on the 24-bit value bits, not the 4-byte
         // in-memory representation.
+        const V = @Vector(16, u8);
         const dst_bytes: [*]u8 = @ptrCast(dst.ptr);
         while (i + 6 <= src.len) : (i += 4) {
-            const in: @Vector(16, u8) = @as(
-                *const [16]u8,
-                @ptrCast(src[i..][0..4]),
-            ).*;
-            const out: [16]u8 = @shuffle(u8, in, undefined, [16]i32{
-                0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 3, 7, 11, 15,
+            // All intermediaries have to also go through a Vector type
+            // to ensure LLVM lowers as vectorized ops. In Zig 0.16 the
+            // LLVM auto-vectorizer is disabled so this is required.
+            const in: V = @as(*align(4) const V, @ptrCast(src[i..][0..4])).*;
+            const out: V = @shuffle(u8, in, undefined, [16]i32{
+                0,  1,  2,
+                4,  5,  6,
+                8,  9,  10,
+                12, 13, 14,
+
+                // Overflow we don't care about
+                3,  7,  11,
+                15,
             });
-            dst_bytes[i * 3 ..][0..16].* = out;
+
+            // Scary looking but safe, mapping a byte pointer to the full
+            // vector type (hence align 1).
+            @as(*align(1) V, @ptrCast(dst_bytes[i * 3 ..][0..16])).* = out;
         }
     }
 

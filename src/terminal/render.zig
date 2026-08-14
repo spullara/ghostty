@@ -793,7 +793,7 @@ pub const RenderState = struct {
                 const end = @min(run.end, styles.len);
                 const start = @min(run.start, end);
 
-                @memset(styles[start..end], run.style);
+                fillStyles(styles[start..end], run.style);
             }
 
             // Record what we applied so the next rebuild of this row
@@ -808,6 +808,36 @@ pub const RenderState = struct {
             }
         }
         self.pending_styles.clearRetainingCapacity();
+    }
+
+    /// Fill a slice of styles with one value.
+    ///
+    /// This is equivalent to `@memset(dst, value)` but manually vectorized:
+    /// `@memset` with a struct value lowers to a per-element field copy
+    /// that reloads the source at every iteration because LLVM cannot
+    /// prove the destination doesn't alias it. And, Zig 0.16 disables
+    /// auto-vectorization due to an LLVM bug.
+    ///
+    /// This complexity is justified by accounting for ~10% of the endUpdate
+    /// times under heavily styled cases.
+    fn fillStyles(dst: []Style, value: Style) void {
+        // Each element is written as two overlapping 16-byte vector
+        // stores held in registers, which requires 16 <= size <= 32.
+        const elem_size = @sizeOf(Style);
+        comptime assert(elem_size >= 16 and elem_size <= 32);
+
+        const V = @Vector(16, u8);
+        const src: *align(@alignOf(Style)) const [elem_size]u8 = @ptrCast(&value);
+        const lo = @as(*align(4) const V, @ptrCast(src[0..16])).*;
+        const hi = @as(*align(1) const V, @ptrCast(src[elem_size - 16 ..][0..16])).*;
+
+        const dst_bytes = std.mem.sliceAsBytes(dst);
+        var off: usize = 0;
+        for (0..dst.len) |_| {
+            @as(*align(1) V, @ptrCast(dst_bytes[off..][0..16])).* = lo;
+            @as(*align(1) V, @ptrCast(dst_bytes[off + elem_size - 16 ..][0..16])).* = hi;
+            off += elem_size;
+        }
     }
 
     /// Returns true if the two style run lists denormalize to

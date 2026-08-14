@@ -12,6 +12,7 @@ const terminal_c = @import("terminal.zig");
 const ZigTerminal = @import("../Terminal.zig");
 const renderpkg = @import("../render.zig");
 const Result = @import("result.zig").Result;
+const cell_c = @import("cell.zig");
 const row = @import("row.zig");
 const style_c = @import("style.zig");
 
@@ -614,10 +615,11 @@ fn rowCellsGetTypedInner(
     switch (data) {
         .invalid => return .invalid_value,
         .raw => out.* = cell.cval(),
-        .style => out.* = if (cell.hasStyling())
-            style_c.Style.fromStyle(cells.styles[x])
-        else
-            comptime style_c.Style.fromStyle(.{}),
+        .style => if (cell.hasStyling()) {
+            style_c.Style.write(cells.styles[x], out);
+        } else {
+            out.* = style_c.Style.default;
+        },
         .graphemes_len => {
             if (!cell.hasText()) {
                 out.* = 0;
@@ -739,6 +741,7 @@ pub const RowData = enum(c_int) {
     raw = 2,
     cells = 3,
     selection = 4,
+    cells_raw = 5,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: RowData) type {
@@ -748,6 +751,7 @@ pub const RowData = enum(c_int) {
             .raw => row.CRow,
             .cells => RowCells,
             .selection => RowSelection,
+            .cells_raw => cell_c.CellsView,
         };
     }
 };
@@ -863,6 +867,13 @@ fn rowGetTyped(
             const sel = it.selection[y] orelse return .no_value;
             out.start_x = sel[0];
             out.end_x = sel[1];
+        },
+        .cells_raw => {
+            const raws: []const page.Cell = it.cells[y].items(.raw);
+            out.* = .{
+                .ptr = @ptrCast(raws.ptr),
+                .len = raws.len,
+            };
         },
     }
 
@@ -1324,6 +1335,68 @@ test "render: row get selection" {
     try testing.expect(row_iterator_next(it));
     sel = .{};
     try testing.expectEqual(Result.no_value, row_get(it, .selection, @ptrCast(&sel)));
+}
+
+test "render: row get cells_raw" {
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        10,
+        3,
+    ));
+    defer terminal_c.free(terminal);
+
+    terminal_c.vt_write(terminal, "AB", 2);
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(
+        &lib.alloc.test_allocator,
+        &it,
+    ));
+    defer row_iterator_free(it);
+
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+
+    // Not positioned on a row yet.
+    var view: cell_c.CellsView = undefined;
+    try testing.expectEqual(Result.invalid_value, row_get(it, .cells_raw, @ptrCast(&view)));
+
+    try testing.expect(row_iterator_next(it));
+    try testing.expectEqual(Result.success, row_get(it, .cells_raw, @ptrCast(&view)));
+    try testing.expectEqual(@as(usize, 10), view.len);
+
+    // The view must match the per-cell raw reads.
+    var cells: RowCells = null;
+    try testing.expectEqual(Result.success, row_cells_new(
+        &lib.alloc.test_allocator,
+        &cells,
+    ));
+    defer row_cells_free(cells);
+    try testing.expectEqual(Result.success, row_get(it, .cells, @ptrCast(&cells)));
+    const ptr = view.ptr.?;
+    var x: u16 = 0;
+    while (x < view.len) : (x += 1) {
+        var raw: page.Cell.C = undefined;
+        try testing.expectEqual(Result.success, row_cells_select(cells, x));
+        try testing.expectEqual(Result.success, row_cells_get(cells, .raw, @ptrCast(&raw)));
+        try testing.expectEqual(raw, ptr[x]);
+    }
+
+    // Contents sanity: first two cells hold our text.
+    const first: page.Cell = @bitCast(ptr[0]);
+    const second: page.Cell = @bitCast(ptr[1]);
+    try testing.expectEqual(@as(u21, 'A'), first.codepoint());
+    try testing.expectEqual(@as(u21, 'B'), second.codepoint());
 }
 
 test "render: row cells get selected" {
