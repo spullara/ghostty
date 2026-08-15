@@ -391,16 +391,15 @@ pub const std_options: std.Options = opts: {
     var options: std.Options = .{};
 
     if (builtin.target.cpu.arch.isWasm()) {
-        // Wasm builds we specifically want to optimize for space with small
-        // releases so we bump up to warn. Everything else acts pretty normal.
-        options.log_level = switch (builtin.mode) {
-            .Debug => .debug,
-            .ReleaseSmall => .warn,
-            else => .info,
-        };
-
-        // Wasm doesn't have access to stdio so we have a custom log function.
-        options.logFn = @import("os/wasm/log.zig").log;
+        // In non-debug modes, we want to ship effectively no logging
+        // warn and lower add ~200KB at the time of this comment.
+        if (builtin.mode == .Debug) {
+            options.log_level = .debug;
+            options.logFn = @import("os/wasm/log.zig").log;
+        } else {
+            options.log_level = .err;
+            options.logFn = @import("os/wasm/log.zig").noop;
+        }
     } else if (terminal.options.c_abi) {
         // For C ABI builds, use a custom log function that dispatches to an
         // embedder-provided callback (or silently discards when none is set).

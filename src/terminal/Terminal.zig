@@ -498,7 +498,14 @@ pub fn printRepeat(self: *Terminal, count_req: usize) !void {
     // identical to calling print per codepoint: ineligible characters
     // or terminal states (insert mode, grapheme clustering, hyperlinks,
     // etc.) fall back to the per-codepoint print() path internally.
-    var buf: [4096]u32 = @splat(c);
+    //
+    // The buffer is filled with a runtime-bounded loop rather than
+    // `= @splat(c)`: a comptime-known 4096-element splat gets fully
+    // unrolled into ~33KB of consecutive stores (LLVM won't re-roll
+    // or vectorize it, see quirks_memset.zig), and it would fill the
+    // whole buffer even for the typical small repeat counts.
+    var buf: [4096]u32 = undefined;
+    for (buf[0..@min(remaining, buf.len)]) |*cp| cp.* = c;
     while (remaining > 0) {
         const n = @min(remaining, buf.len);
         try self.printSlice(buf[0..n]);
