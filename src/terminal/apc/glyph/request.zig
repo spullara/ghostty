@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Glyf = @import("../../../font/opentype/glyf.zig").Glyf;
+const fraction = @import("../../fraction.zig");
 
 /// Maximum decoded glyph payload size accepted by the protocol.
 /// This is documented in the spec.
@@ -563,9 +564,7 @@ pub const Pad = struct {
     /// Top/bottom fractions are relative to cell height; left/right fractions
     /// are relative to render span width.
     fn parseFraction(value: []const u8) ?f64 {
-        const result = std.fmt.parseFloat(f64, value) catch return null;
-        if (!(result >= 0 and result <= 1)) return null;
-        return result;
+        return fraction.parse(value);
     }
 };
 
