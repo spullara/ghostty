@@ -256,9 +256,12 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    *  This is the bulk alternative to iterating cells one at a time.
    *  It lets callers with expensive call boundaries (e.g. WebAssembly
-   *  embedders) read an entire row with a single call, then drill
-   *  into the cells iterator only for cells that need managed data
-   *  (styles, graphemes). */
+   *  embedders) read an entire row with a single call.
+   *
+   *  Bit positions aren't protected by ABI, so callers should parse them
+   *  out of the manifest from `ghostty_type_json`. Callers with access
+   *  to the C header or without high FFI costs should use `ghostty_cell_get`.
+   */
   GHOSTTY_RENDER_STATE_ROW_DATA_CELLS_RAW = 5,
   GHOSTTY_RENDER_STATE_ROW_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateRowData;

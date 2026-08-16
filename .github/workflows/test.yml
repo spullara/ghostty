@@ -701,6 +701,12 @@ jobs:
             -Dtarget=wasm32-freestanding \
             -Doptimize=ReleaseSmall
 
+      - name: Validate WASM ABI manifest
+        run: |
+          nix develop -c zig build test-lib-vt-schema \
+            -Dtarget=wasm32-freestanding \
+            -Doptimize=ReleaseSmall
+
       - name: Optimize ReleaseSmall WASM
         run: |
           nix develop -c wasm-opt -O3 \
@@ -1469,6 +1475,9 @@ jobs:
 
       - name: Test
         run: nix develop -c zig build test-lib-vt
+
+      - name: Validate native ABI manifest
+        run: nix develop -c zig build test-lib-vt-schema
 
   test-kaitai:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'

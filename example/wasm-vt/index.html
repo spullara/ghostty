@@ -156,7 +156,7 @@
 
         // Look up a field's offset and DataView setter from the type layout JSON.
         function fieldInfo(structName, fieldName) {
-            const field = typeLayout[structName].fields[fieldName];
+            const field = typeLayout.types[structName].fields[fieldName];
             return field;
         }
 
@@ -166,9 +166,16 @@
             switch (field.type) {
                 case 'u8':  case 'bool': view.setUint8(field.offset, value); break;
                 case 'u16': view.setUint16(field.offset, value, true); break;
-                case 'u32': case 'enum': view.setUint32(field.offset, value, true); break;
+                case 'u32': view.setUint32(field.offset, value, true); break;
                 case 'u64': view.setBigUint64(field.offset, BigInt(value), true); break;
-                default: throw new Error(`Unsupported field type: ${field.type}`);
+                default: {
+                    const type = typeLayout.types[field.type];
+                    if (type?.kind === 'enum' && type.underlying === 'i32') {
+                        view.setInt32(field.offset, value, true);
+                        break;
+                    }
+                    throw new Error(`Unsupported field type: ${field.type}`);
+                }
             }
         }
 
@@ -186,15 +193,14 @@
                 .replace(/\\\\/g, '\\');
         }
 
-        // GHOSTTY_FORMATTER_FORMAT_PLAIN = 0
-        const GHOSTTY_FORMATTER_FORMAT_PLAIN = 0;
-        // GHOSTTY_SUCCESS = 0
-        const GHOSTTY_SUCCESS = 0;
-
         function run() {
             const outputDiv = document.getElementById('output');
 
             try {
+                const GHOSTTY_FORMATTER_FORMAT_PLAIN =
+                    typeLayout.types.GhosttyFormatterFormat.values.PLAIN;
+                const GHOSTTY_SUCCESS =
+                    typeLayout.types.GhosttyResult.values.SUCCESS;
                 const cols = parseInt(document.getElementById('cols').value, 10);
                 const rows = parseInt(document.getElementById('rows').value, 10);
                 const vtText = parseEscapes(document.getElementById('vtInput').value);
@@ -224,7 +230,7 @@
                 wasmInstance.exports.ghostty_wasm_free_u8_array(dataPtr, vtBytes.length);
 
                 // Create a plain-text formatter
-                const FMT_OPTS_SIZE = typeLayout['GhosttyFormatterTerminalOptions'].size;
+                const FMT_OPTS_SIZE = typeLayout.types.GhosttyFormatterTerminalOptions.size;
                 const fmtOptsPtr = wasmInstance.exports.ghostty_wasm_alloc_u8_array(FMT_OPTS_SIZE);
                 new Uint8Array(getBuffer(), fmtOptsPtr, FMT_OPTS_SIZE).fill(0);
                 const fmtOptsView = new DataView(getBuffer(), fmtOptsPtr, FMT_OPTS_SIZE);
@@ -235,12 +241,12 @@
 
                 // Set the nested sized-struct `size` fields for extra and extra.screen
                 const extraOffset = fieldInfo('GhosttyFormatterTerminalOptions', 'extra').offset;
-                const extraSize = typeLayout['GhosttyFormatterTerminalExtra'].size;
+                const extraSize = typeLayout.types.GhosttyFormatterTerminalExtra.size;
                 const extraSizeField = fieldInfo('GhosttyFormatterTerminalExtra', 'size');
                 fmtOptsView.setUint32(extraOffset + extraSizeField.offset, extraSize, true);
 
                 const screenOffset = fieldInfo('GhosttyFormatterTerminalExtra', 'screen').offset;
-                const screenSize = typeLayout['GhosttyFormatterScreenExtra'].size;
+                const screenSize = typeLayout.types.GhosttyFormatterScreenExtra.size;
                 const screenSizeField = fieldInfo('GhosttyFormatterScreenExtra', 'size');
                 fmtOptsView.setUint32(extraOffset + screenOffset + screenSizeField.offset, screenSize, true);
 

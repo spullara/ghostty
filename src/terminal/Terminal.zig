@@ -2590,7 +2590,7 @@ pub const ScrollViewport = union(Tag) {
         @This(),
         // Padding: largest variant is isize (8 bytes on 64-bit).
         // Use [2]u64 (16 bytes) for future expansion.
-        [2]u64,
+        .{ .padding = [2]u64 },
     );
     pub const C = c_union.C;
     pub const CValue = c_union.CValue;

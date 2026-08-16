@@ -182,7 +182,7 @@ pub const UnknownSequence = union(Tag) {
         // A future borrowed CSI payload may need parameter, separator, and
         // intermediate arrays. Reserve 128 bytes so that representation and
         // other structured sequence types can be added without an ABI break.
-        [16]u64,
+        .{ .padding = [16]u64 },
     );
     pub const C = c_union.C;
     pub const CValue = c_union.CValue;
