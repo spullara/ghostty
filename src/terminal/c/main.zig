@@ -114,8 +114,6 @@ pub const sgr_unknown_full = sgr.unknown_full;
 pub const sgr_unknown_partial = sgr.unknown_partial;
 pub const sgr_attribute_tag = sgr.attribute_tag;
 pub const sgr_attribute_value = sgr.attribute_value;
-pub const wasm_alloc_sgr_attribute = sgr.wasm_alloc_attribute;
-pub const wasm_free_sgr_attribute = sgr.wasm_free_attribute;
 
 pub const key_event_new = key_event.new;
 pub const key_event_free = key_event.free;

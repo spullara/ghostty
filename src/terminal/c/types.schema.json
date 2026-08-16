@@ -60,6 +60,7 @@
         "environment",
         "pointer_size",
         "usize_size",
+        "max_alignment",
         "endian"
       ],
       "properties": {
@@ -79,6 +80,10 @@
           "$ref": "#/$defs/positiveInteger"
         },
         "usize_size": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "max_alignment": {
+          "description": "Maximum fundamental C ABI alignment in bytes.",
           "$ref": "#/$defs/positiveInteger"
         },
         "endian": {

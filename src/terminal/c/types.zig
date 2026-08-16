@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("terminal_options");
 const lib = @import("../lib.zig");
+const c_abi = @import("../../lib/c_abi.zig");
 
 const color = @import("../color.zig");
 const clipboard = @import("../clipboard.zig");
@@ -377,6 +378,8 @@ const Json = struct {
         try jws.write(@sizeOf(*anyopaque));
         try jws.objectField("usize_size");
         try jws.write(@sizeOf(usize));
+        try jws.objectField("max_alignment");
+        try jws.write(c_abi.max_alignment);
         try jws.objectField("endian");
         try jws.write(@tagName(builtin.target.cpu.arch.endian()));
         try jws.endObject();
@@ -843,6 +846,10 @@ test "manifest parses and is versioned" {
     const root = parsed.value.object;
     try std.testing.expectEqual(@as(i64, 1), root.get("schema").?.integer);
     try std.testing.expect(root.contains("abi"));
+    try std.testing.expectEqual(
+        @as(i64, c_abi.max_alignment),
+        root.get("abi").?.object.get("max_alignment").?.integer,
+    );
     try std.testing.expect(root.contains("library_version"));
     const manifest_types = root.get("types").?.object;
     try std.testing.expectEqual(type_decls.len, manifest_types.count());

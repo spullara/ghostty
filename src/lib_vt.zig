@@ -400,19 +400,12 @@ comptime {
 
         // On Wasm we need to export our allocator convenience functions.
         if (builtin.target.cpu.arch.isWasm()) {
-            const alloc = @import("lib/allocator/convenience.zig");
+            const alloc = @import("lib/allocator/wasm.zig");
+            @export(&alloc.allocBytes, .{ .name = "ghostty_wasm_alloc" });
+            @export(&alloc.freeBytes, .{ .name = "ghostty_wasm_free" });
             @export(&alloc.allocOpaque, .{ .name = "ghostty_wasm_alloc_opaque" });
             @export(&alloc.freeOpaque, .{ .name = "ghostty_wasm_free_opaque" });
-            @export(&alloc.allocU8Array, .{ .name = "ghostty_wasm_alloc_u8_array" });
-            @export(&alloc.freeU8Array, .{ .name = "ghostty_wasm_free_u8_array" });
-            @export(&alloc.allocU16Array, .{ .name = "ghostty_wasm_alloc_u16_array" });
-            @export(&alloc.freeU16Array, .{ .name = "ghostty_wasm_free_u16_array" });
-            @export(&alloc.allocU8, .{ .name = "ghostty_wasm_alloc_u8" });
-            @export(&alloc.freeU8, .{ .name = "ghostty_wasm_free_u8" });
-            @export(&alloc.allocUsize, .{ .name = "ghostty_wasm_alloc_usize" });
-            @export(&alloc.freeUsize, .{ .name = "ghostty_wasm_free_usize" });
-            @export(&c.wasm_alloc_sgr_attribute, .{ .name = "ghostty_wasm_alloc_sgr_attribute" });
-            @export(&c.wasm_free_sgr_attribute, .{ .name = "ghostty_wasm_free_sgr_attribute" });
+            @export(&alloc.takeOpaque, .{ .name = "ghostty_wasm_take_opaque" });
         }
     }
 }

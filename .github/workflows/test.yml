@@ -733,6 +733,11 @@ jobs:
             echo "Verified ${artifact} requires simd128"
           done
 
+      - name: Test WASM allocator
+        run: |
+          nix develop -c node test/wasm-alloc.mjs ghostty-vt.wasm
+          nix develop -c node test/wasm-alloc.mjs ghostty-vt-small.wasm
+
   # Compile-only checks for the -Dvt-features flags so that future changes
   # don't regress any feature combination.
   build-libghostty-vt-features:

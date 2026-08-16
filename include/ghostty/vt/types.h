@@ -358,7 +358,8 @@ typedef struct {
  *   "schema": 1,
  *   "abi": {
  *     "target": "wasm32", "os": "freestanding", "environment": "none",
- *     "pointer_size": 4, "usize_size": 4, "endian": "little"
+ *     "pointer_size": 4, "usize_size": 4, "max_alignment": 16,
+ *     "endian": "little"
  *   },
  *   "types": {
  *     "GhosttyRenderStateData": {
