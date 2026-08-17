@@ -542,14 +542,18 @@ pub fn encode(
     if (continuation.result != .success) return continuation.result;
     defer native.gpa().free(continuation.bytes);
 
-    // Stream the snapshot directly through the callback adapter.
-    var adapter: io_c.WriterAdapter = .init(writer);
+    // Stream the snapshot through the callback adapter, batching the
+    // encoder's writes into few callback invocations.
+    var buffer: [io_c.WriterAdapter.recommended_buffer_len]u8 = undefined;
+    var adapter: io_c.WriterAdapter = .initBuffered(writer, &buffer);
     snapshot_core.encode(
         native.gpa(),
         &adapter.interface,
         native,
         .{ .continuation = continuationValue(continuation.bytes) },
     ) catch |err| return mapEncodeError(err, &adapter);
+    adapter.interface.flush() catch
+        return mapEncodeError(error.WriteFailed, &adapter);
     return .success;
 }
 

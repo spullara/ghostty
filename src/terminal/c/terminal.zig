@@ -810,15 +810,20 @@ pub fn continuation_write(
 
     // The callback was validated above, so invalid_write can only mean output
     // accounting overflow. Keep that distinct from callback rejection.
-    var adapter: c_io.WriterAdapter = .init(writer);
-    continuationWriteIo(terminal_, &adapter.interface) catch |err| {
-        if (err == error.WriteFailed) {
-            if (adapter.invalid_write) return .limit_exceeded;
-            if (adapter.callback_failed) return .io_error;
-        }
-        return continuationErrorResult(err);
-    };
-    return .success;
+    var buffer: [c_io.WriterAdapter.recommended_buffer_len]u8 = undefined;
+    var adapter: c_io.WriterAdapter = .initBuffered(writer, &buffer);
+    write: {
+        continuationWriteIo(terminal_, &adapter.interface) catch |err| switch (err) {
+            error.WriteFailed => break :write,
+            else => return continuationErrorResult(err),
+        };
+        adapter.interface.flush() catch break :write;
+        return .success;
+    }
+
+    if (adapter.invalid_write) return .limit_exceeded;
+    if (adapter.callback_failed) return .io_error;
+    return continuationErrorResult(error.WriteFailed);
 }
 
 pub fn continuation_buf(

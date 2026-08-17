@@ -169,16 +169,22 @@ pub fn format(
     const wrapper = formatter_ orelse return .invalid_value;
     if (!writer.valid()) return .invalid_value;
 
-    var adapter: io_c.WriterAdapter = .init(writer);
-    switch (wrapper.kind) {
-        .terminal => |*t| t.format(adapter.writer()) catch {
-            if (adapter.invalid_write) return .limit_exceeded;
-            if (adapter.callback_failed) return .io_error;
-            return .io_error;
-        },
+    // Batch the formatter's many small writes into few callback calls. The
+    // trailing flush upholds the API contract that success means the
+    // callback has accepted every byte.
+    var buffer: [io_c.WriterAdapter.recommended_buffer_len]u8 = undefined;
+    var adapter: io_c.WriterAdapter = .initBuffered(writer, &buffer);
+    format_: {
+        switch (wrapper.kind) {
+            .terminal => |*t| t.format(adapter.writer()) catch break :format_,
+        }
+        adapter.writer().flush() catch break :format_;
+        return .success;
     }
 
-    return .success;
+    if (adapter.invalid_write) return .limit_exceeded;
+    if (adapter.callback_failed) return .io_error;
+    return .io_error;
 }
 
 pub fn format_buf(
