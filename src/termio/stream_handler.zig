@@ -1346,17 +1346,9 @@ pub const StreamHandler = struct {
         title: []const u8,
         body: []const u8,
     ) !void {
-        var message = apprt.surface.Message{ .desktop_notification = undefined };
-
-        const title_len = @min(title.len, message.desktop_notification.title.len);
-        @memcpy(message.desktop_notification.title[0..title_len], title[0..title_len]);
-        message.desktop_notification.title[title_len] = 0;
-
-        const body_len = @min(body.len, message.desktop_notification.body.len);
-        @memcpy(message.desktop_notification.body[0..body_len], body[0..body_len]);
-        message.desktop_notification.body[body_len] = 0;
-
-        self.surfaceMessageWriter(message);
+        self.surfaceMessageWriter(.{
+            .desktop_notification = .init(title, body),
+        });
     }
 
     /// Send a report to the pty.

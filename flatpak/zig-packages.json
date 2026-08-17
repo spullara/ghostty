@@ -180,10 +180,10 @@
     "sha256": "5cedcadde81b75e60f23e5e83b5dd2b8eb4efb9f8f79bd7a347d148aeb0530f8"
   },
   {
-    "type": "archive",
-    "url": "https://deps.files.ghostty.org/wuffs-122037b39d577ec2db3fd7b2130e7b69ef6cc1807d68607a7c232c958315d381b5cd.tar.gz",
-    "dest": "vendor/p/N-V-__8AAAzZywE3s51XfsLbP9eyEw57ae9swYB9aGB6fCMs",
-    "sha256": "9e4cd20abe96e6c4c6ede9c3057108860126e7be2e2c3e35515476c250be1c13"
+    "type": "git",
+    "url": "https://github.com/google/wuffs-mirror-release-c.git",
+    "commit": "7411f488fe2e2c205c3d3b3d28638b7356522930",
+    "dest": "vendor/p/N-V-__8AAP5JWgCGP_AD0teWpa4krRvE9VPZzvviGdbmN4jI"
   },
   {
     "type": "archive",
