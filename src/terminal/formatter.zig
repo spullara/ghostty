@@ -485,7 +485,6 @@ pub const TerminalFormatter = struct {
 
         var screen_formatter: ScreenFormatter = .init(self.terminal.screens.active, self.opts);
         screen_formatter.content = self.content;
-        screen_formatter.extra = self.extra.screen;
         screen_formatter.pin_map = self.pin_map;
         try screen_formatter.format(writer);
 
@@ -543,6 +542,13 @@ pub const TerminalFormatter = struct {
                 ) catch return error.WriteFailed;
             }
         }
+
+        // Emit extra screen state last because terminal state such
+        // as scrolling regions can move the cursor, so we have to set
+        // cursor last.
+        screen_formatter.content = .none;
+        screen_formatter.extra = self.extra.screen;
+        try screen_formatter.format(writer);
     }
 };
 
@@ -689,6 +695,43 @@ pub const ScreenFormatter = struct {
             .html => return,
         }
 
+        // Emit cursor position before the other extras because restoring a
+        // pending wrap requires reprinting the cell at the right edge. That
+        // print uses and changes active screen state, so the requested style,
+        // hyperlink, protection, and charset must be restored afterwards.
+        if (self.extra.cursor) cursor: {
+            const cursor = &self.screen.cursor;
+
+            // If we don't have pending wrap, then we can just use CUP.
+            if (!cursor.pending_wrap or cursor.x != self.screen.pages.cols - 1) {
+                try writer.print("\x1b[{d};{d}H", .{ cursor.y + 1, cursor.x + 1 });
+                break :cursor;
+            }
+
+            // Pending wrap, we can't use CUP because it resets pending wrap.
+            const start_x = switch (cursor.page_cell.wide) {
+                .spacer_tail => cursor.x - 1,
+                .narrow, .wide, .spacer_head => cursor.x,
+            };
+
+            // Move cursor to the edge.
+            try writer.print(
+                "\x1b[{d};{d}H",
+                .{ cursor.y + 1, start_x + 1 },
+            );
+
+            // Reformat the cell which sets the proper pending wrap state.
+            var cell_formatter: PageFormatter = .init(
+                cursor.page_pin.node.page(),
+                self.opts,
+            );
+            cell_formatter.start_x = cursor.x;
+            cell_formatter.end_x = cursor.x;
+            cell_formatter.start_y = cursor.page_pin.y;
+            cell_formatter.end_y = cursor.page_pin.y;
+            try cell_formatter.format(writer);
+        }
+
         // Emit current SGR style state
         if (self.extra.style) {
             const cursor = &self.screen.cursor;
@@ -776,13 +819,6 @@ pub const ScreenFormatter = struct {
                 };
                 try writer.print("{s}", .{seq});
             }
-        }
-
-        // Emit cursor position using CUP (CSI H)
-        if (self.extra.cursor) {
-            const cursor = &self.screen.cursor;
-            // CUP is 1-indexed
-            try writer.print("\x1b[{d};{d}H", .{ cursor.y + 1, cursor.x + 1 });
         }
 
         // If we have a pin_map, we need to count how many bytes the extras
@@ -5214,6 +5250,65 @@ test "Screen vt with cursor position" {
     for (content_len..output.len) |i| {
         try testing.expectEqual(node, pin_map.get(i).?.node);
     }
+}
+
+test "Terminal vt cursor preserves pending wrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var source = try Terminal.init(io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer source.deinit(alloc);
+
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("abcd");
+    try testing.expect(source.screens.active.cursor.pending_wrap);
+
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: TerminalFormatter = .init(&source, .vt);
+    formatter.extra = .none;
+    formatter.extra.screen.cursor = true;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    try testing.expectEqual(builder.writer.buffered().len, pin_map.count());
+
+    var target = try Terminal.init(io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer target.deinit(alloc);
+
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(builder.writer.buffered());
+
+    try testing.expectEqual(
+        source.screens.active.cursor.pending_wrap,
+        target.screens.active.cursor.pending_wrap,
+    );
+
+    source_stream.nextSlice("X");
+    target_stream.nextSlice("X");
+    const source_contents = try source.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{} },
+    );
+    defer alloc.free(source_contents);
+    const target_contents = try target.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{} },
+    );
+    defer alloc.free(target_contents);
+    try testing.expectEqualStrings(source_contents, target_contents);
 }
 
 test "Screen vt with style" {

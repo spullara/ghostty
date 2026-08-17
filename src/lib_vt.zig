@@ -270,6 +270,7 @@ comptime {
         @export(&c.sgr_attribute_value, .{ .name = "ghostty_sgr_attribute_value" });
         if (features.formatter) {
             @export(&c.formatter_terminal_new, .{ .name = "ghostty_formatter_terminal_new" });
+            @export(&c.formatter_format, .{ .name = "ghostty_formatter_format" });
             @export(&c.formatter_format_buf, .{ .name = "ghostty_formatter_format_buf" });
             @export(&c.formatter_format_alloc, .{ .name = "ghostty_formatter_format_alloc" });
             @export(&c.formatter_free, .{ .name = "ghostty_formatter_free" });

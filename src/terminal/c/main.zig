@@ -78,6 +78,7 @@ pub const focus_encode = focus.encode;
 pub const mode_report_encode = modes.report_encode;
 
 pub const formatter_terminal_new = formatter.terminal_new;
+pub const formatter_format = formatter.format;
 pub const formatter_format_buf = formatter.format_buf;
 pub const formatter_format_alloc = formatter.format_alloc;
 pub const formatter_free = formatter.free;
