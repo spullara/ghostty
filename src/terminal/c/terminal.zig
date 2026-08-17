@@ -579,12 +579,15 @@ pub const FromDecodedError = error{
 /// This function consumes `io` on every path. The decoded terminal is
 /// transferred only after its final heap address has been allocated; its
 /// continuation remains in `decoded` and is replayed before returning.
-/// Replay uses a temporary exact-size tracker which is disabled before the
-/// terminal crosses the C ABI, restoring the ordinary C default policy.
+/// `continuation_max_bytes` selects the returned terminal's tracking policy:
+/// zero uses a temporary exact-size tracker and restores the ordinary C
+/// default before returning, while a nonzero value leaves tracking enabled
+/// with that limit.
 pub fn fromDecoded(
     alloc: std.mem.Allocator,
     io: Io,
     decoded: *snapshot_core.Decoded,
+    continuation_max_bytes: usize,
 ) FromDecodedError!Terminal {
     const native = alloc.create(ZigTerminal) catch {
         io.deinit(alloc);
@@ -596,11 +599,18 @@ pub fn fromDecoded(
         .ground => "",
         .bytes => |bytes| bytes,
     };
+    assert(continuation_max_bytes == 0 or
+        continuation.len <= continuation_max_bytes);
 
-    // Non-ground state needs tracking only long enough to verify that replay
-    // reconstructed the exact canonical continuation. Ground state needs no
-    // tracker at all.
-    const terminal = wrap(alloc, native, io, continuation.len) catch |err| {
+    // Without opt-in retention, non-ground state needs tracking only long
+    // enough to verify that replay reconstructed the exact canonical
+    // continuation. With retention, even ground state needs a tracker so its
+    // continuation can be exported successfully as an empty slice.
+    const tracker_max_bytes = if (continuation_max_bytes > 0)
+        continuation_max_bytes
+    else
+        continuation.len;
+    const terminal = wrap(alloc, native, io, tracker_max_bytes) catch |err| {
         native.deinit(alloc);
         alloc.destroy(native);
         io.deinit(alloc);
@@ -610,8 +620,8 @@ pub fn fromDecoded(
 
     if (continuation.len > 0) {
         restoreContinuation(terminal, continuation) catch |err| return switch (err) {
-            // The decoded bytes exactly fit this fresh tracker's cap, so
-            // losing them while replaying can only be an allocation failure.
+            // The decoded bytes fit this fresh tracker's cap, so losing them
+            // while replaying can only be an allocation failure.
             error.OutOfMemory,
             error.ContinuationUnavailable,
             => error.OutOfMemory,
@@ -621,9 +631,12 @@ pub fn fromDecoded(
         };
     }
 
-    // Decoder validation limits are not terminal runtime policy. A restored
-    // terminal always starts with the same disabled tracking default as new.
-    setContinuationMaxBytes(terminal.?, default_continuation_max_bytes);
+    // Unless the decoder opted into retention, restore the same disabled
+    // tracking default used by newly created C terminals. Disabling tracking
+    // does not alter the parser or UTF-8 state reconstructed above.
+    if (continuation_max_bytes == 0) {
+        setContinuationMaxBytes(terminal.?, default_continuation_max_bytes);
+    }
     return terminal;
 }
 
