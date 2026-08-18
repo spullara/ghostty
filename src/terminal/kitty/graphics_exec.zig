@@ -273,22 +273,45 @@ fn display(
             .none => {},
             .after => {
                 // We use terminal.index to properly handle scroll regions.
+                const screen = terminal.screens.active;
                 const size = p.gridSize(img, terminal);
-                // Once the requested movement leaves the screen, its exact
-                // position is undefined by the Kitty graphics protocol. Bound
-                // the work so an untrusted row count can't make us spin.
+                const target_x = @as(usize, pin.x) +| @as(usize, size.cols);
+                const wraps = target_x >= @as(usize, terminal.cols);
+                const requested_rows =
+                    (@as(usize, size.rows) -| 1) +| @intFromBool(wraps);
+
+                // The requested row count comes from the application and can
+                // be as large as u32. Calling terminal.index once for every
+                // row could therefore leave the terminal unresponsive for a
+                // very long time.
+                //
+                // First allow enough calls to reach the bottom of the scroll
+                // region. Each call after that scrolls the region by one row,
+                // so limit those extra calls to one screen. This follows
+                // Kitty's behavior while keeping the amount of work bounded.
+                const region = terminal.scrolling_region;
+                const rows_before_scroll: usize = if (screen.cursor.y >= region.top and
+                    screen.cursor.y <= region.bottom and
+                    screen.cursor.x >= region.left and
+                    screen.cursor.x <= region.right)
+                    @as(usize, region.bottom - screen.cursor.y)
+                else
+                    0;
                 const rows_to_move: usize = @min(
-                    @as(usize, size.rows),
-                    @as(usize, terminal.rows),
+                    requested_rows,
+                    rows_before_scroll +| @as(usize, terminal.rows),
                 );
                 for (0..rows_to_move) |_| terminal.index() catch |err| {
                     log.warn("failed to move cursor: {}", .{err});
                     break;
                 };
 
-                terminal.setCursorPos(
-                    terminal.screens.active.cursor.y,
-                    @as(usize, pin.x) +| @as(usize, size.cols) +| 1,
+                // Kitty wraps once when the movement reaches the right edge;
+                // otherwise it leaves the cursor immediately to the right of
+                // the placement.
+                screen.cursor.pending_wrap = false;
+                screen.cursorHorizontalAbsolute(
+                    if (wraps) 0 else @intCast(target_x),
                 );
             },
         },
@@ -779,4 +802,77 @@ test "kittygfx placement bounds cursor movement for untrusted dimensions" {
     const resp = execute(io, alloc, &t, &cmd).?;
     try testing.expect(resp.ok());
     try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
+    // Reaching the bottom takes four rows, then scrolling is capped to one
+    // screen (five rows), matching Kitty's bounded screen-scroll behavior.
+    try testing.expectEqual(@as(usize, 10), t.screens.active.pages.scrollbar().total);
+}
+
+test "kittygfx placement moves cursor past a tall image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Load a one-pixel RGB image, then place it over the full width and eight
+    // rows. Eight rows are taller than the screen but still within Kitty's
+    // scroll budget.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,t=d,f=24,i=1,s=1,v=1;////",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=p,i=1,p=1,c=5,r=8",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+
+    // A subsequent placement begins immediately after the first one instead
+    // of overlapping it at the old one-screen movement cap.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=p,i=1,p=2,C=1",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+
+    const storage = &t.screens.active.kitty_images;
+    const first = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const second = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 2 },
+    }).?;
+    const first_pin = switch (first.location) {
+        .pin => |pin| pin,
+        .virtual => unreachable,
+    };
+    const second_pin = switch (second.location) {
+        .pin => |pin| pin,
+        .virtual => unreachable,
+    };
+    const first_y = t.screens.active.pages.pointFromPin(
+        .screen,
+        first_pin.*,
+    ).?.screen.y;
+    const second_y = t.screens.active.pages.pointFromPin(
+        .screen,
+        second_pin.*,
+    ).?.screen.y;
+    try testing.expectEqual(first_y + 8, second_y);
 }
