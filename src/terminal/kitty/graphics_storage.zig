@@ -447,6 +447,30 @@ pub const ImageStorage = struct {
         return newest;
     }
 
+    /// Clear placements intersecting the active screen, then reclaim every
+    /// image with no remaining placement. Unlike protocol d=A, a terminal
+    /// clear also reclaims images that were already unplaced.
+    pub fn clearScreen(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+    ) void {
+        const placements_before = self.placements.count();
+        const images_before = self.images.count();
+
+        // Delete unused placements and images
+        self.deleteVisiblePlacements(alloc, t, true);
+        var image_it = self.images.iterator();
+        while (image_it.next()) |entry| {
+            self.deleteIfUnused(alloc, entry.key_ptr.*);
+        }
+
+        // Mark mutated only if things changed.
+        if (self.placements.count() != placements_before or
+            self.images.count() != images_before) self.markMutated(io);
+    }
+
     /// Delete placements, images.
     pub fn delete(
         self: *ImageStorage,
@@ -457,37 +481,19 @@ pub const ImageStorage = struct {
     ) void {
         // Deletes only ever remove placements/images, so comparing counts
         // before and after tells us whether anything actually changed.
-        // Only then do we mark a mutation. This matters because a
-        // delete-all runs on every screen clear (e.g. `ESC [ 2 J`), and
-        // we don't want empty clears to dirty the image state or bump
-        // the generation.
+        // Only then do we mark a mutation, so a delete that matches nothing
+        // doesn't dirty the image state or bump the generation.
         const placements_before = self.placements.count();
         const images_before = self.images.count();
         defer if (self.placements.count() != placements_before or
             self.images.count() != images_before) self.markMutated(io);
 
         switch (cmd) {
-            .all => |delete_images| {
-                var it = self.placements.iterator();
-                while (it.next()) |entry| {
-                    // Skip virtual placements
-                    switch (entry.value_ptr.location) {
-                        .pin => {},
-                        .virtual => continue,
-                    }
-
-                    // Deinit the placement and remove it
-                    const image_id = entry.key_ptr.image_id;
-                    entry.value_ptr.deinit(t.screens.active);
-                    self.removePlacementByPtr(entry.key_ptr);
-                    if (delete_images) self.deleteIfUnused(alloc, image_id);
-                }
-
-                if (delete_images) {
-                    var image_it = self.images.iterator();
-                    while (image_it.next()) |kv| self.deleteIfUnused(alloc, kv.key_ptr.*);
-                }
-            },
+            .all => |delete_images| self.deleteVisiblePlacements(
+                alloc,
+                t,
+                delete_images,
+            ),
 
             .id => |v| self.deleteById(
                 alloc,
@@ -633,8 +639,9 @@ pub const ImageStorage = struct {
             },
 
             .range => |v| range: {
-                if (v.first <= 0 or v.last <= 0) {
-                    log.warn("delete range values must be greater than zero", .{});
+                // The lower bound defaults to zero when x is omitted.
+                if (v.last == 0) {
+                    log.warn("delete range upper bound must be greater than zero", .{});
                     break :range;
                 }
                 if (v.first > v.last) {
@@ -642,13 +649,24 @@ pub const ImageStorage = struct {
                     break :range;
                 }
 
-                var it = self.placements.iterator();
-                while (it.next()) |entry| {
-                    if (entry.key_ptr.image_id >= v.first and entry.key_ptr.image_id <= v.last) {
-                        const image_id = entry.key_ptr.image_id;
-                        entry.value_ptr.deinit(t.screens.active);
-                        self.removePlacementByPtr(entry.key_ptr);
-                        if (v.delete) self.deleteIfUnused(alloc, image_id);
+                // Remove matching placements in one pass.
+                var placement_it = self.placements.iterator();
+                while (placement_it.next()) |entry| {
+                    if (entry.key_ptr.image_id < v.first or
+                        entry.key_ptr.image_id > v.last) continue;
+
+                    entry.value_ptr.deinit(t.screens.active);
+                    self.removePlacementByPtr(entry.key_ptr);
+                }
+
+                // Uppercase deletion also frees matching images that are now
+                // unused, including images that had no placements initially.
+                if (!v.delete) break :range;
+                var image_it = self.images.iterator();
+                while (image_it.next()) |entry| {
+                    const image_id = entry.key_ptr.*;
+                    if (image_id >= v.first and image_id <= v.last) {
+                        self.deleteIfUnused(alloc, image_id);
                     }
                 }
             },
@@ -656,6 +674,43 @@ pub const ImageStorage = struct {
             // We don't support animation frames yet so they are successfully
             // deleted!
             .animation_frames => {},
+        }
+    }
+
+    /// Delete only non-virtual placements that intersect the active screen.
+    /// The protocol defines d=a/A in terms of visible placements, and an
+    /// uppercase delete only frees data for images selected by those
+    /// placements.
+    fn deleteVisiblePlacements(
+        self: *ImageStorage,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+        delete_unused: bool,
+    ) void {
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const pin = switch (entry.value_ptr.location) {
+                .pin => |pin| pin,
+                .virtual => continue,
+            };
+            if (pin.garbage) continue;
+
+            // Placements anchored in the active area are necessarily visible.
+            // Only compute their extent when the anchor is already in history
+            // and the bottom edge may still intersect the active area.
+            if (t.screens.active.pages.pointFromPin(
+                .active,
+                pin.*,
+            ) == null) {
+                const image = self.imageById(entry.key_ptr.image_id) orelse continue;
+                const rect = entry.value_ptr.rect(image, t) orelse continue;
+                if (t.screens.active.pages.pointFromPin(.active, rect.bottom_right) == null) continue;
+            }
+
+            const image_id = entry.key_ptr.image_id;
+            entry.value_ptr.deinit(t.screens.active);
+            self.removePlacementByPtr(entry.key_ptr);
+            if (delete_unused) self.deleteIfUnused(alloc, image_id);
         }
     }
 
@@ -668,22 +723,18 @@ pub const ImageStorage = struct {
         delete_unused: bool,
     ) void {
         // If no placement, we delete all placements with the ID
-        if (placement_id == 0) {
-            var it = self.placements.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.image_id == image_id) {
-                    entry.value_ptr.deinit(s);
-                    self.removePlacementByPtr(entry.key_ptr);
-                }
-            }
-        } else {
-            if (self.placements.getEntry(.{
-                .image_id = image_id,
-                .placement_id = .{ .tag = .external, .id = placement_id },
-            })) |entry| {
-                entry.value_ptr.deinit(s);
-                self.removePlacementByPtr(entry.key_ptr);
-            }
+        if (placement_id == 0) self.removePlacementsByImageId(
+            s,
+            image_id,
+        ) else if (self.placements.getEntry(.{
+            .image_id = image_id,
+            .placement_id = .{
+                .tag = .external,
+                .id = placement_id,
+            },
+        })) |entry| {
+            entry.value_ptr.deinit(s);
+            self.removePlacementByPtr(entry.key_ptr);
         }
 
         // If this is specified, then we also delete the image
@@ -1236,7 +1287,7 @@ test "storage: placement count limit permits replacement" {
     try testing.expectEqual(@as(usize, 1), s.placements.count());
 }
 
-test "storage: delete all placements and images" {
+test "storage: delete all visible placements and matching images" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -1255,7 +1306,8 @@ test "storage: delete all placements and images" {
     s.dirty = false;
     s.delete(io, alloc, &t, .{ .all = true });
     try testing.expect(s.dirty);
-    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
 }
@@ -1280,10 +1332,96 @@ test "storage: delete all placements and images preserves limit" {
     s.dirty = false;
     s.delete(io, alloc, &t, .{ .all = true });
     try testing.expect(s.dirty);
-    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 5000), s.total_limit);
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: delete all visible placements preserves scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const history_key: ImageStorage.PlacementKey = .{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        s.placements.get(history_key).?.location.pin.*,
+    ) == null);
+
+    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+
+    s.delete(io, alloc, &t, .{ .all = true });
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(s.placements.contains(history_key));
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(1));
+}
+
+test "storage: delete all includes placements spanning into active area" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 2,
+    });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const placement = s.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        placement.location.pin.*,
+    ) == null);
+    const rect = placement.rect(s.imageById(1).?, &t).?;
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        rect.bottom_right,
+    ) != null);
+
+    s.delete(io, alloc, &t, .{ .all = true });
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(@as(usize, 0), s.images.count());
 }
 
 test "storage: delete all placements" {
@@ -1791,6 +1929,75 @@ test "storage: delete images by range 4" {
         .placement_id = .{ .tag = .external, .id = 1 },
     }) != null);
     try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: uppercase range deletes unplaced image data" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
+
+    s.delete(io, alloc, &t, .{
+        .range = .{
+            .delete = true,
+            // Zero is the default lower bound when x is omitted.
+            .first = 0,
+            .last = 2,
+        },
+    });
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
+}
+
+test "storage: erase display preserves scrollback and reclaims unplaced images" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    const s = &t.screens.active.kitty_images;
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const history_key: ImageStorage.PlacementKey = .{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        s.placements.get(history_key).?.location.pin.*,
+    ) == null);
+
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 3, .width = 1, .height = 1 });
+
+    t.eraseDisplay(.complete, false);
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(s.placements.contains(history_key));
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(1));
+    try testing.expect(!s.images.contains(2));
+    try testing.expect(!s.images.contains(3));
 }
 
 test "storage: cell offsets stay within explicit destination rectangle" {
