@@ -118,9 +118,10 @@ pub const Handler = struct {
         /// valid for the lifetime of the call.
         enquiry: ?*const fn (*Handler) []const u8,
 
-        /// Called in response to XTWINOPS size queries (CSI 14/16/18 t).
-        /// Returns the current terminal geometry used for encoding.
-        /// Return null to silently ignore the query.
+        /// Called for XTWINOPS size queries (CSI 14/16/18 t) and when VT input
+        /// enables in-band size reports (mode 2048). Returns the current
+        /// terminal geometry used for encoding. Return null to suppress the
+        /// XTWINOPS response or mode 2048 report.
         size: ?*const fn (*Handler) ?size_report.Size,
 
         /// Called when the terminal title changes via escape sequences
@@ -674,6 +675,17 @@ pub const Handler = struct {
         self.writePty(resp);
     }
 
+    fn reportMode2048(self: *Handler) void {
+        const get_size = self.effects.size orelse return;
+        const current = get_size(self) orelse return;
+
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+        size_report.encode(&writer, .mode_2048, current) catch return;
+        buf[writer.end] = 0;
+        self.writePty(buf[0..writer.end :0]);
+    }
+
     fn windowTitle(self: *Handler, title_raw: []const u8) !void {
         // Prevent DoS attacks by limiting title length.
         const max_title_len = 1024;
@@ -797,9 +809,13 @@ pub const Handler = struct {
 
             .synchronized_output,
             .linefeed,
-            .in_band_size_reports,
             .focus_event,
             => {},
+
+            // Enabling mode 2048 reports already-committed pixel geometry.
+            // Waiting for the next resize leaves late-enabling clients without
+            // the dimensions they need for their first image frame.
+            .in_band_size_reports => if (enabled) self.reportMode2048(),
 
             .report_visibility => if (enabled) self.sendVisibilityReport(),
 
@@ -2907,6 +2923,97 @@ test "size report csi_14_t with effect" {
     s.nextSlice("\x1b[14t");
     defer testing.allocator.free(S.written.?);
     try testing.expectEqualStrings("\x1b[4;432;720t", S.written.?);
+}
+
+test "mode 2048 enable reports current geometry and disable is silent" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [128]u8 = undefined;
+        var response_len: usize = 0;
+        var calls: usize = 0;
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+            calls += 1;
+        }
+
+        fn getSize(_: *Handler) ?size_report.Size {
+            return .{ .rows = 24, .columns = 80, .cell_width = 8, .cell_height = 16 };
+        }
+    };
+    S.response_len = 0;
+    S.calls = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.size = &S.getSize;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1b[?2048h");
+    s.nextSlice("\x1b[?2048h");
+
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expectEqualStrings("\x1b[48;24;80;384;640t", S.response[0..S.response_len]);
+
+    s.nextSlice("\x1b[?2048l");
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expect(!t.modes.get(.in_band_size_reports));
+}
+
+test "mode 2048 enable tolerates missing effects" {
+    const S = struct {
+        var calls: usize = 0;
+
+        fn writePty(_: *Handler, _: [:0]const u8) void {
+            calls += 1;
+        }
+
+        fn getSize(_: *Handler) ?size_report.Size {
+            return .{ .rows = 24, .columns = 80, .cell_width = 8, .cell_height = 16 };
+        }
+    };
+    S.calls = 0;
+
+    var no_size_terminal: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer no_size_terminal.deinit(testing.allocator);
+    var no_size_handler: Handler = .init(&no_size_terminal);
+    no_size_handler.effects.write_pty = &S.writePty;
+    var no_size_stream: Stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = no_size_handler,
+    });
+    defer no_size_stream.deinit();
+
+    no_size_stream.nextSlice("\x1b[?2048h");
+    try testing.expect(no_size_terminal.modes.get(.in_band_size_reports));
+    try testing.expectEqual(@as(usize, 0), S.calls);
+
+    var no_write_terminal: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer no_write_terminal.deinit(testing.allocator);
+    var no_write_handler: Handler = .init(&no_write_terminal);
+    no_write_handler.effects.size = &S.getSize;
+    var no_write_stream: Stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = no_write_handler,
+    });
+    defer no_write_stream.deinit();
+
+    no_write_stream.nextSlice("\x1b[?2048h");
+    try testing.expect(no_write_terminal.modes.get(.in_band_size_reports));
+    try testing.expectEqual(@as(usize, 0), S.calls);
 }
 
 test "size report csi_16_t with effect" {

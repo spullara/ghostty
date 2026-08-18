@@ -272,9 +272,10 @@ const Effects = struct {
     /// and its content are borrowed for the callback duration.
     pub const UnknownSequenceFn = *const fn (Terminal, ?*anyopaque, *const UnknownSequence.C) callconv(lib.calling_conv) void;
 
-    /// C function pointer type for the size callback.
-    /// Returns true and fills out_size if size is available,
-    /// or returns false to silently ignore the query.
+    /// C function pointer type for the size callback. Used by XTWINOPS queries
+    /// and VT-driven mode 2048 enable reports. Returns true and fills out_size
+    /// if size is available, or false to suppress the XTWINOPS response or
+    /// mode 2048 report.
     pub const SizeFn = *const fn (Terminal, ?*anyopaque, *size_report.Size) callconv(lib.calling_conv) bool;
 
     /// C function pointer type for the device_attributes callback.
@@ -4671,6 +4672,109 @@ test "size without callback is silent" {
 
     // CSI 18 t without a size callback should not crash
     vt_write(t, "\x1B[18t", 5);
+}
+
+test "mode 2048 enable and disable use C callbacks" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var data: [128]u8 = undefined;
+        var len: usize = 0;
+        var calls: usize = 0;
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, length: usize) callconv(lib.calling_conv) void {
+            @memcpy(data[0..length], ptr[0..length]);
+            len = length;
+            calls += 1;
+        }
+
+        fn sizeCb(_: Terminal, _: ?*anyopaque, out_size: *size_report.Size) callconv(lib.calling_conv) bool {
+            out_size.* = .{
+                .rows = 24,
+                .columns = 80,
+                .cell_width = 8,
+                .cell_height = 16,
+            };
+            return true;
+        }
+    };
+    S.len = 0;
+    S.calls = 0;
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .size_cb, @ptrCast(&S.sizeCb)));
+
+    const enable = "\x1B[?2048h";
+    const disable = "\x1B[?2048l";
+    vt_write(t, enable, enable.len);
+    vt_write(t, enable, enable.len);
+
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expectEqualStrings("\x1B[48;24;80;384;640t", S.data[0..S.len]);
+    vt_write(t, disable, disable.len);
+
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expect(!t.?.terminal.modes.get(.in_band_size_reports));
+}
+
+test "mode 2048 enable tolerates missing C callbacks" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var writes: usize = 0;
+        var sizes: usize = 0;
+
+        fn writePty(_: Terminal, _: ?*anyopaque, _: [*]const u8, _: usize) callconv(lib.calling_conv) void {
+            writes += 1;
+        }
+
+        fn sizeCb(_: Terminal, _: ?*anyopaque, out_size: *size_report.Size) callconv(lib.calling_conv) bool {
+            sizes += 1;
+            out_size.* = .{
+                .rows = 24,
+                .columns = 80,
+                .cell_width = 8,
+                .cell_height = 16,
+            };
+            return true;
+        }
+    };
+    S.writes = 0;
+    S.sizes = 0;
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+
+    const sequence = "\x1B[?2048h";
+    vt_write(t, sequence, sequence.len);
+
+    try testing.expectEqual(@as(usize, 0), S.writes);
+    try testing.expect(t.?.terminal.modes.get(.in_band_size_reports));
+    var no_write: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &no_write,
+        80,
+        24,
+    ));
+    defer free(no_write);
+    try testing.expectEqual(Result.success, set(no_write, .size_cb, @ptrCast(&S.sizeCb)));
+    vt_write(no_write, sequence, sequence.len);
+    try testing.expectEqual(@as(usize, 1), S.sizes);
+    try testing.expect(no_write.?.terminal.modes.get(.in_band_size_reports));
 }
 
 test "set device_attributes callback primary" {
