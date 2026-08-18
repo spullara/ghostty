@@ -39,6 +39,10 @@ pub const LoadingImage = struct {
     /// used if q isn't set on subsequent chunks.
     quiet: command.Command.Quiet,
 
+    /// Response identifiers from the initial load command. Subsequent chunks
+    /// omit these, so completion responses must use the saved values.
+    response: command.Response = .{},
+
     /// The temporary directory for file transmission (null means that
     /// temporary directory transmission is disabled).
     temporary_directory: ?[]const u8,
@@ -104,6 +108,11 @@ pub const LoadingImage = struct {
 
             .display = cmd.display(),
             .quiet = cmd.quiet,
+            .response = .{
+                .id = t.image_id,
+                .image_number = t.image_number,
+                .placement_id = t.placement_id,
+            },
             .temporary_directory = switch (limits.temporary_file) {
                 .enabled => |d| d.directory,
                 .disabled => null,

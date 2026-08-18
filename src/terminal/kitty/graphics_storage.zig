@@ -722,6 +722,8 @@ pub const ImageStorage = struct {
         placement_id: u32,
         delete_unused: bool,
     ) void {
+        var matched = placement_id == 0;
+
         // If no placement, we delete all placements with the ID
         if (placement_id == 0) self.removePlacementsByImageId(
             s,
@@ -735,11 +737,13 @@ pub const ImageStorage = struct {
         })) |entry| {
             entry.value_ptr.deinit(s);
             self.removePlacementByPtr(entry.key_ptr);
+            matched = true;
         }
 
-        // If this is specified, then we also delete the image
-        // if it is no longer in use.
-        if (delete_unused) self.deleteIfUnused(alloc, image_id);
+        // A placement ID narrows the selection to that exact placement, so an
+        // unmatched selector must not free otherwise-unreferenced image data.
+        // https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
+        if (delete_unused and matched) self.deleteIfUnused(alloc, image_id);
     }
 
     /// Delete an image if it is unused.
@@ -1523,6 +1527,79 @@ test "storage: delete placement by specific id" {
     try testing.expectEqual(@as(usize, 2), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: uppercase id delete preserves image when placement does not match" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+
+    s.dirty = false;
+    const generation = s.generation;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+        .placement_id = 7,
+    } });
+
+    try testing.expect(s.imageById(1) != null);
+    try testing.expect(!s.dirty);
+    try testing.expectEqual(generation, s.generation);
+}
+
+test "storage: uppercase id delete frees image after placement matches" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 9, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+    });
+
+    s.dirty = false;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+        .placement_id = 9,
+    } });
+
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expect(s.dirty);
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: uppercase id delete without placement frees unplaced image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+
+    s.dirty = false;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+    } });
+
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expect(s.dirty);
 }
 
 test "storage: delete intersecting cursor" {
