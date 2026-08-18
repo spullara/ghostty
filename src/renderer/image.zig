@@ -438,18 +438,9 @@ pub const State = struct {
         // Calculate the dimensions of our image, taking in to
         // account the rows / columns specified by the placement.
         const dest_size = p.pixelSize(image.*, t);
+        const cell_offset = p.cellOffset(t);
 
-        // Calculate the source rectangle
-        const source_x = @min(image.width, p.source_x);
-        const source_y = @min(image.height, p.source_y);
-        const source_width = if (p.source_width > 0)
-            @min(image.width - source_x, p.source_width)
-        else
-            image.width;
-        const source_height = if (p.source_height > 0)
-            @min(image.height - source_y, p.source_height)
-        else
-            image.height;
+        const source = p.sourceRect(image.*);
 
         // Get the viewport-relative Y position of the placement.
         const y_pos: i32 = @as(i32, @intCast(img_top_y)) - @as(i32, @intCast(top_y));
@@ -463,12 +454,12 @@ pub const State = struct {
                 .z = p.z,
                 .width = dest_size.width,
                 .height = dest_size.height,
-                .cell_offset_x = p.x_offset,
-                .cell_offset_y = p.y_offset,
-                .source_x = source_x,
-                .source_y = source_y,
-                .source_width = source_width,
-                .source_height = source_height,
+                .cell_offset_x = cell_offset.x,
+                .cell_offset_y = cell_offset.y,
+                .source_x = source.x,
+                .source_y = source.y,
+                .source_width = source.width,
+                .source_height = source.height,
             });
         }
     }
@@ -1035,4 +1026,48 @@ test "kitty renderer ignores pending payloads and removes replaced placements" {
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
     try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
     try testing.expect(state.images.get(.{ .kitty = 1 }).?.image.isUnloading());
+}
+
+test "kitty renderer uses the intersected source rectangle" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    t.width_px = 30;
+    t.height_px = 30;
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+
+    const storage = &t.screens.active.kitty_images;
+    const pixels = try alloc.alloc(u8, 4 * 3 * 3);
+    @memset(pixels, 0);
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 4,
+        .height = 3,
+        .format = .rgb,
+        .data = .{ .complete = pixels },
+    });
+    const pin = try t.screens.active.pages.trackPin(
+        t.screens.active.cursor.page_pin.*,
+    );
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = pin },
+        .source_x = 3,
+        .source_y = 1,
+    });
+
+    state.kittyUpdate(alloc, &t, .{ .width = 10, .height = 10 });
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+
+    const placement = state.kitty_placements.items[0];
+    try testing.expectEqual(@as(u32, 1), placement.width);
+    try testing.expectEqual(@as(u32, 2), placement.height);
+    try testing.expectEqual(@as(u32, 3), placement.source_x);
+    try testing.expectEqual(@as(u32, 1), placement.source_y);
+    try testing.expectEqual(@as(u32, 1), placement.source_width);
+    try testing.expectEqual(@as(u32, 2), placement.source_height);
 }

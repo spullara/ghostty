@@ -516,16 +516,12 @@ pub fn placement_source_rect(
     const entry = iter.entry orelse return .invalid_value;
     const p = entry.value_ptr;
 
-    // Apply "0 = full image dimension" convention, then clamp to image bounds.
-    const x = @min(p.source_x, image.width);
-    const y = @min(p.source_y, image.height);
-    const w = @min(if (p.source_width > 0) p.source_width else image.width, image.width - x);
-    const h = @min(if (p.source_height > 0) p.source_height else image.height, image.height - y);
+    const source = p.sourceRect(image.*);
 
-    out_x.* = x;
-    out_y.* = y;
-    out_width.* = w;
-    out_height.* = h;
+    out_x.* = source.x;
+    out_y.* = source.y;
+    out_width.* = source.width;
+    out_height.* = source.height;
 
     return .success;
 }
@@ -576,12 +572,11 @@ pub fn placement_render_info(
     out.viewport_row = vp.row;
     out.viewport_visible = vp.visible;
 
-    const x = @min(p.source_x, image.width);
-    const y = @min(p.source_y, image.height);
-    out.source_x = x;
-    out.source_y = y;
-    out.source_width = @min(if (p.source_width > 0) p.source_width else image.width, image.width - x);
-    out.source_height = @min(if (p.source_height > 0) p.source_height else image.height, image.height - y);
+    const source = p.sourceRect(image.*);
+    out.source_x = source.x;
+    out.source_y = source.y;
+    out.source_width = source.width;
+    out.source_height = source.height;
 
     return .success;
 }
@@ -1567,6 +1562,15 @@ test "placement_source_rect clamps to image bounds" {
     try testing.expectEqual(3, y);
     try testing.expectEqual(1, w);
     try testing.expectEqual(1, h);
+
+    var pixel_width: u32 = undefined;
+    var pixel_height: u32 = undefined;
+    try testing.expectEqual(
+        Result.success,
+        placement_pixel_size(iter, img, t, &pixel_width, &pixel_height),
+    );
+    try testing.expectEqual(1, pixel_width);
+    try testing.expectEqual(1, pixel_height);
 }
 
 test "placement_source_rect null args return invalid_value" {
