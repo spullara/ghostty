@@ -2872,16 +2872,7 @@ pub const SelectionString = struct {
 
     /// If true, trim whitespace around the selection.
     trim: bool = true,
-
-    /// If non-null, a stringmap will be written here. This will use
-    /// the same allocator as the call to selectionString. The string will
-    /// be duplicated here and in the return value so both must be freed.
-    map: ?*StringMap = null,
 };
-
-const selectionString_tw = tripwire.module(enum {
-    copy_map,
-}, selectionString);
 
 /// Returns the raw text associated with a selection. This will unwrap
 /// soft-wrapped edges. The returned slice is owned by the caller and allocated
@@ -2892,6 +2883,32 @@ pub fn selectionString(
     self: *Screen,
     alloc: Allocator,
     opts: SelectionString,
+) Allocator.Error![:0]const u8 {
+    return self.selectionStringImpl(alloc, opts, null);
+}
+
+/// Returns a StringMap associated with a selection. The map contains the
+/// selection's raw text and a mapping from each byte to its screen location.
+///
+/// The returned map is owned by the caller.
+pub fn selectionStringMap(
+    self: *Screen,
+    alloc: Allocator,
+    opts: SelectionString,
+) Allocator.Error!StringMap {
+    var pins: PinMap.Map = .empty;
+    errdefer pins.deinit(alloc);
+    return .{
+        .string = try self.selectionStringImpl(alloc, opts, &pins),
+        .map = pins,
+    };
+}
+
+fn selectionStringImpl(
+    self: *Screen,
+    alloc: Allocator,
+    opts: SelectionString,
+    pins: ?*PinMap.Map,
 ) Allocator.Error![:0]const u8 {
     // We'll use this as our buffer to build our string.
     var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -2908,35 +2925,15 @@ pub fn selectionString(
     );
     formatter.content = .{ .selection = opts.sel };
 
-    // If we have a string map, we need to set that up.
-    var pins: PinMap.Map = .empty;
-    defer pins.deinit(alloc);
-    if (opts.map != null) formatter.pin_map = .{
+    if (pins) |map| formatter.pin_map = .{
         .alloc = alloc,
-        .map = &pins,
+        .map = map,
     };
 
     // Emit. Since this is an allocating writer, a failed write
     // just becomes an OOM.
     formatter.format(&aw.writer) catch return error.OutOfMemory;
-
-    // Build our final text and if we have a string map set that up.
-    const text = try aw.toOwnedSliceSentinel(0);
-    errdefer alloc.free(text);
-    if (opts.map) |map| {
-        const map_string = try alloc.dupeZ(u8, text);
-        errdefer alloc.free(map_string);
-        try selectionString_tw.check(.copy_map);
-        map.* = .{
-            .string = map_string,
-            .map = pins,
-        };
-
-        // Ownership of the pin map moved to the string map.
-        pins = .empty;
-    }
-
-    return text;
+    return try aw.toOwnedSliceSentinel(0);
 }
 
 pub const SelectLine = struct {
@@ -11438,38 +11435,6 @@ test "Screen setAttribute splits page on OutOfSpace at max styles" {
         node_before_set.prev != null or
         s.cursor.page_pin.node != original_node;
     try testing.expect(page_was_split);
-}
-
-test "selectionString map allocation failure cleanup" {
-    // This test verifies that if toOwnedSlice fails when building
-    // the StringMap, we don't leak the already-allocated map.string.
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var s = try Screen.init(io, alloc, .{ .cols = 10, .rows = 5, .max_scrollback_bytes = 0 });
-    defer s.deinit();
-
-    try s.testWriteString("hello");
-
-    // Get a selection
-    const sel = Selection.init(
-        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
-        s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?,
-        false,
-    );
-
-    // Trigger allocation failure on toOwnedSlice
-    var map: StringMap = undefined;
-    selectionString_tw.errorAlways(.copy_map, error.OutOfMemory);
-    const result = s.selectionString(alloc, .{
-        .sel = sel,
-        .map = &map,
-    });
-    try testing.expectError(error.OutOfMemory, result);
-    try selectionString_tw.end(.reset);
-
-    // If this test passes without memory leaks (when run with testing.allocator),
-    // it means the errdefer properly cleaned up map.string when toOwnedSlice failed.
 }
 
 test "Screen: promptClickMove line right basic" {

@@ -4369,12 +4369,10 @@ fn linkAtPin(
         .semantic_prompt_boundary = true,
     }) orelse return null;
 
-    var strmap: terminal.StringMap = undefined;
-    self.alloc.free(try screen.selectionString(self.alloc, .{
+    const strmap = try screen.selectionStringMap(self.alloc, .{
         .sel = line,
         .trim = false,
-        .map = &strmap,
-    }));
+    });
     defer strmap.deinit(self.alloc);
 
     for (self.config.links) |link| {
