@@ -408,6 +408,171 @@ pub const ImageStorage = struct {
         self.markMutated(io);
     }
 
+    /// How the row operation behind a scrollMarginsBegin/end pair moves
+    /// tracked pins, which determines how much repositioning work the
+    /// placements need.
+    pub const ScrollOp = enum {
+        /// The operation shifts the entire active window down (it
+        /// creates scrollback), so every placement anchored in the
+        /// active area changes active position and must be restored.
+        window_shift,
+
+        /// The operation moves rows in place within the scrolling
+        /// region: pins anchored outside the region rows keep their
+        /// active position without help, so only placements anchored
+        /// inside the region rows need handling. This is the common
+        /// case (e.g. a status bar image beside a scrolling pane
+        /// costs almost nothing per scroll).
+        in_place,
+    };
+
+    /// Adjust placements for a scroll of the terminal's scrolling region
+    /// by `delta` rows (negative moves content up). This implements the
+    /// Kitty graphics protocol behavior for scrolls bounded by margins:
+    /// placements entirely inside the scrolling region move with the content
+    /// and are clipped when the move would extend them past a margin (deleted
+    /// when fully clipped), while every other placement (straddling a margin,
+    /// outside the region, or in the scrollback) must not move at all.
+    ///
+    /// This is split into two phases around the row operation because
+    /// the various scroll implementations move tracked pins in
+    /// inconsistent ways (some shift the active area so every pin moves,
+    /// some rotate rows in place and adjust only pins inside the
+    /// region). We record the desired final position of every placement
+    /// up front in the returned state, whose end() repositions the pins
+    /// once the rows have settled, making the result independent of the
+    /// path taken. Every call must be paired with exactly one end().
+    ///
+    /// Callers must skip this entirely when the scrolling region is the
+    /// full screen: a full-screen scroll moves placements with their
+    /// anchored rows (possibly into the scrollback) via pin tracking,
+    /// which already matches kitty's marginless scroll behavior.
+    pub fn scrollMarginsBegin(
+        self: *ImageStorage,
+        io: std.Io,
+        t: *terminal.Terminal,
+        delta: isize,
+        op: ScrollOp,
+    ) ScrollMargins {
+        const s: *terminal.Screen = t.screens.active;
+        assert(self == &s.kitty_images);
+        var result: ScrollMargins = .{ .screen = s };
+
+        const top: i64 = t.scrolling_region.top;
+        const bottom: i64 = t.scrolling_region.bottom;
+
+        var mutated = false;
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const p: *Placement = entry.value_ptr;
+
+            // Virtual placements follow their placeholder cells and
+            // are never adjusted by scrolls, matching kitty.
+            const pin: *PageList.Pin = switch (p.location) {
+                .pin => |pin| pin,
+                .virtual => continue,
+            };
+
+            // Pruned placements are reaped by removeGarbagePlacements.
+            if (pin.garbage) continue;
+
+            // Placements anchored outside the active area (scrollback)
+            // are never touched by a scroll within the margins.
+            const coord = (s.pages.pointFromPin(
+                .active,
+                pin.*,
+            ) orelse continue).coord();
+            const y: i64 = coord.y;
+
+            // An in-place operation doesn't touch pins anchored outside
+            // the region rows, and a placement anchored there can never
+            // be entirely inside the region, so it needs no work at all.
+            if (op == .in_place and (y < top or y > bottom)) continue;
+
+            // The final position defaults to unmoved; restoring the pin
+            // to this exact spot afterwards is what stops the row
+            // operations from dragging the placement around.
+            var final_y: i64 = y;
+
+            inside: {
+                const image = self.images.get(entry.key_ptr.image_id) orelse break :inside;
+                const grid = p.gridSize(image, t);
+
+                // Unknown geometry (e.g. pixel sizes not yet reported)
+                // means we can't know the extent, so we can't consider
+                // the placement contained.
+                if (grid.rows == 0 or grid.cols == 0) break :inside;
+
+                // Only placements entirely within the scrolling region
+                // move. Kitty only has top/bottom margins so it only
+                // checks rows; the column check is our generalization
+                // for left/right margins and is trivially true for
+                // full-width regions.
+                if (y < top or y + grid.rows - 1 > bottom) break :inside;
+                const x: i64 = coord.x;
+                if (x < t.scrolling_region.left or
+                    @min(x + grid.cols - 1, @as(i64, t.cols) - 1) > t.scrolling_region.right) break :inside;
+
+                const new_y: i64 = y + delta;
+                const rows: i64 = grid.rows;
+                const top_clip: i64 = @max(0, top - new_y);
+                const bottom_clip: i64 = @max(0, new_y + rows - 1 - bottom);
+                const visible: bool = clip: {
+                    if (top_clip >= rows or bottom_clip >= rows) break :clip false;
+
+                    if (top_clip > 0) {
+                        if (!p.clipTop(
+                            image,
+                            t,
+                            @intCast(top_clip),
+                            grid.rows,
+                        )) break :clip false;
+                        mutated = true;
+                        final_y = top;
+                        break :clip true;
+                    }
+
+                    if (bottom_clip > 0) {
+                        if (!p.clipBottom(
+                            image,
+                            t,
+                            @intCast(bottom_clip),
+                            grid.rows,
+                        )) break :clip false;
+                        mutated = true;
+                    }
+
+                    final_y = new_y;
+                    break :clip true;
+                };
+
+                // Scrolled or clipped entirely out of the region: the
+                // placement is deleted, like kitty. The image itself is
+                // retained for future placements.
+                if (!visible) {
+                    p.deinit(s);
+                    self.removePlacementByPtr(entry.key_ptr);
+                    mutated = true;
+                    continue;
+                }
+            }
+
+            result.restores.append(s.alloc, .{
+                .pin = pin,
+                .x = pin.x,
+                .y = @intCast(final_y),
+            }) catch {
+                // OOM: this placement is left to the whims of the
+                // generic pin tracking. Degraded, but safe.
+                log.warn("OOM adjusting image placement for scroll", .{});
+                continue;
+            };
+        }
+
+        if (mutated) self.markMutated(io);
+        return result;
+    }
+
     /// Remove pin-backed placements whose tracked content has been pruned.
     /// Virtual placements have no tracked screen location and are retained.
     fn removeGarbagePlacements(
@@ -909,6 +1074,35 @@ pub const ImageStorage = struct {
         return true;
     }
 
+    /// State returned by scrollMarginsBegin: the final active-area
+    /// position every surviving placement pin must be restored to once
+    /// the scrolled rows have settled. Every begin must be paired with
+    /// exactly one end() call after the scroll's row operations
+    /// complete.
+    pub const ScrollMargins = struct {
+        screen: *terminal.Screen,
+        restores: std.ArrayListUnmanaged(Restore) = .empty,
+
+        const Restore = struct {
+            pin: *PageList.Pin,
+            x: size.CellCountInt,
+            y: u32,
+        };
+
+        /// Reposition every recorded placement pin to its post-scroll
+        /// position and release the state. Must be called exactly
+        /// once, after the scroll's row operations complete.
+        pub fn end(self: *ScrollMargins) void {
+            for (self.restores.items) |restore| {
+                restore.pin.* = self.screen.pages.pin(.{ .active = .{
+                    .x = restore.x,
+                    .y = restore.y,
+                } }) orelse continue;
+            }
+            self.restores.deinit(self.screen.alloc);
+        }
+    };
+
     /// Every placement is uniquely identified by the image ID and the
     /// placement ID. If an image ID isn't specified it is assumed to be 0.
     /// Likewise, if a placement ID isn't specified it is assumed to be 0.
@@ -1141,6 +1335,74 @@ pub const ImageStorage = struct {
             };
             // NOTE: Above `divCeil`s can only fail if the cell size is 0,
             //       in such a case it seems safe to return 0 for this.
+        }
+
+        /// Permanently clip `count` rows off the top of this placement,
+        /// which currently spans `span` grid rows, by shrinking the
+        /// source rectangle (the requested source rect is materialized
+        /// into explicit values in the process). Used when a scroll
+        /// within margins pushes the placement past the top margin.
+        /// Requires 0 < count < span. Returns false if no visible
+        /// source pixels would remain, in which case the placement is
+        /// unmodified and should be deleted.
+        fn clipTop(
+            self: *Placement,
+            image: Image,
+            t: *const terminal.Terminal,
+            count: u32,
+            span: u32,
+        ) bool {
+            assert(count > 0 and count < span);
+            const src = self.sourceRect(image);
+            const crop: u32 = if (self.rows > 0)
+                // Scaled placement: each grid row shows an equal
+                // fraction of the source.
+                @intCast(@as(u64, src.height) * count / span)
+            else
+                // Native size: each grid row shows one cell height of
+                // source pixels (kitty does the same).
+                saturatingMul(t.height_px / t.rows, count);
+            if (crop >= src.height) return false;
+            self.source_x = src.x;
+            self.source_y = src.y + crop;
+            self.source_width = src.width;
+            self.source_height = src.height - crop;
+            if (self.rows > 0) self.rows -= count;
+            return true;
+        }
+
+        /// clipTop, but clipping `count` rows off the bottom.
+        fn clipBottom(
+            self: *Placement,
+            image: Image,
+            t: *const terminal.Terminal,
+            count: u32,
+            span: u32,
+        ) bool {
+            assert(count > 0 and count < span);
+            const src = self.sourceRect(image);
+            // An empty source can never be clipped smaller. This also
+            // guarantees we never store an explicit zero source height,
+            // which would be reinterpreted as "full image".
+            if (src.height == 0) return false;
+            if (self.rows > 0) {
+                const crop: u32 = @intCast(@as(u64, src.height) * count / span);
+                if (crop >= src.height) return false;
+                self.source_height = src.height - crop;
+                self.rows -= count;
+            } else {
+                // The remaining rows can show this many source pixels,
+                // with the first cell losing cellOffset pixels to the
+                // placement's y offset.
+                const visible = saturatingMul(t.height_px / t.rows, span - count);
+                const offset = self.cellOffset(t).y;
+                if (visible <= offset) return false;
+                self.source_height = @min(src.height, visible - offset);
+            }
+            self.source_x = src.x;
+            self.source_y = src.y;
+            self.source_width = src.width;
+            return true;
         }
 
         /// Returns a selection of the entire rectangle this placement
@@ -2885,4 +3147,427 @@ test "storage: nextImageId implicit skips in-use ids and zero" {
     s.next_image_id = std.math.maxInt(u32);
     try testing.expectEqual(std.math.maxInt(u32), s.nextImageId(.implicit));
     try testing.expectEqual(@as(u32, 1), s.nextImageId(.implicit));
+}
+
+test "storage: scroll margins placement inside region scrolls and clips at top" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 2-row image (10x10px cells) inside the region (rows 1-4).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 20,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(5, 1);
+
+    // Entirely inside: moves up with the content.
+    try t.index();
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
+    }
+
+    // Would extend above the top margin: anchored at the top margin
+    // with the top cell row clipped off the source.
+    try t.index();
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
+        try testing.expectEqual(@as(u32, 10), p.source_y);
+        try testing.expectEqual(@as(u32, 10), p.source_height);
+    }
+
+    // Fully clipped: deleted.
+    try t.index();
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+    // The image itself is retained.
+    try testing.expectEqual(@as(usize, 1), storage.images.count());
+}
+
+test "storage: scroll margins placement straddling region does not move" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 3-row image anchored at the top of a 2-row region: not entirely
+    // within the region, so region scrolls must not move it. This
+    // exercises the scrollback-creating path (region top at row 0).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 30,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+    t.setTopAndBottomMargin(1, 2);
+    t.setCursorPos(2, 1);
+
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, pt.coord());
+    try testing.expectEqual(@as(u32, 0), p.source_y);
+    try testing.expectEqual(@as(u32, 0), p.source_height);
+}
+
+test "storage: scroll margins placement below region does not move" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // A "status bar" image below the bottom margin must stay put while
+    // the region above it scrolls (scrollback-creating path).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 5 }) },
+    });
+    t.setTopAndBottomMargin(1, 4);
+    t.setCursorPos(4, 1);
+
+    try t.index();
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 5 }, pt.coord());
+}
+
+test "storage: scroll margins reverse index clips at bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 2-row image at the bottom of the region (rows 1-4).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 20,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 3 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(2, 1);
+
+    // Moves down, with the bottom cell row clipped off the source.
+    t.reverseIndex();
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 4 }, pt.coord());
+        try testing.expectEqual(@as(u32, 0), p.source_y);
+        try testing.expectEqual(@as(u32, 10), p.source_height);
+    }
+
+    // Fully clipped: deleted.
+    t.reverseIndex();
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+}
+
+test "storage: scroll margins scaled placement clips proportionally" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // A 40px-tall image scaled into 2 rows, inside a 2-row region.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 40,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 1 }) },
+        .columns = 1,
+        .rows = 2,
+    });
+    t.setTopAndBottomMargin(2, 3);
+    t.setCursorPos(3, 1);
+
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
+    try testing.expectEqual(@as(u32, 20), p.source_y);
+    try testing.expectEqual(@as(u32, 20), p.source_height);
+    try testing.expectEqual(@as(u32, 1), p.rows);
+    try testing.expectEqual(@as(u32, 1), p.columns);
+}
+
+test "storage: scroll margins left/right margins respect columns" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // One placement outside the left/right margin columns, one inside.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 2, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 2, .y = 2 }) },
+    });
+
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(2, 8);
+
+    try t.scrollUp(1);
+
+    // Outside the margin columns: stays.
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 2 }, pt.coord());
+    }
+
+    // Inside: moves up.
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 2 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 2, .y = 1 }, pt.coord());
+    }
+}
+
+test "storage: scroll margins insert/delete lines do not move placements" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // Kitty does not scroll images for IL/DL, only for IND/RI/SU/SD.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(2, 1);
+
+    t.deleteLines(1);
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 2 }, pt.coord());
+    }
+
+    t.insertLines(1);
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 2 }, pt.coord());
+    }
+}
+
+test "storage: scroll without margins moves placement into scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // No margins: the placement follows its anchored row into the
+    // scrollback via pin tracking (kitty's marginless behavior).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 20,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+    t.setCursorPos(6, 1);
+
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        p.location.pin.*,
+    ) == null);
+    const pt = t.screens.active.pages.pointFromPin(.screen, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, pt.coord());
+}
+
+test "storage: scroll margins large scroll deletes inside placement" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+
+    try t.scrollUp(10);
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+}
+
+test "storage: scroll margins straddling placement pin inside region restored" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 2-row image anchored on the bottom margin row, extending below
+    // the region: not entirely inside, so it must not move even though
+    // the region scroll moves every tracked pin within the region rows.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 20,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 4 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(5, 1);
+
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 4 }, pt.coord());
+    try testing.expectEqual(@as(u32, 0), p.source_y);
+    try testing.expectEqual(@as(u32, 0), p.source_height);
+}
+
+test "storage: scroll margins multi-line scroll up with scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 1-row image inside a region whose top is the screen top, so the
+    // scroll pushes text into the scrollback (window shift) while the
+    // image moves within the region.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    t.setTopAndBottomMargin(1, 4);
+
+    try t.scrollUp(2);
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, pt.coord());
+    }
+
+    // Another two rows scrolls it out of the region: deleted.
+    try t.scrollUp(2);
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
 }

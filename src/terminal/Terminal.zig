@@ -2347,16 +2347,40 @@ pub fn index(self: *Terminal) !void {
             (!screen.no_scrollback or
                 self.scrolling_region.bottom == 0))
         {
+            // If a bottom margin is set, kitty image placements may
+            // need adjusting around the scroll. The rare placements-
+            // present case is handled out of line so this hot path
+            // only pays a count check (a load from a cache line we
+            // already write, above).
+            if (comptime build_options.kitty_graphics) {
+                if (screen.kitty_images.placements.count() != 0) {
+                    @branchHint(.unlikely);
+                    try self.indexScrollWithImages(.window_shift);
+                    return;
+                }
+            }
+
             try screen.cursorScrollAbove();
             return;
         }
 
         // Slow path for left and right scrolling region margins.
+        // scrollUp handles the kitty image adjustment itself.
         if (self.scrolling_region.left != 0 or
             self.scrolling_region.right != self.cols - 1)
         {
             try self.scrollUp(1);
             return;
+        }
+
+        // Kitty image placements may need adjusting around the scroll;
+        // handled out of line like the scrollback path above.
+        if (comptime build_options.kitty_graphics) {
+            if (screen.kitty_images.placements.count() != 0) {
+                @branchHint(.unlikely);
+                try self.indexScrollWithImages(.in_place);
+                return;
+            }
         }
 
         // Otherwise use a fast path function to efficiently scroll
@@ -2372,6 +2396,69 @@ pub fn index(self: *Terminal) !void {
     if (screen.cursor.y < self.scrolling_region.bottom) {
         screen.cursorDown(1);
     }
+}
+
+/// The operation when we have Kitty image placements during index.
+/// Split out of index() so its hot paths don't carry the adjustment
+/// state in their stack frame, which measurably slows the scroll
+/// hot path.
+fn indexScrollWithImages(
+    self: *Terminal,
+    comptime op: kitty.graphics.ImageStorage.ScrollOp,
+) !void {
+    var kitty_scroll = self.kittyScrollMarginsBegin(-1, op);
+    defer if (kitty_scroll) |*state| state.end();
+    switch (op) {
+        .window_shift => try self.screens.active.cursorScrollAbove(),
+        .in_place => try self.screens.active.cursorScrollRegionUp(
+            self.scrolling_region.bottom - self.scrolling_region.top,
+        ),
+    }
+}
+
+// Handle when Kitty graphics is disabled.
+const KittyScrollMargins = if (build_options.kitty_graphics)
+    kitty.graphics.ImageStorage.ScrollMargins
+else
+    struct {
+        pub inline fn end(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+/// Begin adjusting kitty image placements for a scroll of the
+/// scrolling region by delta rows (negative moves content up). If
+/// adjustment is needed this returns state whose end() must be called
+/// after the scroll's row operations complete (see
+/// ImageStorage.scrollMarginsBegin for why this is two phases). This
+/// returns null when the scrolling region is the full screen, because
+/// placements then follow their anchored rows via pin tracking which
+/// matches kitty's marginless behavior.
+///
+/// Callers must comptime-gate on build_options.kitty_graphics and
+/// check that placements exist before calling, which keeps the cost
+/// on the hot scroll paths cheap.
+fn kittyScrollMarginsBegin(
+    self: *Terminal,
+    delta: isize,
+    op: kitty.graphics.ImageStorage.ScrollOp,
+) ?kitty.graphics.ImageStorage.ScrollMargins {
+    @branchHint(.cold);
+
+    // Full-screen scrolls need no adjustment: placements follow their
+    // anchored rows (possibly into the scrollback) via pin tracking.
+    if (self.scrolling_region.top == 0 and
+        self.scrolling_region.bottom == self.rows - 1 and
+        self.scrolling_region.left == 0 and
+        self.scrolling_region.right == self.cols - 1) return null;
+
+    const screen: *Screen = self.screens.active;
+    return screen.kitty_images.scrollMarginsBegin(
+        self.io(),
+        self,
+        delta,
+        op,
+    );
 }
 
 /// Move the cursor to the previous line in the scrolling region, possibly
@@ -2499,6 +2586,24 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
         self.screens.active.cursor.pending_wrap = old_wrap;
     }
 
+    // If margins are set and kitty image placements exist, they need
+    // adjusting around the scroll. Note this wraps scrollDown and NOT
+    // insertLines: kitty scrolls images for SD/RI but leaves them
+    // alone for IL/DL.
+    var kitty_scroll: ?KittyScrollMargins = null;
+    defer if (kitty_scroll) |*state| state.end();
+    if (comptime build_options.kitty_graphics) {
+        if (self.screens.active.kitty_images.placements.count() != 0) {
+            @branchHint(.unlikely);
+            const region_height: usize =
+                @as(usize, self.scrolling_region.bottom - self.scrolling_region.top) + 1;
+            kitty_scroll = self.kittyScrollMarginsBegin(
+                @intCast(@min(count, region_height)),
+                .in_place,
+            );
+        }
+    }
+
     // Move to the top of the scroll region
     self.screens.active.cursorAbsolute(self.scrolling_region.left, self.scrolling_region.top);
     self.insertLines(count);
@@ -2519,6 +2624,35 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
     defer {
         self.screens.active.cursorAbsolute(old_x, old_y);
         self.screens.active.cursor.pending_wrap = old_wrap;
+    }
+
+    // If margins are set and kitty image placements exist, they need
+    // adjusting around the scroll. Note this wraps scrollUp and NOT
+    // deleteLines: kitty scrolls images for SU/IND but leaves them
+    // alone for IL/DL.
+    var kitty_scroll: ?KittyScrollMargins = null;
+    defer if (kitty_scroll) |*state| state.end();
+    if (comptime build_options.kitty_graphics) {
+        if (self.screens.active.kitty_images.placements.count() != 0) {
+            @branchHint(.unlikely);
+
+            // The op must mirror the branch below: the scrollback path
+            // shifts the active window while the deleteLines path
+            // moves rows in place.
+            const region_height: usize =
+                @as(usize, self.scrolling_region.bottom - self.scrolling_region.top) + 1;
+            kitty_scroll = self.kittyScrollMarginsBegin(
+                -@as(isize, @intCast(@min(count, region_height))),
+                if (self.scrolling_region.top == 0 and
+                    self.scrolling_region.left == 0 and
+                    self.scrolling_region.right == self.cols - 1 and
+                    (!self.screens.active.no_scrollback or
+                        self.scrolling_region.bottom == self.rows - 1))
+                    .window_shift
+                else
+                    .in_place,
+            );
+        }
     }
 
     // If our scroll region is at the top and we have no left/right
