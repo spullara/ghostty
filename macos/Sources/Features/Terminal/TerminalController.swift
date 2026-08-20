@@ -1239,12 +1239,6 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         super.windowDidBecomeKey(notification)
         self.relabelTabs()
         self.fixTabBar()
-        terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)
-    }
-
-    override func windowDidResignKey(_ notification: Notification) {
-        super.windowDidResignKey(notification)
-        terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: false)
     }
 
     override func windowDidMove(_ notification: Notification) {

@@ -119,13 +119,15 @@ const ThreadEnterState = struct {
     ) (Allocator.Error || error{InputNotFound})![]const Input {
         const alloc = self.arena.allocator();
 
-        var input = try alloc.alloc(
-            Input,
+        var inputs: std.ArrayList(Input) = try .initCapacity(
+            alloc,
             self.input.list.items.len,
         );
-        for (self.input.list.items, 0..) |item, i| {
-            input[i] = switch (item) {
-                .raw => |v| .{ .string = try alloc.dupe(u8, v) },
+        errdefer for (inputs.items) |item| item.deinit();
+
+        for (self.input.list.items) |item| {
+            inputs.appendAssumeCapacity(switch (item) {
+                .raw => |v| .{ .string = v },
                 .path => |path| file: {
                     const f = std.Io.Dir.cwd().openFile(
                         global.io(),
@@ -141,15 +143,22 @@ const ThreadEnterState = struct {
 
                     break :file .{ .file = f };
                 },
-            };
+            });
         }
 
-        return input;
+        return inputs.items;
     }
 
     const Input = union(enum) {
         string: []const u8,
         file: std.Io.File,
+
+        fn deinit(self: Input) void {
+            switch (self) {
+                .string => {},
+                .file => |f| f.close(global.io()),
+            }
+        }
     };
 };
 
@@ -346,6 +355,9 @@ pub fn threadEnter(
         try v.prepareInput()
     else
         null;
+    defer if (inputs) |items| {
+        for (items) |input| input.deinit();
+    };
 
     data.* = .{
         .alloc = self.alloc,
@@ -366,20 +378,21 @@ pub fn threadEnter(
             log.warn("failed to queue input string err={}", .{err});
             return error.InputFailed;
         },
-        .file => |f| self.queueWrite(
-            data,
-            compat_file.readToEndAlloc(
+        .file => |f| {
+            const contents = compat_file.readToEndAlloc(
                 f,
                 self.alloc,
                 10 * 1024 * 1024, // 10 MiB max
             ) catch |err| {
                 log.warn("failed to read input file err={}", .{err});
                 return error.InputFailed;
-            },
-            false,
-        ) catch |err| {
-            log.warn("failed to queue input file err={}", .{err});
-            return error.InputFailed;
+            };
+            defer self.alloc.free(contents);
+
+            self.queueWrite(data, contents, false) catch |err| {
+                log.warn("failed to queue input file err={}", .{err});
+                return error.InputFailed;
+            };
         },
     };
 }
