@@ -345,7 +345,12 @@ pub const Handler = struct {
             },
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.terminal.decaln(),
-            .full_reset => self.terminal.fullReset(),
+            .full_reset => {
+                self.terminal.fullReset();
+
+                // Clear the progress bar
+                self.progressReport(.{ .state = .remove });
+            },
             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .semantic_prompt => try self.terminal.semanticPrompt(value),
@@ -2504,6 +2509,15 @@ test "progress_report effect callback" {
         try testing.expectEqual(case.state, S.last_state);
         try testing.expectEqual(case.progress, S.last_progress);
     }
+
+    // A full reset (RIS) removes any active progress bar.
+    s.nextSlice("\x1B]9;4;1;50\x1B\\");
+    try testing.expectEqual(@as(usize, cases.len + 1), S.count);
+    try testing.expectEqual(osc.Command.ProgressReport.State.set, S.last_state);
+    s.nextSlice("\x1Bc");
+    try testing.expectEqual(@as(usize, cases.len + 2), S.count);
+    try testing.expectEqual(osc.Command.ProgressReport.State.remove, S.last_state);
+    try testing.expectEqual(@as(?u8, null), S.last_progress);
 }
 
 test "clipboard_write effect callback" {
