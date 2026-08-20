@@ -1336,3 +1336,115 @@ test "kittygfx placement moves cursor past a tall image" {
     ).?.screen.y;
     try testing.expectEqual(first_y + 8, second_y);
 }
+
+test "kittygfx unknown format responds with EINVAL" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=t,f=42,t=d,i=31,s=1,v=1;AAAA",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(io, alloc, &t, &cmd).?;
+    try testing.expect(!resp.ok());
+    try testing.expectEqual(@as(u32, 31), resp.id);
+    try testing.expectEqualStrings("EINVAL: unsupported format", resp.message);
+    try testing.expectEqual(
+        @as(usize, 0),
+        t.screens.active.kitty_images.images.count(),
+    );
+}
+
+test "kittygfx unknown format on query responds with EINVAL" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=q,f=42,t=d,i=31,s=1,v=1;AAAA",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(io, alloc, &t, &cmd).?;
+    try testing.expect(!resp.ok());
+    try testing.expectEqual(@as(u32, 31), resp.id);
+    try testing.expectEqualStrings("EINVAL: unsupported format", resp.message);
+}
+
+test "kittygfx zero format is rgba" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Kitty treats f=0 as an absent f, i.e. RGBA.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=t,f=0,t=d,i=1,s=1,v=2,c=10,r=1;///////////",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(io, alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+
+    const img = t.screens.active.kitty_images.imageById(1).?;
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+}
+
+test "kittygfx unknown format with q=3 has no response" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // q above 2 is out of range in the spec but Kitty suppresses
+    // everything for anything above 1, so we must still parse it.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=t,f=42,t=d,i=31,q=3,s=1,v=1;AAAA",
+    );
+    defer cmd.deinit(alloc);
+
+    try testing.expect(execute(io, alloc, &t, &cmd) == null);
+}
+
+test "kittygfx out of range display keys are tolerated" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=T,f=24,t=d,i=31,s=1,v=1,C=2,U=2;AAAA",
+        );
+        defer cmd.deinit(alloc);
+
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(u32, 31), resp.id);
+    }
+
+    // U=2 must behave like U=1, so the placement is virtual.
+    const storage = &t.screens.active.kitty_images;
+    var it = storage.placements.iterator();
+    const entry = it.next().?;
+    try testing.expect(entry.value_ptr.location == .virtual);
+}
