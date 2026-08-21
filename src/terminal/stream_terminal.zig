@@ -398,6 +398,8 @@ pub const Handler = struct {
             // Have no terminal-modifying effect
             .title_push,
             .title_pop,
+            // Unimplemented; the sequence is consumed and ignored.
+            .kitty_clipboard,
             => {},
         }
     }
