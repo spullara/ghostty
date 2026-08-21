@@ -15406,6 +15406,32 @@ test "Terminal: fullReset status display" {
     try testing.expect(t.status_display == .main);
 }
 
+test "Terminal: fullReset preserves kitty graphics limits" {
+    const alloc = testing.allocator;
+    const temp_dir = "/tmp/ghostty-kitty-images";
+
+    var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+
+    t.setKittyGraphicsLoadingLimits(.allWithTempDir(temp_dir));
+    for ([_]usize{ 1234, 0 }) |total_limit| {
+        t.setKittyGraphicsSizeLimit(alloc, total_limit);
+        t.fullReset();
+
+        const storage = &t.screens.active.kitty_images;
+        try testing.expectEqual(total_limit, storage.total_limit);
+        try testing.expect(storage.image_limits.file);
+        try testing.expect(storage.image_limits.shared_memory);
+        switch (storage.image_limits.temporary_file) {
+            .enabled => |value| try testing.expectEqualStrings(
+                temp_dir,
+                value.directory,
+            ),
+            .disabled => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 // https://github.com/mitchellh/ghostty/issues/1607
 test "Terminal: fullReset clears alt screen kitty keyboard state" {
     var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
