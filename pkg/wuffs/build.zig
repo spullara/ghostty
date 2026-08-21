@@ -71,7 +71,13 @@ pub fn build(b: *std.Build) !void {
         var flags: std.ArrayList([]const u8) = .empty;
         defer flags.deinit(b.allocator);
         try flags.append(b.allocator, "-DWUFFS_IMPLEMENTATION");
-        if (target.result.abi == .msvc) {
+
+        // Disable ubsan on Windows to avoid undefined __ubsan_handle_*
+        // references: Zig's ubsan runtime can't be bundled on Windows
+        // (its /exclude-symbols directives break the MSVC linker), so
+        // these handlers would go unresolved. This affects both the
+        // MSVC and GNU ABIs.
+        if (windows) {
             try flags.append(b.allocator, "-fno-sanitize=undefined");
             try flags.append(b.allocator, "-fno-sanitize-trap=undefined");
         }

@@ -15407,6 +15407,8 @@ test "Terminal: fullReset status display" {
 }
 
 test "Terminal: fullReset preserves kitty graphics limits" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
     const alloc = testing.allocator;
     const temp_dir = "/tmp/ghostty-kitty-images";
 
