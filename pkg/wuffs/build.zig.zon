@@ -22,12 +22,11 @@
             .hash = "N-V-__8AADYiAAB_80AWnH1AxXC0tql9thT-R-DYO1gBqTLc",
             .lazy = true,
         },
-
-        .apple_sdk = .{ .path = "../apple-sdk" },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "include",
         "src",
     },
 }
