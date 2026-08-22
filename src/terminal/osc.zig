@@ -46,12 +46,13 @@ pub const Command = union(Key) {
     /// Semantic prompt command: https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md
     semantic_prompt: SemanticPrompt,
 
-    /// Set or get clipboard contents. If data is null, then the current
-    /// clipboard contents are sent to the pty. If data is set, this
-    /// contents is set on the clipboard.
+    /// Set or get clipboard contents. If data is "?", then the current
+    /// clipboard contents are sent to the pty. Otherwise, the contents
+    /// are set on the clipboard.
     clipboard_contents: struct {
         kind: u8,
         data: [:0]const u8,
+        terminator: Terminator = .st,
     },
 
     /// OSC 7. Reports the current working directory of the shell. This is

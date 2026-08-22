@@ -414,6 +414,7 @@ pub const Action = union(Key) {
     pub const ClipboardContents = struct {
         kind: u8,
         data: []const u8,
+        terminator: osc.Terminator,
 
         pub const C = extern struct {
             kind: u8,
@@ -2500,6 +2501,7 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.clipboard_contents, .{
                         .kind = clip.kind,
                         .data = clip.data,
+                        .terminator = clip.terminator,
                     });
                 },
 

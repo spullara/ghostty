@@ -138,6 +138,42 @@ pub const ClipboardWrite = extern struct {
     contents_len: usize,
 };
 
+/// The reply to a clipboard read request.
+///
+/// C: GhosttyClipboardReadReply
+pub const ClipboardReadReply = extern struct {
+    size: usize,
+    result: clipboard.Read.Status,
+    contents: ?[*]const ClipboardContent,
+    contents_len: usize,
+    available: ?[*]const lib.String,
+    available_len: usize,
+    remember: bool,
+};
+
+/// A synchronous request to read clipboard contents. The embedder answers
+/// by calling `reply` with the request before the callback returns.
+///
+/// C: GhosttyClipboardRead
+pub const ClipboardRead = extern struct {
+    size: usize,
+    location: clipboard.Location,
+    mimes: ?[*]const lib.String,
+    mimes_len: usize,
+    list: bool,
+    name: lib.String,
+    granted: bool,
+    can_remember: bool,
+    /// Terminal-owned reply state; opaque to the embedder.
+    ctx: *const anyopaque,
+    reply: ClipboardReadReplyFn,
+};
+
+/// C function pointer type for replying to a clipboard read.
+///
+/// C: GhosttyClipboardReadReplyFn
+pub const ClipboardReadReplyFn = *const fn (*const ClipboardRead, *const ClipboardReadReply) callconv(lib.calling_conv) void;
+
 /// A request to show a desktop notification.
 ///
 /// C: GhosttyTerminalDesktopNotification
@@ -220,6 +256,7 @@ const Effects = struct {
     progress_report: ?ProgressReportFn = null,
     size_cb: ?SizeFn = null,
     clipboard_write: ?ClipboardWriteFn = null,
+    clipboard_read: ?ClipboardReadFn = null,
     unknown_sequence: ?UnknownSequenceFn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
@@ -254,6 +291,11 @@ const Effects = struct {
     /// C function pointer type for the clipboard_write callback. The request
     /// and its contents are borrowed and only valid for the callback duration.
     pub const ClipboardWriteFn = *const fn (Terminal, ?*anyopaque, *const ClipboardWrite) callconv(lib.calling_conv) clipboard.WriteResult;
+
+    /// C function pointer type for the clipboard_read callback. The request
+    /// is borrowed for the callback duration and must be answered through
+    /// its reply function before the callback returns.
+    pub const ClipboardReadFn = *const fn (Terminal, ?*anyopaque, *const ClipboardRead) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the desktop_notification callback. The
     /// request and its strings are borrowed for the callback duration.
@@ -354,6 +396,100 @@ const Effects = struct {
             .contents_len = contents.len,
         };
         return func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
+    }
+
+    /// Opaque context behind ClipboardRead.ctx for the reply trampoline.
+    const ClipboardReadCtx = struct {
+        read: clipboard.Read,
+        wrapper: *TerminalWrapper,
+    };
+
+    fn clipboardReadTrampoline(handler: *Handler, read: clipboard.Read) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.clipboard_read orelse return;
+
+        // Requests carry a handful of MIME types, so keep the common case
+        // allocation-free. On OOM the request goes unanswered and the
+        // handler replies with an empty clipboard.
+        var sfa = std.heap.stackFallback(128, wrapper.terminal.gpa());
+        const alloc = sfa.get();
+        const mimes = alloc.alloc(lib.String, read.mimes.len) catch {
+            log.warn("out of memory converting clipboard read request", .{});
+            return;
+        };
+        defer alloc.free(mimes);
+        for (mimes, read.mimes) |*c_mime, mime| c_mime.* = .init(mime);
+
+        const ctx: ClipboardReadCtx = .{ .read = read, .wrapper = wrapper };
+        const request: ClipboardRead = .{
+            .size = @sizeOf(ClipboardRead),
+            .location = read.location,
+            .mimes = if (mimes.len > 0) mimes.ptr else null,
+            .mimes_len = mimes.len,
+            .list = read.list,
+            .name = .init(read.name),
+            .granted = read.granted,
+            .can_remember = read.can_remember,
+            .ctx = &ctx,
+            .reply = &clipboardReadReplyTrampoline,
+        };
+        func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
+    }
+
+    fn clipboardReadReplyTrampoline(
+        request: *const ClipboardRead,
+        reply: *const ClipboardReadReply,
+    ) callconv(lib.calling_conv) void {
+        const ctx: *const ClipboardReadCtx = @ptrCast(@alignCast(request.ctx));
+        const read = ctx.read;
+        switch (reply.result) {
+            .success => {},
+            .denied => return read.reply(.denied),
+            .busy => return read.reply(.busy),
+            .io_error => return read.reply(.io_error),
+            .unsupported, _ => return read.reply(.unsupported),
+        }
+
+        const c_contents: []const ClipboardContent = if (reply.contents) |ptr|
+            ptr[0..reply.contents_len]
+        else
+            &.{};
+        const c_available: []const lib.String = if (reply.available) |ptr|
+            ptr[0..reply.available_len]
+        else
+            &.{};
+
+        // Most replies carry one representation, so keep that path
+        // allocation-free while supporting arbitrary multi-MIME replies.
+        // On OOM we don't reply and the handler answers with an empty
+        // clipboard.
+        var sfa = std.heap.stackFallback(256, ctx.wrapper.terminal.gpa());
+        const alloc = sfa.get();
+        const contents = alloc.alloc(clipboard.Content, c_contents.len) catch {
+            log.warn("out of memory converting clipboard read reply", .{});
+            return;
+        };
+        defer alloc.free(contents);
+        for (contents, c_contents) |*content, c_content| {
+            content.* = .{
+                .mime = c_content.mime.ptr[0..c_content.mime.len],
+                .data = c_content.data.ptr[0..c_content.data.len],
+            };
+        }
+        const available = alloc.alloc([]const u8, c_available.len) catch {
+            log.warn("out of memory converting clipboard read reply", .{});
+            return;
+        };
+        defer alloc.free(available);
+        for (available, c_available) |*mime, c_mime| {
+            mime.* = c_mime.ptr[0..c_mime.len];
+        }
+
+        read.reply(.{ .success = .{
+            .contents = contents,
+            .available = available,
+            .remember = reply.remember,
+        } });
     }
 
     fn desktopNotificationTrampoline(
@@ -525,6 +661,7 @@ fn wrap(
         .progress_report = &Effects.progressReportTrampoline,
         .size = &Effects.sizeTrampoline,
         .clipboard_write = &Effects.clipboardWriteTrampoline,
+        .clipboard_read = null,
     };
 
     wrapper.* = .{
@@ -1021,6 +1158,7 @@ pub const Option = enum(c_int) {
     unknown_sequence = 35,
     unknown_max_bytes = 36,
     terminfo_name = 37,
+    clipboard_read = 38,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1038,6 +1176,7 @@ pub const Option = enum(c_int) {
             .progress_report => ?Effects.ProgressReportFn,
             .size_cb => ?Effects.SizeFn,
             .clipboard_write => ?Effects.ClipboardWriteFn,
+            .clipboard_read => ?Effects.ClipboardReadFn,
             .unknown_sequence => ?Effects.UnknownSequenceFn,
             .title, .pwd, .terminfo_name => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
@@ -1106,6 +1245,13 @@ fn setTyped(
         .progress_report => wrapper.effects.progress_report = value,
         .size_cb => wrapper.effects.size_cb = value,
         .clipboard_write => wrapper.effects.clipboard_write = value,
+        .clipboard_read => {
+            wrapper.effects.clipboard_read = value;
+            wrapper.stream.handler.effects.clipboard_read = if (value != null)
+                &Effects.clipboardReadTrampoline
+            else
+                null;
+        },
         .unknown_sequence => {
             wrapper.effects.unknown_sequence = value;
             wrapper.stream.handler.unknown_sequence = if (value != null)
@@ -4598,6 +4744,112 @@ test "clipboard_write without callback is unsupported and silent" {
         .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
     });
     try testing.expectEqual(clipboard.WriteResult.unsupported, result);
+}
+
+test "set clipboard_read callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+        var count: usize = 0;
+        var last_size: usize = 0;
+        var last_location: clipboard.Location = .standard;
+        var last_mimes_len: usize = 0;
+        var last_mime_is_text: bool = false;
+        var last_list: bool = true;
+        var last_name_len: usize = 1;
+        var last_granted: bool = true;
+        var last_can_remember: bool = true;
+        var result: clipboard.Read.Status = .success;
+
+        fn deinit() void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = null;
+        }
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+
+        fn clipboardRead(
+            _: Terminal,
+            _: ?*anyopaque,
+            request: *const ClipboardRead,
+        ) callconv(lib.calling_conv) void {
+            count += 1;
+            last_size = request.size;
+            last_location = request.location;
+            last_mimes_len = request.mimes_len;
+            last_mime_is_text = request.mimes_len > 0 and std.mem.eql(
+                u8,
+                request.mimes.?[0].ptr[0..request.mimes.?[0].len],
+                "text/plain",
+            );
+            last_list = request.list;
+            last_name_len = request.name.len;
+            last_granted = request.granted;
+            last_can_remember = request.can_remember;
+
+            const mime: []const u8 = "text/plain";
+            const data: []const u8 = "hello";
+            const contents = [_]ClipboardContent{.{
+                .mime = .init(mime),
+                .data = .init(data),
+            }};
+            request.reply(request, &.{
+                .size = @sizeOf(ClipboardReadReply),
+                .result = result,
+                .contents = &contents,
+                .contents_len = contents.len,
+                .available = null,
+                .available_len = 0,
+                .remember = false,
+            });
+        }
+    };
+    defer S.deinit();
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+
+    // Without a callback the handler effect is unset and reads are silent.
+    try testing.expect(t.?.stream.handler.effects.clipboard_read == null);
+    const read_st = "\x1B]52;c;?\x1B\\";
+    vt_write(t, read_st, read_st.len);
+    try testing.expect(S.last_data == null);
+
+    try testing.expectEqual(Result.success, set(t, .clipboard_read, @ptrCast(&S.clipboardRead)));
+    try testing.expect(t.?.stream.handler.effects.clipboard_read != null);
+
+    const read_bel = "\x1B]52;p;?\x07";
+    vt_write(t, read_bel, read_bel.len);
+    try testing.expectEqual(1, S.count);
+    try testing.expectEqual(@sizeOf(ClipboardRead), S.last_size);
+    try testing.expectEqual(clipboard.Location.primary, S.last_location);
+    try testing.expectEqual(1, S.last_mimes_len);
+    try testing.expect(S.last_mime_is_text);
+    try testing.expect(!S.last_list);
+    try testing.expectEqual(0, S.last_name_len);
+    try testing.expect(!S.last_granted);
+    try testing.expect(!S.last_can_remember);
+    try testing.expectEqualStrings("\x1B]52;p;aGVsbG8=\x07", S.last_data.?);
+
+    // Denied replies with an empty clipboard.
+    S.result = .denied;
+    vt_write(t, read_st, read_st.len);
+    try testing.expectEqual(2, S.count);
+    try testing.expectEqualStrings("\x1B]52;c;\x1B\\", S.last_data.?);
+
+    // Clearing the callback uninstalls the handler effect.
+    try testing.expectEqual(Result.success, set(t, .clipboard_read, null));
+    try testing.expect(t.?.stream.handler.effects.clipboard_read == null);
 }
 
 test "pwd_changed without callback is silent" {
