@@ -36,7 +36,7 @@ pub const WriteState = struct {
     loc: clipboard.Location,
     id: []const u8,
     pw: []const u8,
-    has_name: bool,
+    name: []const u8,
     spool: std.ArrayListUnmanaged(u8) = .empty,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     aliases: std.ArrayListUnmanaged(Alias) = .empty,
@@ -68,12 +68,13 @@ pub const WriteState = struct {
         errdefer arena.deinit();
         const id = try arena.allocator().dupe(u8, meta.id);
         const pw = try arena.allocator().dupe(u8, meta.pw);
+        const name = try arena.allocator().dupe(u8, meta.name);
         return .{
             .arena = arena,
             .loc = meta.loc,
             .id = id,
             .pw = pw,
-            .has_name = meta.has_name,
+            .name = name,
         };
     }
 
@@ -220,7 +221,7 @@ pub const WriteState = struct {
         loc: clipboard.Location,
         id: []const u8,
         pw: []const u8,
-        has_name: bool,
+        name: []const u8,
         truncated: bool,
         contents: []const Content,
 
@@ -289,7 +290,7 @@ pub const WriteState = struct {
             .loc = self.loc,
             .id = self.id,
             .pw = self.pw,
-            .has_name = self.has_name,
+            .name = self.name,
             .truncated = self.truncated,
             .contents = try contents.toOwnedSlice(alloc),
         };

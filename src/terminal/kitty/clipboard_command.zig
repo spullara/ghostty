@@ -28,8 +28,8 @@ pub const max_pw_len = 128;
 /// types are tiny; anything longer drops the packet.
 pub const max_mime_len = 256;
 
-/// Maximum decoded name length we bother validating. Longer names are
-/// treated as present without validation; only their presence matters.
+/// Maximum decoded name length. Kitty has no limit but names are shown
+/// in permission prompts so anything longer drops the packet.
 pub const max_name_len = 256;
 
 /// The decoded, validated metadata of one OSC 5522 sequence.
@@ -62,9 +62,10 @@ pub const Metadata = struct {
     /// treat the request as though it had no password."
     pw: []const u8 = "",
 
-    /// True if a non-empty (valid) name was given. We don't retain the
-    /// name contents; it exists to opt into password grants.
-    has_name: bool = false,
+    /// Decoded human friendly name of the requesting program, shown in
+    /// permission prompts. Empty means absent. Its presence opts into
+    /// password grants.
+    name: []const u8 = "",
 
     /// Parse the metadata field. The raw value is expected to be exactly
     /// the metadata (prefix and payload and separators stripped out).
@@ -124,21 +125,13 @@ pub const Metadata = struct {
                     error.Invalid => return null,
                 };
             } else if (std.mem.eql(u8, key, "name")) {
-                // We only need to know whether a (non-empty) name was
-                // given; the contents are decoded for validation only.
-                result.has_name = has_name: {
-                    const name = decodeValue(
-                        alloc,
-                        value,
-                        max_name_len,
-                    ) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        // Over-long names are accepted as present but
-                        // not validated further.
-                        error.Overflow => break :has_name true,
-                        error.Invalid => return null,
-                    };
-                    break :has_name name.len > 0;
+                result.name = decodeValue(
+                    alloc,
+                    value,
+                    max_name_len,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Overflow, error.Invalid => return null,
                 };
             }
             // Unknown keys are ignored.
@@ -351,7 +344,21 @@ test "metadata: pw and name" {
     // pw="secret", name="app"
     const meta = (try Metadata.parse(arena.allocator(), "type=read:pw=c2VjcmV0:name=YXBw")).?;
     try testing.expectEqualStrings("secret", meta.pw);
-    try testing.expect(meta.has_name);
+    try testing.expectEqualStrings("app", meta.name);
+}
+
+test "metadata: over-long name dropped" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const Encoder = std.base64.standard.Encoder;
+    const long = "n" ** (max_name_len + 1);
+    var buf: [Encoder.calcSize(long.len)]u8 = undefined;
+    const raw = try std.mem.concat(arena.allocator(), u8, &.{
+        "type=read:name=",
+        Encoder.encode(&buf, long),
+    });
+    try testing.expect((try Metadata.parse(arena.allocator(), raw)) == null);
 }
 
 test "metadata: empty name" {
@@ -359,7 +366,7 @@ test "metadata: empty name" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const meta = (try Metadata.parse(arena.allocator(), "type=read:pw=c2VjcmV0:name=")).?;
-    try testing.expect(!meta.has_name);
+    try testing.expectEqual(@as(usize, 0), meta.name.len);
 }
 
 test "payload: mime iterator" {

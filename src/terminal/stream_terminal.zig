@@ -14,6 +14,7 @@ const color = @import("color.zig");
 const modes = @import("modes.zig");
 const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
+const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
 const size_report = @import("size_report.zig");
 const simd = @import("../simd/main.zig");
@@ -70,6 +71,17 @@ pub const Handler = struct {
 
     /// The DCS command handler maintains state for DCS queries.
     dcs_handler: dcs.Handler = .{},
+
+    /// The in-flight Kitty clipboard protocol (OSC 5522) write
+    /// transaction, if any. Null means no transaction is active.
+    /// Heap-allocated since transactions are rare and short-lived.
+    kitty_clipboard_write: ?*kitty_clipboard.WriteState = null,
+
+    /// Kitty clipboard protocol (OSC 5522) session password grants,
+    /// recorded when a clipboard_read reply asks to remember the user's
+    /// decision. Later requests carrying a granted password are forwarded
+    /// with `granted` set so the embedder can skip its prompt.
+    kitty_clipboard_grants: kitty_clipboard.Grants = .{},
 
     /// Called for sequence identifiers not supported by this library.
     /// Currently, only APC is reported. Content is borrowed and only valid
@@ -145,21 +157,38 @@ pub const Handler = struct {
         /// A write with no contents clears the destination. A content entry
         /// with empty data is a distinct empty representation.
         ///
-        /// Clipboard read requests (OSC 52 with a "?" payload) are
-        /// delivered to clipboard_read instead.
+        /// OSC 52, OSC 1337 Copy, and Kitty clipboard (OSC 5522) writes all
+        /// share this callback. Every call is one complete write whose
+        /// contents replace whatever the destination previously held; there
+        /// is never a partial update. A Kitty clipboard write transaction
+        /// results in exactly one call, at commit, carrying all of the
+        /// transaction's representations, and the returned result is
+        /// reported back to the running program as the commit status (see
+        /// kittyClipboard).
+        ///
+        /// Clipboard read requests (OSC 52 with a "?" payload and OSC 5522
+        /// reads) are delivered to clipboard_read instead.
         clipboard_write: ?*const fn (*Handler, clipboard.Write) clipboard.WriteResult,
 
         /// Called when the running program requests clipboard contents
-        /// (OSC 52 with a "?" payload). Answering one lets the program
-        /// read the user's clipboard, so the embedder is expected to
-        /// mediate consent.
+        /// (OSC 52 with a "?" payload, or a Kitty clipboard (OSC 5522)
+        /// read). Answering one lets the program read the user's
+        /// clipboard, so the embedder is expected to mediate consent.
         ///
         /// Reads are synchronous: the callback must answer through
         /// `read.reply` before it returns, so an embedder that needs to
         /// ask the user must block (e.g. run a modal prompt) while the
-        /// stream waits. Returning without a reply, or replying denied or
-        /// unsupported, answers the program with an empty clipboard so it
-        /// doesn't hang. If this is null, read requests are ignored.
+        /// stream waits. Returning without a reply, or replying with any
+        /// failure, answers the program with an empty clipboard (OSC 52)
+        /// or the matching protocol status (OSC 5522) so it doesn't hang.
+        /// If this is null, OSC 52 reads are ignored and OSC 5522 reads
+        /// are refused with EPERM.
+        ///
+        /// OSC 5522 requests carry the program's MIME list, name, and
+        /// password grant state; a reply that sets `remember` records a
+        /// session grant so later requests with the same password arrive
+        /// with `granted` set. Kitty itself serves a request for only the
+        /// targets listing (`list` with no `mimes`) without prompting.
         clipboard_read: ?*const fn (*Handler, clipboard.Read) void,
 
         /// Called in response to an XTVERSION query. Returns the version
@@ -207,6 +236,8 @@ pub const Handler = struct {
     }
 
     pub fn deinit(self: *Handler) void {
+        self.kittyClipboardAbort();
+        self.kitty_clipboard_grants.deinit(self.terminal.gpa());
         self.apc_handler.deinit();
         self.dcs_handler.deinit();
     }
@@ -374,6 +405,11 @@ pub const Handler = struct {
             .kitty_color_report => self.kittyColorOperation(value) catch |err| {
                 log.warn("error reporting Kitty colors err={}", .{err});
             },
+            .kitty_clipboard => self.kittyClipboard(value) catch |err| {
+                // Clipboard operations are external effects, not terminal
+                // state; a failed transaction was already answered.
+                log.warn("error handling kitty clipboard err={}", .{err});
+            },
 
             // APC
             .apc_start => self.apc_handler.start(),
@@ -411,8 +447,6 @@ pub const Handler = struct {
             // Have no terminal-modifying effect
             .title_push,
             .title_pop,
-            // Unimplemented; the sequence is consumed and ignored.
-            .kitty_clipboard,
             => {},
         }
     }
@@ -654,6 +688,397 @@ pub const Handler = struct {
             handler.writePty(written);
         }
     };
+
+    /// Handle one Kitty clipboard protocol (OSC 5522) packet.
+    fn kittyClipboard(
+        self: *Handler,
+        v: Action.Value(.kitty_clipboard),
+    ) error{OutOfMemory}!void {
+        // Decode and validate the metadata.
+        var arena: std.heap.ArenaAllocator = .init(self.terminal.gpa());
+        defer arena.deinit();
+        const meta = (try kitty_clipboard.Metadata.parse(
+            arena.allocator(),
+            v.metadata,
+        )) orelse return;
+
+        const payload = v.payload orelse "";
+        switch (meta.op) {
+            .read => try self.kittyClipboardRead(&meta, payload, v.terminator),
+            .write => try self.kittyClipboardWriteBegin(&meta, v.terminator),
+            .wdata => try self.kittyClipboardData(&meta, payload, v.terminator),
+            .walias => try self.kittyClipboardAlias(&meta, payload, v.terminator),
+        }
+    }
+
+    fn kittyClipboardRead(
+        self: *Handler,
+        meta: *const kitty_clipboard.Metadata,
+        payload: []const u8,
+        terminator: osc.Terminator,
+    ) error{OutOfMemory}!void {
+        // The payload is the requested MIME list. Kitty drops a read
+        // request with an undecodable payload without any response.
+        const alloc = self.terminal.gpa();
+        const decoded = kitty_clipboard.Payload.init(
+            alloc,
+            payload,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => return,
+        };
+        defer decoded.deinit(alloc);
+
+        // Without a clipboard_read effect nothing can serve the read.
+        // EPERM is the protocol's denial so clients degrade gracefully.
+        const func = self.effects.clipboard_read orelse {
+            self.kittyClipboardRespond(&.{
+                .op = .read,
+                .status = .EPERM,
+                .id = meta.id,
+                .terminator = terminator,
+            });
+            return;
+        };
+
+        // The targets type ('.') asks for the listing of available
+        // types rather than data. Requested types beyond the cap are
+        // dropped and simply never served, which is how the protocol
+        // reports an unavailable type anyway.
+        var mimes_buf: [kitty_clipboard.max_read_mimes][]const u8 = undefined;
+        const mimes, const list = mimes: {
+            var targets = false;
+            var len: usize = 0;
+            var it = decoded.mimeIterator();
+            while (it.next()) |mime| {
+                if (std.mem.eql(u8, mime, kitty_clipboard.targets_mime)) {
+                    targets = true;
+                    continue;
+                }
+                if (len == mimes_buf.len) continue;
+                mimes_buf[len] = mime;
+                len += 1;
+            }
+            break :mimes .{ mimes_buf[0..len], targets };
+        };
+
+        // Per the spec a password without a name is no password. A
+        // stored grant for it lets the embedder skip its prompt.
+        const pw: []const u8 = if (meta.name.len > 0) meta.pw else "";
+        const granted = self.kitty_clipboard_grants.use(alloc, pw, .read);
+
+        var state: KittyClipboardReadState = .{
+            .handler = self,
+            .primary = meta.loc == .primary,
+            .id = meta.id,
+            .pw = pw,
+            .mimes = mimes,
+            .list = list,
+            .terminator = terminator,
+        };
+        func(self, .{
+            .location = meta.loc,
+            .mimes = mimes,
+            .list = list,
+            .name = meta.name,
+            .granted = granted,
+            .can_remember = pw.len > 0,
+            .reply_ctx = &state,
+            .reply_fn = &KittyClipboardReadState.reply,
+        });
+
+        // The program is waiting on us, so a callback that returned
+        // without a reply is answered as a denial rather than silence.
+        if (!state.replied) state.respondStatus(.EPERM);
+    }
+
+    /// Reply state for one synchronous Kitty clipboard read. This lives
+    /// on the kittyClipboardRead stack frame, so it is only valid during
+    /// the callback.
+    const KittyClipboardReadState = struct {
+        handler: *Handler,
+        primary: bool,
+        id: []const u8,
+
+        /// The effective password, empty when the request had none.
+        pw: []const u8,
+
+        /// The requested types; only these are served from a reply.
+        mimes: []const []const u8,
+        list: bool,
+        terminator: osc.Terminator,
+        replied: bool = false,
+
+        fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
+            const self: *KittyClipboardReadState = @ptrCast(@alignCast(ctx));
+            if (self.replied) {
+                log.warn("clipboard read replied more than once, ignoring", .{});
+                return;
+            }
+            self.replied = true;
+
+            const success = switch (result) {
+                .denied => return self.respondStatus(.EPERM),
+                .unsupported => return self.respondStatus(.ENOSYS),
+                .busy => return self.respondStatus(.EBUSY),
+                .io_error => return self.respondStatus(.EIO),
+                .success => |s| s,
+            };
+
+            // Remembering is only offered when the request carried a
+            // usable password.
+            if (success.remember and self.pw.len > 0) {
+                self.handler.kitty_clipboard_grants.grant(
+                    self.handler.terminal.gpa(),
+                    self.pw,
+                    .read,
+                    false,
+                ) catch |err| {
+                    log.warn("error recording clipboard grant err={}", .{err});
+                };
+            }
+
+            self.respondSuccess(&success) catch |err| {
+                log.warn("error replying to clipboard read err={}", .{err});
+                self.respondStatus(.EIO);
+            };
+        }
+
+        /// Answer with a single status packet.
+        fn respondStatus(
+            self: *const KittyClipboardReadState,
+            status: kitty_clipboard.Status,
+        ) void {
+            self.handler.kittyClipboardRespond(&.{
+                .op = .read,
+                .status = status,
+                .id = self.id,
+                .terminator = self.terminator,
+            });
+        }
+
+        /// Answer with the full success sequence (OK, listing, DATA
+        /// chunks, DONE), serving only the requested representations
+        /// in request order.
+        fn respondSuccess(
+            self: *const KittyClipboardReadState,
+            success: *const clipboard.Read.Result.Success,
+        ) error{ OutOfMemory, WriteFailed }!void {
+            const handler = self.handler;
+            if (handler.effects.write_pty == null) return;
+
+            var served_buf: [kitty_clipboard.max_read_mimes]clipboard.Content = undefined;
+            var served_len: usize = 0;
+            for (self.mimes) |mime| {
+                for (success.contents) |content| {
+                    if (!std.mem.eql(u8, content.mime, mime)) continue;
+                    served_buf[served_len] = content;
+                    served_len += 1;
+                    break;
+                }
+            }
+
+            // Status packets fit on the stack; DATA packets carry the
+            // clipboard contents and fall back to the heap.
+            var stack = std.heap.stackFallback(1024, handler.terminal.gpa());
+            const alloc = stack.get();
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            defer aw.deinit();
+            try (kitty_clipboard.ReadSuccess{
+                .primary = self.primary,
+                .id = self.id,
+                .list = self.list,
+                .available = success.available,
+                .contents = served_buf[0..served_len],
+                .terminator = self.terminator,
+            }).encode(&aw.writer);
+
+            const written = try aw.toOwnedSliceSentinel(0);
+            defer alloc.free(written);
+            handler.writePty(written);
+        }
+    };
+
+    fn kittyClipboardWriteBegin(
+        self: *Handler,
+        meta: *const kitty_clipboard.Metadata,
+        terminator: osc.Terminator,
+    ) error{OutOfMemory}!void {
+        // A new write silently replaces any in-flight transaction.
+        self.kittyClipboardAbort();
+
+        // Without a clipboard_write effect a commit can never succeed,
+        // so fail the transaction up front instead of spooling data
+        // we'd only throw away. Later wdata packets are ignored.
+        if (self.effects.clipboard_write == null) {
+            self.kittyClipboardRespond(&.{
+                .op = .write,
+                .status = .ENOSYS,
+                .id = meta.id,
+                .terminator = terminator,
+            });
+            return;
+        }
+
+        // Setup our write state
+        const alloc = self.terminal.gpa();
+        const state = try alloc.create(kitty_clipboard.WriteState);
+        errdefer alloc.destroy(state);
+        state.* = try .init(alloc, meta);
+        self.kitty_clipboard_write = state;
+    }
+
+    fn kittyClipboardData(
+        self: *Handler,
+        meta: *const kitty_clipboard.Metadata,
+        payload: []const u8,
+        terminator: osc.Terminator,
+    ) error{OutOfMemory}!void {
+        // Data without a transaction is silently ignored.
+        const state = self.kitty_clipboard_write orelse return;
+
+        // A wdata packet without a MIME type commits the transaction.
+        if (meta.mime.len == 0) return self.kittyClipboardCommit(
+            state,
+            terminator,
+        );
+
+        state.data(
+            self.terminal.gpa(),
+            meta,
+            payload,
+        ) catch |err| switch (err) {
+            // Failing to spool matches kitty's EIO for a failed buffer
+            // write.
+            error.OutOfMemory => {
+                self.kittyClipboardFinish(
+                    state,
+                    .EIO,
+                    terminator,
+                );
+                return error.OutOfMemory;
+            },
+        };
+    }
+
+    fn kittyClipboardAlias(
+        self: *Handler,
+        meta: *const kitty_clipboard.Metadata,
+        payload: []const u8,
+        terminator: osc.Terminator,
+    ) error{OutOfMemory}!void {
+        // Aliases without a transaction or without a target MIME type
+        // are silently ignored.
+        const state = self.kitty_clipboard_write orelse return;
+        if (meta.mime.len == 0) return;
+
+        state.alias(
+            self.terminal.gpa(),
+            meta,
+            payload,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.kittyClipboardFinish(
+                    state,
+                    .EIO,
+                    terminator,
+                );
+                return error.OutOfMemory;
+            },
+
+            // An undecodable alias payload aborts the transaction.
+            error.Invalid => self.kittyClipboardFinish(
+                state,
+                .EINVAL,
+                terminator,
+            ),
+        };
+    }
+
+    fn kittyClipboardCommit(
+        self: *Handler,
+        state: *kitty_clipboard.WriteState,
+        terminator: osc.Terminator,
+    ) error{OutOfMemory}!void {
+        const alloc = self.terminal.gpa();
+        const committed = state.commit(alloc) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.kittyClipboardFinish(state, .EIO, terminator);
+                return error.OutOfMemory;
+            },
+        };
+        defer committed.deinit(alloc);
+
+        // The effect result maps 1:1 onto the protocol's commit
+        // statuses. The effect can't be null here (checked when the
+        // transaction began) but if an embedder cleared it
+        // mid-transaction that's ENOSYS.
+        const result: clipboard.WriteResult = if (self.effects.clipboard_write) |func|
+            func(self, .{
+                .location = committed.loc,
+                .contents = committed.contents,
+            })
+        else
+            .unsupported;
+
+        self.kittyClipboardFinish(state, switch (result) {
+            .success => .DONE,
+            .denied => .EPERM,
+            .unsupported => .ENOSYS,
+            .busy => .EBUSY,
+            .invalid_data => .EINVAL,
+            .io_error, _ => .EIO,
+        }, terminator);
+    }
+
+    /// Answer a write transaction with its final status and drop it.
+    /// The id echoed is the one from the transaction's opening write
+    /// packet, matching kitty.
+    fn kittyClipboardFinish(
+        self: *Handler,
+        state: *const kitty_clipboard.WriteState,
+        status: kitty_clipboard.Status,
+        terminator: osc.Terminator,
+    ) void {
+        self.kittyClipboardRespond(&.{
+            .op = .write,
+            .status = status,
+            .id = state.id,
+            .terminator = terminator,
+        });
+        self.kittyClipboardAbort();
+    }
+
+    /// Drop any in-flight write transaction without responding.
+    fn kittyClipboardAbort(self: *Handler) void {
+        if (self.kitty_clipboard_write) |state| {
+            const alloc = self.terminal.gpa();
+            state.deinit(alloc);
+            alloc.destroy(state);
+            self.kitty_clipboard_write = null;
+        }
+    }
+
+    /// Encode and write a single response packet. Unlike kitty, which
+    /// always terminates responses with ST, we echo the terminator of
+    /// the request being answered, matching our other OSC responses.
+    fn kittyClipboardRespond(
+        self: *Handler,
+        response: *const kitty_clipboard.Response,
+    ) void {
+        if (self.effects.write_pty == null) return;
+
+        // Our responses carry at most a status and the echoed id so
+        // they virtually always fit on the stack.
+        var stack = std.heap.stackFallback(1024, self.terminal.gpa());
+        const alloc = stack.get();
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        defer aw.deinit();
+        response.encode(&aw.writer) catch return;
+        const resp = aw.toOwnedSliceSentinel(0) catch return;
+        defer alloc.free(resp);
+        self.writePty(resp);
+    }
 
     fn reportDeviceAttributes(self: *Handler, req: device_attributes.Req) void {
         const func = self.effects.device_attributes orelse return;
@@ -2893,6 +3318,663 @@ test "clipboard_write allocation failure is ignored" {
     }
     try testing.expectEqual(@as(usize, 0), S.count);
     try testing.expect(!s.handler.semantic_failure);
+}
+
+/// Shared capture state for the Kitty clipboard (OSC 5522) tests below:
+/// records every pty response and the most recent clipboard write.
+const KittyClipboardCapture = struct {
+    var responses: [1024]u8 = undefined;
+    var responses_len: usize = 0;
+    var write_count: usize = 0;
+    var result: clipboard.WriteResult = .success;
+    var last_location: clipboard.Location = .standard;
+    var last_contents_len: usize = 0;
+    var last_mimes: [8][64]u8 = undefined;
+    var last_mime_lens: [8]usize = @splat(0);
+    var last_data: [8][256]u8 = undefined;
+    var last_data_lens: [8]usize = @splat(0);
+
+    // Read capture. A null read_result returns without replying.
+    var read_count: usize = 0;
+    var read_result: ?clipboard.Read.Result = null;
+    var read_reply_twice: bool = false;
+    var last_read_location: clipboard.Location = .standard;
+    var last_read_mimes: [8][64]u8 = undefined;
+    var last_read_mime_lens: [8]usize = @splat(0);
+    var last_read_mimes_len: usize = 0;
+    var last_read_list: bool = false;
+    var last_read_name: [64]u8 = undefined;
+    var last_read_name_len: usize = 0;
+    var last_read_granted: bool = false;
+    var last_read_can_remember: bool = false;
+
+    fn reset() void {
+        responses_len = 0;
+        write_count = 0;
+        result = .success;
+        last_location = .standard;
+        last_contents_len = 0;
+        last_mime_lens = @splat(0);
+        last_data_lens = @splat(0);
+        read_count = 0;
+        read_result = null;
+        read_reply_twice = false;
+        last_read_location = .standard;
+        last_read_mime_lens = @splat(0);
+        last_read_mimes_len = 0;
+        last_read_list = false;
+        last_read_name_len = 0;
+        last_read_granted = false;
+        last_read_can_remember = false;
+    }
+
+    fn writePty(_: *Handler, data: [:0]const u8) void {
+        @memcpy(responses[responses_len..][0..data.len], data);
+        responses_len += data.len;
+    }
+
+    fn clipboardWrite(_: *Handler, write: clipboard.Write) clipboard.WriteResult {
+        write_count += 1;
+        last_location = write.location;
+        last_contents_len = write.contents.len;
+        for (write.contents[0..@min(write.contents.len, last_mimes.len)], 0..) |content, i| {
+            last_mime_lens[i] = content.mime.len;
+            @memcpy(last_mimes[i][0..content.mime.len], content.mime);
+            last_data_lens[i] = content.data.len;
+            @memcpy(last_data[i][0..content.data.len], content.data);
+        }
+        return result;
+    }
+
+    fn clipboardRead(_: *Handler, read: clipboard.Read) void {
+        read_count += 1;
+        last_read_location = read.location;
+        last_read_mimes_len = read.mimes.len;
+        for (read.mimes[0..@min(read.mimes.len, last_read_mimes.len)], 0..) |mime, i| {
+            last_read_mime_lens[i] = mime.len;
+            @memcpy(last_read_mimes[i][0..mime.len], mime);
+        }
+        last_read_list = read.list;
+        last_read_name_len = read.name.len;
+        @memcpy(last_read_name[0..read.name.len], read.name);
+        last_read_granted = read.granted;
+        last_read_can_remember = read.can_remember;
+        if (read_result) |r| read.reply(r);
+        if (read_reply_twice) read.reply(.denied);
+    }
+
+    fn responseSlice() []const u8 {
+        return responses[0..responses_len];
+    }
+
+    fn readMimeAt(i: usize) []const u8 {
+        return last_read_mimes[i][0..last_read_mime_lens[i]];
+    }
+
+    fn readName() []const u8 {
+        return last_read_name[0..last_read_name_len];
+    }
+
+    fn mimeAt(i: usize) []const u8 {
+        return last_mimes[i][0..last_mime_lens[i]];
+    }
+
+    fn dataAt(i: usize) []const u8 {
+        return last_data[i][0..last_data_lens[i]];
+    }
+};
+
+test "kitty clipboard write transaction round trip" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Begin a write, stream two MIME types (one chunked), alias the
+    // plain text, and commit. Only the commit produces a response.
+    s.nextSlice("\x1B]5522;type=write:id=42\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\"); // "Ghost"
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;dHk=\x1B\\"); // "ty"
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9odG1s;PGI+aGk8L2I+\x1B\\"); // "<b>hi</b>"
+    // Alias "TEXT UTF8_STRING" -> text/plain.
+    s.nextSlice("\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;VEVYVCBVVEY4X1NUUklORw==\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqual(clipboard.Location.standard, S.last_location);
+    try testing.expectEqual(@as(usize, 4), S.last_contents_len);
+    try testing.expectEqualStrings("text/plain", S.mimeAt(0));
+    try testing.expectEqualStrings("Ghostty", S.dataAt(0));
+    try testing.expectEqualStrings("text/html", S.mimeAt(1));
+    try testing.expectEqualStrings("<b>hi</b>", S.dataAt(1));
+    try testing.expectEqualStrings("TEXT", S.mimeAt(2));
+    try testing.expectEqualStrings("Ghostty", S.dataAt(2));
+    try testing.expectEqualStrings("UTF8_STRING", S.mimeAt(3));
+    try testing.expectEqualStrings("Ghostty", S.dataAt(3));
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=DONE:id=42\x1B\\",
+        S.responseSlice(),
+    );
+
+    // A commit with no transaction in flight is silently ignored.
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+}
+
+test "kitty clipboard write result maps to response status" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    const cases = [_]struct {
+        result: clipboard.WriteResult,
+        response: []const u8,
+    }{
+        .{ .result = .success, .response = "\x1B]5522;type=write:status=DONE\x1B\\" },
+        .{ .result = .denied, .response = "\x1B]5522;type=write:status=EPERM\x1B\\" },
+        .{ .result = .unsupported, .response = "\x1B]5522;type=write:status=ENOSYS\x1B\\" },
+        .{ .result = .busy, .response = "\x1B]5522;type=write:status=EBUSY\x1B\\" },
+        .{ .result = .invalid_data, .response = "\x1B]5522;type=write:status=EINVAL\x1B\\" },
+        .{ .result = .io_error, .response = "\x1B]5522;type=write:status=EIO\x1B\\" },
+    };
+
+    for (cases) |case| {
+        S.reset();
+        S.result = case.result;
+
+        // An immediately-committed write with no data is a clear.
+        s.nextSlice("\x1B]5522;type=write\x1B\\");
+        s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+        try testing.expectEqual(@as(usize, 1), S.write_count);
+        try testing.expectEqual(@as(usize, 0), S.last_contents_len);
+        try testing.expectEqualStrings(case.response, S.responseSlice());
+    }
+
+    // The response echoes the request terminator, unlike kitty which
+    // always uses ST.
+    S.reset();
+    s.nextSlice("\x1B]5522;type=write:loc=primary\x07");
+    s.nextSlice("\x1B]5522;type=wdata\x07");
+    try testing.expectEqual(clipboard.Location.primary, S.last_location);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=DONE\x07",
+        S.responseSlice(),
+    );
+}
+
+test "kitty clipboard write without clipboard effect responds ENOSYS" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // The transaction fails as soon as it begins; the rest of it is
+    // ignored without further responses.
+    s.nextSlice("\x1B]5522;type=write:id=x\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=ENOSYS:id=x\x1B\\",
+        S.responseSlice(),
+    );
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=ENOSYS:id=x\x1B\\",
+        S.responseSlice(),
+    );
+}
+
+test "kitty clipboard read without effect is denied with EPERM" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // The denial never includes loc (only OK responses do) and echoes
+    // the sanitized id.
+    s.nextSlice("\x1B]5522;type=read:loc=primary:id=*4 2*;dGV4dC9wbGFpbg==\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=EPERM:id=42\x1B\\",
+        S.responseSlice(),
+    );
+
+    // A missing payload is an empty MIME list, still answered.
+    S.reset();
+    s.nextSlice("\x1B]5522;type=read\x07");
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=EPERM\x07",
+        S.responseSlice(),
+    );
+
+    // An undecodable payload is dropped without a response.
+    S.reset();
+    s.nextSlice("\x1B]5522;type=read;!!!\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+}
+
+test "kitty clipboard read round trip" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    S.read_result = .{
+        .success = .{
+            .contents = &.{
+                // Unrequested representations are never served, and the
+                // served ones follow request order, not reply order.
+                .{ .mime = "image/png", .data = "\x89PNG" },
+                .{ .mime = "text/html", .data = "<b>hi</b>" },
+                .{ .mime = "text/plain", .data = "Ghostty" },
+            },
+            .available = &.{ "text/plain", "text/html" },
+        },
+    };
+
+    // Request the targets listing plus two types from the primary
+    // selection: ". text/plain text/html".
+    s.nextSlice("\x1B]5522;type=read:loc=primary:id=r1;LiB0ZXh0L3BsYWluIHRleHQvaHRtbA==\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.read_count);
+    try testing.expectEqual(clipboard.Location.primary, S.last_read_location);
+    try testing.expectEqual(@as(usize, 2), S.last_read_mimes_len);
+    try testing.expectEqualStrings("text/plain", S.readMimeAt(0));
+    try testing.expectEqualStrings("text/html", S.readMimeAt(1));
+    try testing.expect(S.last_read_list);
+    try testing.expectEqualStrings("", S.readName());
+    try testing.expect(!S.last_read_granted);
+    try testing.expect(!S.last_read_can_remember);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=OK:loc=primary:id=r1\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:id=r1:mime=Lg==;dGV4dC9wbGFpbiB0ZXh0L2h0bWwK\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:id=r1:mime=dGV4dC9wbGFpbg==;R2hvc3R0eQ==\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:id=r1:mime=dGV4dC9odG1s;PGI+aGk8L2I+\x1B\\" ++
+            "\x1B]5522;type=read:status=DONE:id=r1\x1B\\",
+        S.responseSlice(),
+    );
+
+    // Without the listing request `available` is ignored. The response
+    // echoes the request terminator.
+    S.responses_len = 0;
+    s.nextSlice("\x1B]5522;type=read:id=r2;dGV4dC9wbGFpbg==\x07");
+    try testing.expectEqual(clipboard.Location.standard, S.last_read_location);
+    try testing.expectEqual(@as(usize, 1), S.last_read_mimes_len);
+    try testing.expect(!S.last_read_list);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=OK:id=r2\x07" ++
+            "\x1B]5522;type=read:status=DATA:id=r2:mime=dGV4dC9wbGFpbg==;R2hvc3R0eQ==\x07" ++
+            "\x1B]5522;type=read:status=DONE:id=r2\x07",
+        S.responseSlice(),
+    );
+
+    // A listing-only request carries no types.
+    S.responses_len = 0;
+    s.nextSlice("\x1B]5522;type=read;Lg==\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.last_read_mimes_len);
+    try testing.expect(S.last_read_list);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=OK\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:mime=Lg==;dGV4dC9wbGFpbiB0ZXh0L2h0bWwK\x1B\\" ++
+            "\x1B]5522;type=read:status=DONE\x1B\\",
+        S.responseSlice(),
+    );
+}
+
+test "kitty clipboard read result maps to response status" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    const cases = [_]struct {
+        result: ?clipboard.Read.Result,
+        response: []const u8,
+    }{
+        .{ .result = .denied, .response = "\x1B]5522;type=read:status=EPERM:id=x\x1B\\" },
+        .{ .result = .unsupported, .response = "\x1B]5522;type=read:status=ENOSYS:id=x\x1B\\" },
+        .{ .result = .busy, .response = "\x1B]5522;type=read:status=EBUSY:id=x\x1B\\" },
+        .{ .result = .io_error, .response = "\x1B]5522;type=read:status=EIO:id=x\x1B\\" },
+        // No reply at all is a denial rather than silence.
+        .{ .result = null, .response = "\x1B]5522;type=read:status=EPERM:id=x\x1B\\" },
+        // A success with nothing to serve is still OK then DONE.
+        .{ .result = .{ .success = .{} }, .response = "\x1B]5522;type=read:status=OK:id=x\x1B\\" ++
+            "\x1B]5522;type=read:status=DONE:id=x\x1B\\" },
+    };
+
+    for (cases) |case| {
+        S.reset();
+        S.read_result = case.result;
+        s.nextSlice("\x1B]5522;type=read:id=x;dGV4dC9wbGFpbg==\x1B\\");
+        try testing.expectEqual(@as(usize, 1), S.read_count);
+        try testing.expectEqualStrings(case.response, S.responseSlice());
+    }
+
+    // A second reply is ignored.
+    S.reset();
+    S.read_result = .{ .success = .{ .contents = &.{.{ .mime = "text/plain", .data = "hello" }} } };
+    S.read_reply_twice = true;
+    s.nextSlice("\x1B]5522;type=read;dGV4dC9wbGFpbg==\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=OK\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1B\\" ++
+            "\x1B]5522;type=read:status=DONE\x1B\\",
+        S.responseSlice(),
+    );
+}
+
+test "kitty clipboard read caps requested types" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // "a/0 a/1 a/2 a/3 a/4 a/5 .": extras are dropped but the listing
+    // request after them still counts.
+    S.read_result = .{ .success = .{} };
+    s.nextSlice("\x1B]5522;type=read;YS8wIGEvMSBhLzIgYS8zIGEvNCBhLzUgLg==\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.read_count);
+    try testing.expectEqual(kitty_clipboard.max_read_mimes, S.last_read_mimes_len);
+    try testing.expectEqualStrings("a/0", S.readMimeAt(0));
+    try testing.expectEqualStrings("a/3", S.readMimeAt(kitty_clipboard.max_read_mimes - 1));
+    try testing.expect(S.last_read_list);
+}
+
+test "kitty clipboard read password grants" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // pw="secret", name="app": the first request isn't granted but the
+    // reply may ask to remember it.
+    S.read_result = .{ .success = .{ .remember = true } };
+    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.read_count);
+    try testing.expectEqualStrings("app", S.readName());
+    try testing.expect(!S.last_read_granted);
+    try testing.expect(S.last_read_can_remember);
+
+    // The same password is now granted; a different one is not.
+    S.read_result = .{ .success = .{} };
+    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw\x1B\\");
+    try testing.expect(S.last_read_granted);
+    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=:name=YXBw\x1B\\");
+    try testing.expect(!S.last_read_granted);
+    try testing.expect(S.last_read_can_remember);
+
+    // A password without a name doesn't count: it is neither granted
+    // nor rememberable, even if the reply asks.
+    S.read_result = .{ .success = .{ .remember = true } };
+    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0\x1B\\");
+    try testing.expectEqualStrings("", S.readName());
+    try testing.expect(!S.last_read_granted);
+    try testing.expect(!S.last_read_can_remember);
+    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=\x1B\\");
+    try testing.expect(!S.last_read_can_remember);
+    S.read_result = .{ .success = .{} };
+    s.nextSlice("\x1B]5522;type=read:pw=b3RoZXI=:name=YXBw\x1B\\");
+    try testing.expect(!S.last_read_granted);
+
+    // A grant is advisory: the request is still forwarded and the
+    // embedder may deny it.
+    S.responses_len = 0;
+    S.read_result = .denied;
+    s.nextSlice("\x1B]5522;type=read:id=d:pw=c2VjcmV0:name=YXBw\x1B\\");
+    try testing.expect(S.last_read_granted);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=EPERM:id=d\x1B\\",
+        S.responseSlice(),
+    );
+
+    // Grants are freed with the stream (the testing allocator catches
+    // the leak otherwise).
+}
+
+test "kitty clipboard malformed packets are silently dropped" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Missing type, unknown type, bare metadata record, invalid mime
+    // base64, and orphaned transaction packets all drop silently.
+    s.nextSlice("\x1B]5522;loc=primary\x1B\\");
+    s.nextSlice("\x1B]5522;type=bobr\x1B\\");
+    s.nextSlice("\x1B]5522;type=read:bare\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=!!!;R2hvc3Q=\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+    s.nextSlice("\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;VEVYVA==\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+    try testing.expect(!s.handler.semantic_failure);
+
+    // The terminal is still functional afterwards.
+    s.nextSlice("ok");
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("ok", str);
+}
+
+test "kitty clipboard new write replaces in-flight transaction" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1B]5522;type=write:id=old\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;b2xk\x1B\\"); // "old"
+    s.nextSlice("\x1B]5522;type=write:id=new\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;bmV3\x1B\\"); // "new"
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqual(@as(usize, 1), S.last_contents_len);
+    try testing.expectEqualStrings("new", S.dataAt(0));
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=DONE:id=new\x1B\\",
+        S.responseSlice(),
+    );
+}
+
+test "kitty clipboard invalid walias payload aborts with EINVAL" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1B]5522;type=write:id=w\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+    s.nextSlice("\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;!!!\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+        S.responseSlice(),
+    );
+    try testing.expect(!s.handler.semantic_failure);
+
+    // The transaction is gone: a commit does nothing further.
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+        S.responseSlice(),
+    );
+}
+
+test "kitty clipboard invalid wdata chunk is skipped" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1B]5522;type=write\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;SGVsbG8=\x1B\\"); // "Hello"
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;!!!bad!!!\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;V29ybGQ=\x1B\\"); // "World"
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqualStrings("HelloWorld", S.dataAt(0));
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=DONE\x1B\\",
+        S.responseSlice(),
+    );
+}
+
+test "kitty clipboard in-flight transaction is freed on deinit" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Never committed: stream deinit must free the transaction (the
+    // testing allocator catches the leak otherwise).
+    s.nextSlice("\x1B]5522;type=write\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+}
+
+test "kitty clipboard allocation failure is ignored" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Only transaction state uses the terminal allocator here. Swap in
+    // an allocator that always fails, then restore it before teardown.
+    {
+        const alloc = t.screens.active.alloc;
+        t.screens.active.alloc = testing.failing_allocator;
+        defer t.screens.active.alloc = alloc;
+        s.nextSlice("\x1B]5522;type=write\x1B\\");
+    }
+
+    // Clipboard writes are external effects, best-effort like OSC 52;
+    // the failed transaction never started and is not a semantic
+    // failure.
+    try testing.expect(!s.handler.semantic_failure);
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+}
+
+test "kitty clipboard without write_pty still commits writes" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1B]5522;type=write\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqualStrings("Ghost", S.dataAt(0));
+
+    // Reads are dropped without a way to respond.
+    s.nextSlice("\x1B]5522;type=read\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
 }
 
 test "request mode DECRQM with write_pty callback" {

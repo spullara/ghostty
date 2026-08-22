@@ -95,8 +95,8 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS query (CSI 14/16/18 t) or mode 2048 enable |
  * | `GHOSTTY_TERMINAL_OPT_COLOR_SCHEME`     | `GhosttyTerminalColorSchemeFn`    | Color scheme query (CSI ? 996 n)          |
  * | `GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES`| `GhosttyTerminalDeviceAttributesFn`| Device attributes query (CSI c / > c / = c)|
- * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`  | `GhosttyTerminalClipboardWriteFn` | Clipboard write via OSC 52 / OSC 1337     |
- * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ`   | `GhosttyTerminalClipboardReadFn`  | Clipboard read via OSC 52 "?"             |
+ * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`  | `GhosttyTerminalClipboardWriteFn` | Clipboard write via OSC 52 / OSC 1337 / OSC 5522 |
+ * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ`   | `GhosttyTerminalClipboardReadFn`  | Clipboard read via OSC 52 "?" / OSC 5522  |
  * | `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION`| `GhosttyTerminalDesktopNotificationFn` | Desktop notification via OSC 9 / OSC 777 |
  * | `GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT`  | `GhosttyTerminalProgressReportFn` | Progress report via OSC 9;4               |
  * | `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` | `GhosttyTerminalUnknownSequenceFn` | Unsupported sequence identifier          |
@@ -494,7 +494,10 @@ typedef struct {
  * Result of a clipboard write callback.
  *
  * Protocols without write acknowledgements, including OSC 52 and iTerm2
- * OSC 1337 Copy, ignore this result.
+ * OSC 1337 Copy, ignore this result. The Kitty clipboard protocol
+ * (OSC 5522) acknowledges writes: each result maps to the corresponding
+ * protocol status (DONE, EPERM, ENOSYS, EBUSY, EINVAL, EIO) and is
+ * reported back to the running program through the write_pty callback.
  *
  * @ingroup terminal
  */
@@ -525,9 +528,18 @@ typedef enum GHOSTTY_ENUM_TYPED {
  * Called synchronously for a complete logical clipboard write. Protocol
  * details such as OSC 52 selectors, base64 encoding, multipart chunks,
  * aliases, and terminators are normalized before this callback is invoked.
- * OSC 52 and iTerm2 OSC 1337 Copy writes therefore use the same callback
- * shape. OSC 52 clipboard read requests ("?") are delivered to
- * GhosttyTerminalClipboardReadFn instead.
+ * OSC 52, iTerm2 OSC 1337 Copy, and Kitty clipboard (OSC 5522) writes
+ * therefore use the same callback shape.
+ *
+ * Every invocation is one complete write: the contents replace whatever
+ * the destination previously held, so there is never a partial update to
+ * detect or a reset to perform. A Kitty clipboard write transaction
+ * results in exactly one invocation, at commit, carrying all of the
+ * transaction's MIME representations together; its protocol response is
+ * generated automatically from the returned result.
+ *
+ * Clipboard read requests (OSC 52 "?" and OSC 5522 reads) are delivered
+ * to GhosttyTerminalClipboardReadFn instead.
  *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
@@ -572,8 +584,9 @@ typedef enum {
  * duration of the reply call and may be freed as soon as it returns.
  *
  * Any result other than GHOSTTY_CLIPBOARD_READ_RESULT_SUCCESS answers the
- * program with an empty clipboard; the other fields are ignored in that
- * case. On success, `contents` should carry one representation per
+ * program with an empty clipboard (OSC 52) or the matching protocol status
+ * (OSC 5522: EPERM, ENOSYS, EBUSY, EIO); the other fields are ignored in
+ * that case. On success, `contents` should carry one representation per
  * requested MIME type (GhosttyClipboardRead::mimes) that the clipboard
  * has; unrequested representations are ignored. Protocols that carry a
  * single text value (OSC 52) use the first entry with a text MIME type
@@ -637,7 +650,7 @@ typedef void (*GhosttyClipboardReadReplyFn)(
  * GhosttyClipboardReadReply. This must happen before the callback returns;
  * the request is invalid afterwards. Calling `reply` more than once is
  * ignored. Returning without replying answers the program with an empty
- * clipboard.
+ * clipboard (OSC 52) or EPERM (OSC 5522).
  *
  * @ingroup terminal
  */
@@ -695,14 +708,21 @@ struct GhosttyClipboardRead {
  * Callback function type for clipboard_read.
  *
  * Called synchronously when the running program requests clipboard contents
- * via OSC 52 with a "?" payload. Answering lets the program read the user's
- * clipboard, so the embedder is expected to mediate consent. Because the
- * read is synchronous, an embedder that needs to ask the user must block
- * (for example by running a modal prompt) until it has an answer; the VT
- * stream waits until the callback returns.
+ * via OSC 52 with a "?" payload or a Kitty clipboard (OSC 5522) read.
+ * Answering lets the program read the user's clipboard, so the embedder is
+ * expected to mediate consent. Because the read is synchronous, an embedder
+ * that needs to ask the user must block (for example by running a modal
+ * prompt) until it has an answer; the VT stream waits until the callback
+ * returns.
  *
  * Answer by calling `read->reply(read, &reply)` before returning. See
  * GhosttyClipboardRead for the full contract.
+ *
+ * OSC 5522 requests carry the program's MIME list, name, and password grant
+ * state; a reply that sets `remember` records a session grant so later
+ * requests with the same password arrive with `granted` set. Kitty itself
+ * serves a request for only the targets listing (`list` with no `mimes`)
+ * without prompting.
  *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
@@ -1243,9 +1263,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /**
    * Callback invoked when the running program performs a clipboard write.
-   * OSC 52 and iTerm2 OSC 1337 Copy writes are normalized to an atomic set
-   * of decoded MIME representations. Set to NULL to ignore clipboard writes.
-   * Clipboard read requests are delivered to
+   * OSC 52, iTerm2 OSC 1337 Copy, and Kitty clipboard (OSC 5522) writes
+   * are normalized to an atomic set of decoded MIME representations. Set
+   * to NULL to ignore clipboard writes (Kitty clipboard writes are then
+   * refused with ENOSYS). Clipboard read requests are delivered to
    * GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ instead.
    *
    * Input type: GhosttyTerminalClipboardWriteFn
@@ -1411,9 +1432,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /**
    * Callback invoked when the running program requests clipboard contents
-   * via OSC 52 with a "?" payload. The read is synchronous and must be
-   * answered before the callback returns. Set to NULL to ignore clipboard
-   * read requests (the default).
+   * via OSC 52 with a "?" payload or a Kitty clipboard (OSC 5522) read. The
+   * read is synchronous and must be answered before the callback returns.
+   * Set to NULL (the default) to ignore OSC 52 read requests and refuse
+   * OSC 5522 reads with EPERM.
    *
    * Input type: GhosttyTerminalClipboardReadFn
    */

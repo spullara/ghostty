@@ -50,10 +50,10 @@ pub const sys = terminal.sys;
 pub const TinyIo = @import("lib/TinyIo.zig");
 
 pub const apc = terminal.apc;
+pub const clipboard = terminal.clipboard;
 pub const dcs = terminal.dcs;
 pub const osc = terminal.osc;
 pub const point = terminal.point;
-pub const clipboard = terminal.clipboard;
 pub const color = terminal.color;
 pub const device_status = terminal.device_status;
 pub const formatter = terminal.formatter;

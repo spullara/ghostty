@@ -240,8 +240,12 @@ pub const ModeConfig = extern struct {
 
 /// C callback state for terminal effects. Most trampolines are always
 /// installed on the stream handler; they check these fields and no-op when
-/// the corresponding callback is null. The unknown-sequence trampoline is
-/// installed dynamically to preserve its null fast path.
+/// the corresponding callback is null. The unknown-sequence and
+/// clipboard trampolines are installed dynamically to preserve their
+/// null fast paths (for clipboard_write, a null Zig-level effect makes
+/// Kitty clipboard writes fail up front instead of spooling a
+/// transaction that can never commit; for clipboard_read it keeps
+/// reads denied).
 const Effects = struct {
     userdata: ?*anyopaque = null,
     write_pty: ?WritePtyFn = null,
@@ -660,7 +664,9 @@ fn wrap(
         .pwd_changed = &Effects.pwdChangedTrampoline,
         .progress_report = &Effects.progressReportTrampoline,
         .size = &Effects.sizeTrampoline,
-        .clipboard_write = &Effects.clipboardWriteTrampoline,
+
+        // Installed dynamically when the callback is set; see Effects.
+        .clipboard_write = null,
         .clipboard_read = null,
     };
 
@@ -1244,7 +1250,13 @@ fn setTyped(
         .pwd_changed => wrapper.effects.pwd_changed = value,
         .progress_report => wrapper.effects.progress_report = value,
         .size_cb => wrapper.effects.size_cb = value,
-        .clipboard_write => wrapper.effects.clipboard_write = value,
+        .clipboard_write => {
+            wrapper.effects.clipboard_write = value;
+            wrapper.stream.handler.effects.clipboard_write = if (value != null)
+                &Effects.clipboardWriteTrampoline
+            else
+                null;
+        },
         .clipboard_read => {
             wrapper.effects.clipboard_read = value;
             wrapper.stream.handler.effects.clipboard_read = if (value != null)
@@ -4717,8 +4729,10 @@ test "set clipboard_write callback" {
     try testing.expectEqualStrings("image/png", S.last_mimes[4][0..S.last_mime_lens[4]]);
     try testing.expectEqualSlices(u8, "\x89PNG", S.last_data[4][0..S.last_data_lens[4]]);
 
-    // Removing the callback takes effect immediately.
+    // Removing the callback takes effect immediately and uninstalls
+    // the trampoline.
     try testing.expectEqual(Result.success, set(t, .clipboard_write, null));
+    try testing.expect(t.?.stream.handler.effects.clipboard_write == null);
     const after_remove = "\x1B]52;c;eA==\x1B\\";
     vt_write(t, after_remove, after_remove.len);
     try testing.expectEqual(@as(usize, 7), S.count);
@@ -4738,12 +4752,183 @@ test "clipboard_write without callback is unsupported and silent" {
     const seq = "\x1B]52;c;aGVsbG8=\x1B\\";
     vt_write(t, seq, seq.len);
 
-    const handler = &t.?.stream.handler;
-    const result = handler.effects.clipboard_write.?(handler, .{
-        .location = .standard,
-        .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
-    });
-    try testing.expectEqual(clipboard.WriteResult.unsupported, result);
+    // No trampoline is installed until a callback is set, so the
+    // stream skips clipboard work (and never spools a Kitty clipboard
+    // transaction it can't deliver).
+    try testing.expect(t.?.stream.handler.effects.clipboard_write == null);
+}
+
+test "kitty clipboard write via C effects" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var responses: [512]u8 = undefined;
+        var responses_len: usize = 0;
+        var write_count: usize = 0;
+        var last_location: clipboard.Location = .standard;
+        var last_contents_len: usize = 0;
+        var last_mimes: [4][64]u8 = undefined;
+        var last_mime_lens: [4]usize = @splat(0);
+        var last_data: [4][64]u8 = undefined;
+        var last_data_lens: [4]usize = @splat(0);
+
+        fn writePty(
+            _: Terminal,
+            _: ?*anyopaque,
+            ptr: [*]const u8,
+            len: usize,
+        ) callconv(lib.calling_conv) void {
+            @memcpy(responses[responses_len..][0..len], ptr[0..len]);
+            responses_len += len;
+        }
+
+        fn clipboardWrite(
+            _: Terminal,
+            _: ?*anyopaque,
+            request: *const ClipboardWrite,
+        ) callconv(lib.calling_conv) clipboard.WriteResult {
+            write_count += 1;
+            last_location = request.location;
+            last_contents_len = request.contents_len;
+            if (request.contents) |ptr| {
+                for (ptr[0..@min(request.contents_len, last_mimes.len)], 0..) |content, i| {
+                    last_mime_lens[i] = @min(content.mime.len, last_mimes[i].len);
+                    @memcpy(
+                        last_mimes[i][0..last_mime_lens[i]],
+                        content.mime.ptr[0..last_mime_lens[i]],
+                    );
+                    last_data_lens[i] = @min(content.data.len, last_data[i].len);
+                    @memcpy(
+                        last_data[i][0..last_data_lens[i]],
+                        content.data.ptr[0..last_data_lens[i]],
+                    );
+                }
+            }
+            return .success;
+        }
+    };
+    S.responses_len = 0;
+    S.write_count = 0;
+    S.last_mime_lens = @splat(0);
+    S.last_data_lens = @splat(0);
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .clipboard_write, @ptrCast(&S.clipboardWrite)));
+
+    // A full OSC 5522 write transaction: begin, chunked data for two
+    // representations, commit. Only the commit invokes the callback,
+    // and its result maps to the DONE response.
+    const seqs = [_][]const u8{
+        "\x1B]5522;type=write:id=c1\x1B\\",
+        "\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\", // "Ghost"
+        "\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;dHk=\x1B\\", // "ty"
+        "\x1B]5522;type=wdata:mime=dGV4dC9odG1s;PGI+aGk8L2I+\x1B\\", // "<b>hi</b>"
+        "\x1B]5522;type=wdata\x1B\\",
+    };
+    for (seqs) |seq| vt_write(t, seq.ptr, seq.len);
+
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqual(clipboard.Location.standard, S.last_location);
+    try testing.expectEqual(@as(usize, 2), S.last_contents_len);
+    try testing.expectEqualStrings("text/plain", S.last_mimes[0][0..S.last_mime_lens[0]]);
+    try testing.expectEqualStrings("Ghostty", S.last_data[0][0..S.last_data_lens[0]]);
+    try testing.expectEqualStrings("text/html", S.last_mimes[1][0..S.last_mime_lens[1]]);
+    try testing.expectEqualStrings("<b>hi</b>", S.last_data[1][0..S.last_data_lens[1]]);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=DONE:id=c1\x1B\\",
+        S.responses[0..S.responses_len],
+    );
+
+    // Without a read callback reads are denied.
+    S.responses_len = 0;
+    const read = "\x1B]5522;type=read:id=r1;dGV4dC9wbGFpbg==\x1B\\";
+    vt_write(t, read, read.len);
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=EPERM:id=r1\x1B\\",
+        S.responses[0..S.responses_len],
+    );
+
+    // With a read callback the request is served through it.
+    const R = struct {
+        var count: usize = 0;
+        var last_mimes_len: usize = 0;
+        var last_mime_is_text: bool = false;
+        var last_list: bool = true;
+        var last_name_len: usize = 0;
+        var last_granted: bool = true;
+        var last_can_remember: bool = true;
+
+        fn clipboardRead(
+            _: Terminal,
+            _: ?*anyopaque,
+            request: *const ClipboardRead,
+        ) callconv(lib.calling_conv) void {
+            count += 1;
+            last_mimes_len = request.mimes_len;
+            last_mime_is_text = request.mimes_len > 0 and std.mem.eql(
+                u8,
+                request.mimes.?[0].ptr[0..request.mimes.?[0].len],
+                "text/plain",
+            );
+            last_list = request.list;
+            last_name_len = request.name.len;
+            last_granted = request.granted;
+            last_can_remember = request.can_remember;
+
+            const mime: []const u8 = "text/plain";
+            const data: []const u8 = "hello";
+            const contents = [_]ClipboardContent{.{
+                .mime = .init(mime),
+                .data = .init(data),
+            }};
+            request.reply(request, &.{
+                .size = @sizeOf(ClipboardReadReply),
+                .result = .success,
+                .contents = &contents,
+                .contents_len = contents.len,
+                .available = null,
+                .available_len = 0,
+                .remember = false,
+            });
+        }
+    };
+    try testing.expectEqual(Result.success, set(t, .clipboard_read, @ptrCast(&R.clipboardRead)));
+    S.responses_len = 0;
+    // name="app" without a password: forwarded for prompts, not
+    // rememberable.
+    const read2 = "\x1B]5522;type=read:id=r2:name=YXBw;dGV4dC9wbGFpbg==\x1B\\";
+    vt_write(t, read2, read2.len);
+    try testing.expectEqual(@as(usize, 1), R.count);
+    try testing.expectEqual(@as(usize, 1), R.last_mimes_len);
+    try testing.expect(R.last_mime_is_text);
+    try testing.expect(!R.last_list);
+    try testing.expectEqual(@as(usize, 3), R.last_name_len);
+    try testing.expect(!R.last_granted);
+    try testing.expect(!R.last_can_remember);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=read:status=OK:id=r2\x1B\\" ++
+            "\x1B]5522;type=read:status=DATA:id=r2:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1B\\" ++
+            "\x1B]5522;type=read:status=DONE:id=r2\x1B\\",
+        S.responses[0..S.responses_len],
+    );
+
+    // Without a clipboard callback the transaction fails up front.
+    try testing.expectEqual(Result.success, set(t, .clipboard_write, null));
+    S.responses_len = 0;
+    const begin = "\x1B]5522;type=write:id=c2\x1B\\";
+    vt_write(t, begin, begin.len);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=ENOSYS:id=c2\x1B\\",
+        S.responses[0..S.responses_len],
+    );
 }
 
 test "set clipboard_read callback" {
