@@ -74,6 +74,7 @@ bo2themax
 bousii
 brentschroeter
 brianc442
+by-nelson
 c0x0o
 carldaws
 carlvillads
@@ -306,6 +307,7 @@ thirstycrow
 thoutbeckers
 ticclick
 tnagatomi
+tothedarktowercame
 trag1c
 tristan957
 tsacha
