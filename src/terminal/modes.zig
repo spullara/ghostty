@@ -8,6 +8,7 @@
 //! to ensure all our various types and logic remain in sync.
 
 const std = @import("std");
+const build_options = @import("terminal_options");
 const testing = std.testing;
 
 /// A struct that maintains the state of all the settable modes.
@@ -331,10 +332,12 @@ const entries: []const ModeEntry = &.{
     // paste sends an unsolicited OSC 5522 targets listing with a
     // one-time password instead of pasting the text.
     // See https://sw.kovidgoyal.net/kitty/clipboard/
-    //
-    // Forcibly disabled for now since the functionality isn't exposed
-    // yet to libghostty or any GUI apps.
-    .{ .name = "kitty_paste_events", .value = 5522, .disabled = true },
+    .{
+        .name = "kitty_paste_events",
+        .value = 5522,
+        // Only libghostty-vt supports this currently
+        .disabled = build_options.artifact != .lib,
+    },
 };
 
 test {

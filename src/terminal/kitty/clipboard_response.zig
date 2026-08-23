@@ -23,6 +23,9 @@ pub const max_read_mimes = 4;
 /// The special MIME type that requests the list of available types.
 pub const targets_mime = ".";
 
+/// Maximum MIME types reported in a paste event's targets listing.
+pub const max_listing_mimes = 16;
+
 /// A single response packet.
 pub const Response = struct {
     op: Operation,
@@ -179,6 +182,36 @@ pub const ReadSuccess = struct {
             try b64.encodeWriter(writer, fixed.buffered());
         }
         try writer.writeAll(self.terminator.string());
+    }
+};
+
+/// An unsolicited Kitty paste event (mode 5522): a read response that
+/// lists the clipboard's available MIME types and carries the one-time
+/// password the program uses for its follow-up read.
+pub const PasteEvent = struct {
+    /// True if the paste came from the primary selection, reported as
+    /// `loc=primary` on the OK packet.
+    primary: bool = false,
+
+    /// The one-time password, echoed in every packet.
+    pw: []const u8,
+
+    /// The MIME types available on the clipboard.
+    available: []const []const u8,
+
+    terminator: Terminator = .st,
+
+    pub fn encode(
+        self: *const PasteEvent,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try (ReadSuccess{
+            .primary = self.primary,
+            .pw = self.pw,
+            .list = true,
+            .available = self.available,
+            .terminator = self.terminator,
+        }).encode(writer);
     }
 };
 
@@ -379,6 +412,57 @@ test "read success: paste event carries pw in every packet" {
     try testing.expectEqualStrings(
         "\x1b]5522;type=read:status=OK:pw=b3Rw\x1b\\" ++
             "\x1b]5522;type=read:status=DATA:mime=Lg==:pw=b3Rw;dGV4dC9wbGFpbgo=\x1b\\" ++
+            "\x1b]5522;type=read:status=DONE:pw=b3Rw\x1b\\",
+        writer.buffered(),
+    );
+}
+
+test "paste event: pw in every packet, listing of every type" {
+    const testing = std.testing;
+
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try (PasteEvent{
+        .pw = "otp",
+        .available = &.{ "text/plain", "image/png" },
+    }).encode(&writer);
+    // Payload is base64 of "text/plain image/png\n".
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=read:status=OK:pw=b3Rw\x1b\\" ++
+            "\x1b]5522;type=read:status=DATA:mime=Lg==:pw=b3Rw;dGV4dC9wbGFpbiBpbWFnZS9wbmcK\x1b\\" ++
+            "\x1b]5522;type=read:status=DONE:pw=b3Rw\x1b\\",
+        writer.buffered(),
+    );
+}
+
+test "paste event: primary is reported only on the OK packet" {
+    const testing = std.testing;
+
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try (PasteEvent{
+        .primary = true,
+        .pw = "otp",
+        .available = &.{"text/plain"},
+        .terminator = .bel,
+    }).encode(&writer);
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=read:status=OK:loc=primary:pw=b3Rw\x07" ++
+            "\x1b]5522;type=read:status=DATA:mime=Lg==:pw=b3Rw;dGV4dC9wbGFpbgo=\x07" ++
+            "\x1b]5522;type=read:status=DONE:pw=b3Rw\x07",
+        writer.buffered(),
+    );
+}
+
+test "paste event: empty listing packet is still sent" {
+    const testing = std.testing;
+
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try (PasteEvent{ .pw = "otp", .available = &.{} }).encode(&writer);
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=read:status=OK:pw=b3Rw\x1b\\" ++
+            "\x1b]5522;type=read:status=DATA:mime=Lg==:pw=b3Rw\x1b\\" ++
             "\x1b]5522;type=read:status=DONE:pw=b3Rw\x1b\\",
         writer.buffered(),
     );

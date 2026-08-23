@@ -17,6 +17,7 @@ const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
 const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
+const paste_pkg = @import("paste.zig");
 const kitty_dnd = @import("kitty/dnd.zig");
 const size_report = @import("size_report.zig");
 const simd = @import("../simd/main.zig");
@@ -200,6 +201,11 @@ pub const Handler = struct {
         /// session grant so later requests with the same password arrive
         /// with `granted` set. Kitty itself serves a request for only the
         /// targets listing (`list` with no `mimes`) without prompting.
+        ///
+        /// Installing this also enables Kitty paste events (mode 5522):
+        /// `paste` sends the program an event instead of the text, and
+        /// the program's follow-up read arrives here with `granted` set
+        /// since the user already pasted. See `paste`.
         clipboard_read: ?*const fn (*Handler, clipboard.Read) void,
 
         /// Called in response to an XTVERSION query. Returns the version
@@ -284,6 +290,56 @@ pub const Handler = struct {
         }) catch unreachable;
         buf[writer.end] = 0;
         write_pty(self, buf[0..writer.end :0]);
+    }
+
+    /// A paste request; see `paste`.
+    pub const Paste = paste_pkg.Request;
+
+    pub const PasteError = Allocator.Error || std.Io.RandomSecureError || error{
+        /// The data could inject commands and allow_unsafe was false.
+        /// Nothing was written.
+        UnsafePaste,
+
+        /// No write_pty effect is set, so nothing can be written.
+        NoWritePty,
+    };
+
+    /// Paste into the terminal, applying the terminal's current state
+    /// as necessary to owner mode 5522, bracketed paste, unsafe paste, etc.
+    /// Returns true if anything was written to the pty.
+    pub fn paste(self: *Handler, req: Paste) PasteError!bool {
+        if (self.effects.write_pty == null) return error.NoWritePty;
+
+        // One buffer for the whole result (frame + data + sentinel, or
+        // the event packets). Typical pastes stay on the stack.
+        const alloc = self.terminal.gpa();
+        var stack = std.heap.stackFallback(4096, alloc);
+        const stack_alloc = stack.get();
+        var aw: std.Io.Writer.Allocating = .init(stack_alloc);
+        defer aw.deinit();
+
+        const written_any = paste_pkg.paste(.{
+            .terminal = self.terminal,
+            .grants = &self.kitty_clipboard_grants,
+            .io = self.terminal.io(),
+            .alloc = alloc,
+            .can_event = self.effects.clipboard_read != null,
+            .writer = &aw.writer,
+        }, req) catch |err| return switch (err) {
+            // An allocating writer only fails to allocate.
+            error.WriteFailed => error.OutOfMemory,
+            error.OutOfMemory,
+            error.UnsafePaste,
+            error.EntropyUnavailable,
+            error.Canceled,
+            => |e| e,
+        };
+        if (!written_any) return false;
+
+        const written = try aw.toOwnedSliceSentinel(0);
+        defer stack_alloc.free(written);
+        self.writePty(written);
+        return true;
     }
 
     pub fn vt(
@@ -402,6 +458,10 @@ pub const Handler = struct {
             .decaln => try self.terminal.decaln(),
             .full_reset => {
                 self.terminal.fullReset();
+
+                // Full reset clears grants
+                self.kitty_clipboard_grants.deinit(self.terminal.gpa());
+                self.kitty_clipboard_grants = .{};
 
                 // Clear the progress bar
                 self.progressReport(.{ .state = .remove });
@@ -5393,4 +5453,454 @@ test "kitty dnd: effect reports registration, acceptance, and conclusion" {
     try testing.expect(S.events.items[3] == .registration);
     try testing.expect(t.kitty_dnd == null);
     try testing.expectEqualStrings("", S.mimes.items);
+}
+
+/// Capture state for the Handler.paste tests below: every pty write and
+/// the clipboard reads the program makes afterwards.
+const PasteCapture = struct {
+    var written: std.ArrayList(u8) = .empty;
+    var write_count: usize = 0;
+    var read_count: usize = 0;
+    var read_granted_count: usize = 0;
+    var last_read_granted: bool = false;
+    var last_read_name: [64]u8 = undefined;
+    var last_read_name_len: usize = 0;
+
+    fn reset() void {
+        written.clearRetainingCapacity();
+        write_count = 0;
+        read_count = 0;
+        read_granted_count = 0;
+        last_read_granted = false;
+        last_read_name_len = 0;
+    }
+
+    fn deinit() void {
+        written.deinit(testing.allocator);
+        written = .empty;
+    }
+
+    fn writePty(_: *Handler, data: [:0]const u8) void {
+        written.appendSlice(testing.allocator, data) catch @panic("OOM");
+        write_count += 1;
+    }
+
+    fn clipboardRead(_: *Handler, read: clipboard.Read) void {
+        read_count += 1;
+        last_read_granted = read.granted;
+        if (read.granted) read_granted_count += 1;
+        last_read_name_len = read.name.len;
+        @memcpy(last_read_name[0..read.name.len], read.name);
+        read.reply(.{ .success = .{ .contents = &.{.{
+            .mime = "text/plain",
+            .data = "Ghostty",
+        }} } });
+    }
+
+    fn readName() []const u8 {
+        return last_read_name[0..last_read_name_len];
+    }
+};
+
+test "paste: no write_pty effect is an error" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    try testing.expectError(error.NoWritePty, handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
+    }));
+}
+
+test "paste: plain text converts newlines and strips unsafe bytes" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+
+    // Newlines are unsafe unbracketed; the embedder confirmed.
+    try testing.expect(try handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "hel\x1blo\nwor\x00ld" }},
+        .allow_unsafe = true,
+    }));
+    try testing.expectEqualStrings("hel lo\rwor ld", S.written.items);
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+
+    // The first text representation is used; others are ignored.
+    S.reset();
+    try testing.expect(try handler.paste(.{
+        .contents = &.{
+            .{ .mime = "image/png", .data = "\x89PNG" },
+            .{ .mime = "UTF8_STRING", .data = "hi" },
+            .{ .mime = "text/plain", .data = "ignored" },
+        },
+    }));
+    try testing.expectEqualStrings("hi", S.written.items);
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+}
+
+test "paste: unsafe text is refused unless allowed" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+
+    try testing.expectError(error.UnsafePaste, handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "rm -rf /\n" }},
+    }));
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+
+    try testing.expect(try handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "rm -rf /\n" }},
+        .allow_unsafe = true,
+    }));
+    try testing.expectEqualStrings("rm -rf /\r", S.written.items);
+}
+
+test "paste: bracketed paste frames the text" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+    t.modes.set(.bracketed_paste, true);
+
+    // Newlines are safe inside the frame and are preserved.
+    try testing.expect(try handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "hello\nworld" }},
+    }));
+    try testing.expectEqualStrings("\x1b[200~hello\nworld\x1b[201~", S.written.items);
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+
+    // The frame terminator is not.
+    S.reset();
+    try testing.expectError(error.UnsafePaste, handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "he\x1b[201~llo" }},
+    }));
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+
+    // Allowed, the stripper still defuses it: ESC becomes a space.
+    try testing.expect(try handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "he\x1b[201~llo" }},
+        .allow_unsafe = true,
+    }));
+    try testing.expectEqualStrings("\x1b[200~he [201~llo\x1b[201~", S.written.items);
+}
+
+test "paste: no text representation writes nothing" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+
+    try testing.expect(!try handler.paste(.{
+        .contents = &.{.{ .mime = "image/png", .data = "\x89PNG" }},
+    }));
+    try testing.expect(!try handler.paste(.{
+        .contents = &.{},
+    }));
+    try testing.expect(!try handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "" }},
+    }));
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+}
+
+test "paste: large text falls back to the heap in one write" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+    t.modes.set(.bracketed_paste, true);
+
+    const data = "x" ** 10_000;
+    try testing.expect(try handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = data }},
+    }));
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqual(data.len + "\x1b[200~\x1b[201~".len, S.written.items.len);
+    try testing.expect(std.mem.startsWith(u8, S.written.items, "\x1b[200~xxx"));
+    try testing.expect(std.mem.endsWith(u8, S.written.items, "xxx\x1b[201~"));
+}
+
+test "paste: mode 5522 sends an event the program can read with" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+    t.modes.set(.kitty_paste_events, true);
+    t.modes.set(.bracketed_paste, true);
+
+    // Every representation is listed, the data is never written, and
+    // the one-time password rides on every packet.
+    try testing.expect(try s.handler.paste(.{
+        .contents = &.{
+            .{ .mime = "text/plain", .data = "secret" },
+            .{ .mime = "image/png", .data = "" },
+        },
+    }));
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, S.written.items, "\x1b]5522;"));
+    try testing.expect(std.mem.indexOf(u8, S.written.items, "secret") == null);
+    try testing.expect(std.mem.indexOf(u8, S.written.items, "\x1b[200~") == null);
+
+    // OK packet: parse the (base64) password out.
+    const ok_prefix = "\x1b]5522;type=read:status=OK:pw=";
+    try testing.expect(std.mem.startsWith(u8, S.written.items, ok_prefix));
+    const pw_end = std.mem.indexOfPos(u8, S.written.items, ok_prefix.len, "\x1b\\").?;
+    // Copied out since the capture buffer is reused below.
+    var pw_buf: [64]u8 = undefined;
+    const pw_b64 = pw_buf[0 .. pw_end - ok_prefix.len];
+    @memcpy(pw_b64, S.written.items[ok_prefix.len..pw_end]);
+    try testing.expectEqual(
+        std.base64.standard.Encoder.calcSize(kitty_clipboard.otp_len),
+        pw_b64.len,
+    );
+
+    // Listing packet: base64 of "text/plain image/png\n".
+    var expected_buf: [256]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "\x1b]5522;type=read:status=OK:pw={s}\x1b\\" ++
+            "\x1b]5522;type=read:status=DATA:mime=Lg==:pw={s};dGV4dC9wbGFpbiBpbWFnZS9wbmcK\x1b\\" ++
+            "\x1b]5522;type=read:status=DONE:pw={s}\x1b\\",
+        .{ pw_b64, pw_b64, pw_b64 },
+    );
+    try testing.expectEqualStrings(expected, S.written.items);
+
+    // The program reads with the password and the name "Paste event":
+    // the read arrives granted, exactly once.
+    var read_buf: [256]u8 = undefined;
+    const read = try std.fmt.bufPrint(
+        &read_buf,
+        "\x1b]5522;type=read:pw={s}:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\",
+        .{pw_b64},
+    );
+    S.reset();
+    s.nextSlice(read);
+    try testing.expectEqual(@as(usize, 1), S.read_count);
+    try testing.expect(S.last_read_granted);
+    try testing.expectEqualStrings("Paste event", S.readName());
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=read:status=OK\x1b\\" ++
+            "\x1b]5522;type=read:status=DATA:mime=dGV4dC9wbGFpbg==;R2hvc3R0eQ==\x1b\\" ++
+            "\x1b]5522;type=read:status=DONE\x1b\\",
+        S.written.items,
+    );
+
+    // The password was one-time: a second read is not granted.
+    S.reset();
+    s.nextSlice(read);
+    try testing.expectEqual(@as(usize, 1), S.read_count);
+    try testing.expect(!S.last_read_granted);
+    try testing.expectEqual(@as(usize, 0), S.read_granted_count);
+
+    // Every event mints a fresh password.
+    S.reset();
+    try testing.expect(try s.handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "secret" }},
+    }));
+    try testing.expect(std.mem.indexOf(u8, S.written.items, pw_b64) == null);
+}
+
+test "paste: mode 5522 reports the selection as primary" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    t.modes.set(.kitty_paste_events, true);
+
+    for ([_]clipboard.Location{ .primary, .selection }) |location| {
+        S.reset();
+        try testing.expect(try handler.paste(.{
+            .location = location,
+            .contents = &.{.{ .mime = "text/plain", .data = "x" }},
+        }));
+        try testing.expect(std.mem.startsWith(
+            u8,
+            S.written.items,
+            "\x1b]5522;type=read:status=OK:loc=primary:pw=",
+        ));
+        // Only on the OK packet.
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, S.written.items, "loc=primary"));
+    }
+
+    S.reset();
+    try testing.expect(try handler.paste(.{
+        .location = .standard,
+        .contents = &.{.{ .mime = "text/plain", .data = "x" }},
+    }));
+    try testing.expect(std.mem.indexOf(u8, S.written.items, "loc=") == null);
+}
+
+test "paste: mode 5522 without clipboard_read pastes text" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+    t.modes.set(.kitty_paste_events, true);
+
+    try testing.expect(try handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
+    }));
+    try testing.expectEqualStrings("hello", S.written.items);
+    try testing.expectEqual(@as(usize, 0), handler.kitty_clipboard_grants.entries.items.len);
+}
+
+test "paste: text source never becomes an event" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    t.modes.set(.kitty_paste_events, true);
+
+    try testing.expect(try handler.paste(.{
+        .source = .text,
+        .contents = &.{.{ .mime = "text/plain", .data = "committed" }},
+    }));
+    try testing.expectEqualStrings("committed", S.written.items);
+    try testing.expectEqual(@as(usize, 0), handler.kitty_clipboard_grants.entries.items.len);
+}
+
+test "paste: mode 5522 without entropy fails and records no grant" {
+    var t: Terminal = try .init(std.Io.failing, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    defer handler.deinit();
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    t.modes.set(.kitty_paste_events, true);
+
+    try testing.expectError(error.EntropyUnavailable, handler.paste(.{
+        .contents = &.{.{ .mime = "text/plain", .data = "secret" }},
+    }));
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqual(@as(usize, 0), handler.kitty_clipboard_grants.entries.items.len);
+
+    // Text pastes need no entropy and still work.
+    try testing.expect(try handler.paste(.{
+        .source = .text,
+        .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
+    }));
+    try testing.expectEqualStrings("hello", S.written.items);
+}
+
+test "paste: mode 5522 is settable and reported in the lib build" {
+    if (comptime build_options.artifact != .lib) return error.SkipZigTest;
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Recognized and reset by default, so programs can detect support.
+    s.nextSlice("\x1B[?5522$p");
+    try testing.expectEqualStrings("\x1B[?5522;2$y", S.written.items);
+
+    S.reset();
+    s.nextSlice("\x1B[?5522h");
+    try testing.expect(t.modes.get(.kitty_paste_events));
+    s.nextSlice("\x1B[?5522$p");
+    try testing.expectEqualStrings("\x1B[?5522;1$y", S.written.items);
+
+    s.nextSlice("\x1B[?5522l");
+    try testing.expect(!t.modes.get(.kitty_paste_events));
+}
+
+test "full reset drops kitty clipboard grants" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = PasteCapture;
+    S.reset();
+    defer S.deinit();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    try s.handler.kitty_clipboard_grants.grant(testing.allocator, "pw", .read, false);
+    try testing.expectEqual(@as(usize, 1), s.handler.kitty_clipboard_grants.entries.items.len);
+
+    s.nextSlice("\x1Bc");
+    try testing.expectEqual(@as(usize, 0), s.handler.kitty_clipboard_grants.entries.items.len);
+
+    // A read with the old password is no longer granted, and the
+    // handler keeps working (grants can be recorded again).
+    S.reset();
+    s.nextSlice("\x1b]5522;type=read:pw=cHc=:name=YXBw;dGV4dC9wbGFpbg==\x1b\\");
+    try testing.expectEqual(@as(usize, 1), S.read_count);
+    try testing.expect(!S.last_read_granted);
+    try s.handler.kitty_clipboard_grants.grant(testing.allocator, "pw", .read, false);
 }

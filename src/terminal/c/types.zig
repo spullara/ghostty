@@ -18,6 +18,7 @@ const formatter_pkg = @import("../formatter.zig");
 const modes_pkg = @import("../modes.zig");
 const mouse_pkg = @import("../mouse.zig");
 const page = @import("../page.zig");
+const paste_pkg = @import("../paste.zig");
 const point = @import("../point.zig");
 const Selection = @import("../Selection.zig");
 const sgr = @import("../sgr.zig");
@@ -37,6 +38,7 @@ const kitty_graphics = @import("kitty_graphics.zig");
 const mouse_encode = @import("mouse_encode.zig");
 const mouse_event = @import("mouse_event.zig");
 const osc = @import("osc.zig");
+const paste = @import("paste.zig");
 const render = @import("render.zig");
 const result = @import("result.zig");
 const row = @import("row.zig");
@@ -192,6 +194,7 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyKittyGraphicsPlacementRenderInfo", kitty_graphics.PlacementRenderInfo),
     .initStruct("GhosttyMouseEncoderSize", mouse_encode.Size),
     .initStruct("GhosttyMousePosition", mouse_event.Position),
+    .initStruct("GhosttyPaste", paste.Request),
     .initTaggedStruct("GhosttyPoint", point.Point.C, "tag", "value", .generated),
     .initStruct("GhosttyPointCoordinate", point.Coordinate),
     .initUnion("GhosttyPointValue", point.Point.CValue, point.Point.C),
@@ -272,6 +275,7 @@ const type_decls = [_]TypeDecl{
         "GHOSTTY_OSC_COMMAND_",
         "TYPE_MAX_VALUE",
     ),
+    .initEnum("GhosttyPasteSource", paste_pkg.Source, "GHOSTTY_PASTE_SOURCE_"),
     .initEnum("GhosttyPointTag", point.Tag, "GHOSTTY_POINT_TAG_"),
     .initEnum("GhosttyRenderStateCursorVisualStyle", render.CursorVisualStyle, "GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_"),
     .initEnum("GhosttyRenderStateData", render.Data, "GHOSTTY_RENDER_STATE_DATA_"),

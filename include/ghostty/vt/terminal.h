@@ -724,6 +724,11 @@ struct GhosttyClipboardRead {
  * serves a request for only the targets listing (`list` with no `mimes`)
  * without prompting.
  *
+ * Installing this callback also enables Kitty paste events (mode 5522):
+ * ghostty_terminal_paste() sends the program an event instead of the text,
+ * and the program's follow-up read arrives here with `granted` set since
+ * the user already pasted. See ghostty_terminal_paste().
+ *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
  * @param read Borrowed clipboard read request

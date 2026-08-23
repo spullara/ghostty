@@ -1,7 +1,11 @@
-# Example: `ghostty-vt` Paste Utilities
+# Example: `ghostty-vt` Paste
 
-This contains a simple example of how to use the `ghostty-vt` paste
-utilities to check if paste data is safe and encode it for terminal input.
+This contains a simple example of how to paste into a `ghostty-vt`
+terminal with `ghostty_terminal_paste`: plain and bracketed (mode 2004)
+text pastes, the unsafe-paste confirmation flow, and Kitty clipboard
+protocol paste events (mode 5522) including the program's follow-up
+clipboard read. It also shows the terminal-free building blocks for
+checking paste safety and encoding paste data.
 
 This uses a `build.zig` and `Zig` to build the C program so that we
 can reuse a lot of our build logic and depend directly on our source

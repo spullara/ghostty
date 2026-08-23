@@ -57,8 +57,10 @@ pub const max_write_aliases = write.max_write_aliases;
 
 pub const Response = response.Response;
 pub const ReadSuccess = response.ReadSuccess;
+pub const PasteEvent = response.PasteEvent;
 pub const read_chunk_size = response.read_chunk_size;
 pub const max_read_mimes = response.max_read_mimes;
+pub const max_listing_mimes = response.max_listing_mimes;
 pub const targets_mime = response.targets_mime;
 
 pub const Grants = grants.Grants;
