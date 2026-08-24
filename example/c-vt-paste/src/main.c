@@ -85,23 +85,52 @@ static bool confirm_with_user(void) {
 }
 
 //! [terminal-paste]
+// What the clipboard holds. A real embedder would keep a handle to the
+// pasteboard or its items here; the data is only produced on demand.
+typedef struct {
+  const char* text;
+} clipboard_t;
+
+// Produces the data of one representation when the terminal needs it.
+// Only the text is ever read: the image is listed on a paste event
+// but never requested, so a large image costs nothing to paste.
+// Nothing written to the writer is retained, so the data can be
+// streamed from anywhere in pieces of any size.
+static bool read_clipboard(void* userdata, GhosttyString mime, GhosttyWriter writer) {
+  clipboard_t* clipboard = userdata;
+  if (mime.len == strlen("text/plain") &&
+      memcmp(mime.ptr, "text/plain", mime.len) == 0) {
+    // Stream the text in small pieces just to show that it works.
+    const uint8_t* data = (const uint8_t*)clipboard->text;
+    size_t len = strlen(clipboard->text);
+    for (size_t offset = 0; offset < len; offset += 4) {
+      size_t n = len - offset < 4 ? len - offset : 4;
+      if (!writer.write(writer.userdata, data + offset, n)) return false;
+    }
+    return true;
+  }
+  printf("  image read requested, which never happens\n");
+  return false;
+}
+
 // Paste whatever the clipboard holds. The terminal applies its own
 // state: bracketed paste framing (mode 2004) or a Kitty paste event
 // (mode 5522) instead of the text.
 static void paste_clipboard(GhosttyTerminal terminal, const char* text) {
-  GhosttyClipboardContent contents[] = {
+  clipboard_t clipboard = {.text = text};
+  GhosttyString mimes[] = {
       // The first text representation is what a text paste writes.
-      {.mime = GS("text/plain"),
-       .data = {.ptr = (const uint8_t*)text, .len = strlen(text)}},
-      // Listed on a paste event, never written, so no data is needed.
-      {.mime = GS("image/png"), .data = {.ptr = NULL, .len = 0}},
+      GS("text/plain"),
+      // Listed on a paste event, never read.
+      GS("image/png"),
   };
   GhosttyPaste paste = {
       .size = sizeof(paste),
       .location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
       .source = GHOSTTY_PASTE_SOURCE_CLIPBOARD,
-      .contents = contents,
-      .contents_len = sizeof(contents) / sizeof(contents[0]),
+      .mimes = mimes,
+      .mimes_len = sizeof(mimes) / sizeof(mimes[0]),
+      .reader = {.read = read_clipboard, .userdata = &clipboard},
       .allow_unsafe = false,
   };
 
@@ -120,7 +149,8 @@ static void paste_clipboard(GhosttyTerminal terminal, const char* text) {
   }
 
   // Whether the pty got the text or a paste event depends on the
-  // terminal's modes; either way it went through write_pty above.
+  // terminal's modes; either way it went through write_pty above, in
+  // chunks as the text was read.
   printf("  %s\n", written ? "written" : "nothing to paste");
 }
 //! [terminal-paste]
@@ -211,17 +241,15 @@ int main() {
   // Text inserted by other means (IME, drag and drop) is never an event.
   printf("IME text with mode 5522 enabled:\n");
   {
-    const char* text = "committed";
-    GhosttyClipboardContent content = {
-        .mime = GS("text/plain"),
-        .data = {.ptr = (const uint8_t*)text, .len = strlen(text)},
-    };
+    clipboard_t clipboard = {.text = "committed"};
+    GhosttyString mime = GS("text/plain");
     GhosttyPaste paste = {
         .size = sizeof(paste),
         .location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
         .source = GHOSTTY_PASTE_SOURCE_TEXT,
-        .contents = &content,
-        .contents_len = 1,
+        .mimes = &mime,
+        .mimes_len = 1,
+        .reader = {.read = read_clipboard, .userdata = &clipboard},
         .allow_unsafe = true,
     };
     bool written = false;

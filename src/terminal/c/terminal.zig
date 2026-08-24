@@ -353,7 +353,7 @@ const Effects = struct {
         };
     };
 
-    fn writePtyTrampoline(handler: *Handler, data: [:0]const u8) void {
+    fn writePtyTrampoline(handler: *Handler, data: []const u8) void {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.write_pty orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);

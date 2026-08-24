@@ -16,9 +16,10 @@
  *
  * What a paste writes to the pty depends on the terminal's state, so
  * the recommended way to paste is ghostty_terminal_paste(). The embedder
- * hands over what the clipboard holds as MIME-typed contents (just
- * `text/plain` for an ordinary paste) and where it came from, and the
- * terminal decides how its current modes apply:
+ * hands over the MIME types the clipboard holds (just `text/plain` for
+ * an ordinary paste), a GhosttyMimeReader that produces the data of
+ * any one of them, and where the paste came from, and the terminal
+ * decides how its current modes apply:
  *
  * - If Kitty clipboard protocol paste events (mode 5522,
  *   GHOSTTY_MODE_PASTE_EVENTS) are enabled, the paste was user-initiated
@@ -27,20 +28,29 @@
  *   clipboard's MIME types with a one-time password instead of the data.
  *   The program then reads what it wants through the clipboard_read
  *   callback, which arrives with `granted` set so no permission prompt
- *   is needed.
+ *   is needed. No data is read for the event.
  * - Otherwise the first text representation is written: unsafe control
  *   bytes are replaced with spaces, and it is wrapped in bracketed paste
  *   sequences if mode 2004 (GHOSTTY_MODE_BRACKETED_PASTE) is enabled, or
  *   has its newlines converted to carriage returns if not.
  *
+ * The data is pulled through GhosttyPaste::reader only when a
+ * representation is actually pasted (so a clipboard holding a large
+ * image next to some text costs nothing), and the encoded bytes
+ * stream to the write_pty callback (GHOSTTY_TERMINAL_OPT_WRITE_PTY)
+ * in chunks as they are produced, never in one piece. The callback
+ * may be invoked several times for a single paste; the pieces must be
+ * written to the pty in order.
+ *
  * Text that could inject commands (a newline when unbracketed, or the
  * bracketed paste terminator when bracketed) is refused with
- * GHOSTTY_REJECTED unless GhosttyPaste::allow_unsafe is set. The usual
- * flow is to call once, confirm with the user on GHOSTTY_REJECTED, and
- * call again with `allow_unsafe` set.
- *
- * Output is delivered through the write_pty callback
- * (GHOSTTY_TERMINAL_OPT_WRITE_PTY) in a single call.
+ * GHOSTTY_REJECTED and nothing written unless GhosttyPaste::allow_unsafe
+ * is set. The usual flow is to call once, confirm with the user on
+ * GHOSTTY_REJECTED, and call again with `allow_unsafe` set. Each call
+ * reads the text at most once and buffers it whole while the rule is
+ * applied, so the source needs no stability across reads (the
+ * confirmed retry simply pastes whatever the source holds then) and a
+ * refused or failed paste writes nothing at all.
  *
  * @snippet c-vt-paste/src/main.c terminal-paste
  *
@@ -66,6 +76,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <ghostty/vt/types.h>
+#include <ghostty/vt/io.h>
 #include <ghostty/vt/terminal.h>
 
 #ifdef __cplusplus
@@ -73,7 +84,7 @@ extern "C" {
 #endif
 
 /**
- * Why a paste happened. 
+ * Why a paste happened.
  */
 typedef enum GHOSTTY_ENUM_TYPED {
   /** The user pasted from a clipboard: keybind, menu, middle click. */
@@ -93,8 +104,9 @@ typedef enum GHOSTTY_ENUM_TYPED {
  * A paste of clipboard contents into the terminal.
  *
  * This is a sized struct; set `size` to `sizeof(GhosttyPaste)`. The
- * contents array and the strings it points to are borrowed only for the
- * duration of the ghostty_terminal_paste() call.
+ * MIME type array and the strings it points to are borrowed only for
+ * the duration of the ghostty_terminal_paste() call, as is everything
+ * the reader produces.
  */
 typedef struct {
   /** Size of this struct in bytes. */
@@ -112,16 +124,30 @@ typedef struct {
   GhosttyPasteSource source;
 
   /**
-   * Borrowed array of the representations available, in preferred
-   * order. A text paste writes the first entry with a text MIME type
-   * such as "text/plain" and ignores the rest. A paste event lists every
-   * entry's MIME type and never reads data, so non-text entries may have
-   * empty data. May be NULL when contents_len is zero.
+   * Borrowed array of the MIME types of the representations available,
+   * in preferred order. A text paste reads and writes the first entry
+   * with a text MIME type such as "text/plain" and ignores the rest. A
+   * paste event lists every entry and reads none. May be NULL when
+   * mimes_len is zero, which is nothing to paste.
    */
-  const GhosttyClipboardContent* contents;
+  const GhosttyString* mimes;
 
-  /** Number of entries in contents. */
-  size_t contents_len;
+  /** Number of entries in mimes. */
+  size_t mimes_len;
+
+  /**
+   * Produces the data of a representation on demand. Required when
+   * mimes_len is nonzero.
+   *
+   * Called at most once per ghostty_terminal_paste() call: for the
+   * text representation being pasted, never for anything else and
+   * never for a paste event. The MIME type requested is always an
+   * entry of `mimes`, passed through exactly as given there (the same
+   * pointer and length), so the callback may identify the
+   * representation by pointer or by content. A false return fails the
+   * paste with GHOSTTY_IO_ERROR.
+   */
+  GhosttyMimeReader reader;
 
   /**
    * Write text that could inject commands. Call with false, confirm
@@ -135,8 +161,12 @@ typedef struct {
  * clipboard protocol paste event if mode 5522 is enabled and a
  * clipboard_read callback is installed, otherwise the text framed per
  * mode 2004. See the group documentation for the full behavior. Output
- * goes through the write_pty callback in a single call. The viewport is
- * not scrolled; that is up to the embedder, as for key input.
+ * streams through the write_pty callback in chunks. The viewport is not
+ * scrolled; that is up to the embedder, as for key input.
+ *
+ * A paste event records a session grant for its one-time password only
+ * once the event is written; a failed call never leaves a grant for an
+ * event that was never sent.
  *
  * @param terminal The terminal handle
  * @param paste The paste request, borrowed for the duration of the call
@@ -147,12 +177,12 @@ typedef struct {
  * @return GHOSTTY_SUCCESS on success (see @p out_written);
  *         GHOSTTY_REJECTED if the text could inject commands and
  *         GhosttyPaste::allow_unsafe is false (nothing was written);
- *         GHOSTTY_INVALID_VALUE for a NULL terminal or paste, or when no
- *         write_pty callback is installed; GHOSTTY_OUT_OF_MEMORY;
- *         GHOSTTY_IO_ERROR if there is no secure entropy source to mint
- *         a paste event password (wasm32-freestanding without
- *         GHOSTTY_SYS_OPT_RANDOM_SECURE set), in which case nothing was
- *         written and no grant was recorded.
+ *         GHOSTTY_INVALID_VALUE for a NULL terminal or paste, MIME
+ *         types without a reader, or when no write_pty callback is
+ *         installed; GHOSTTY_OUT_OF_MEMORY; GHOSTTY_IO_ERROR if the
+ *         reader failed or there is no secure entropy source to mint a
+ *         paste event password (wasm32-freestanding without
+ *         GHOSTTY_SYS_OPT_RANDOM_SECURE set). Errors write nothing.
  */
 GHOSTTY_API GhosttyResult ghostty_terminal_paste(
     GhosttyTerminal terminal,
