@@ -47,7 +47,7 @@ class ClipboardConfirmationController: NSWindowController {
         switch confirmation.kind {
         case .paste:
             window.title = "Warning: Potentially Unsafe Paste"
-        case .osc_52_read, .osc_52_write, .kitty_read:
+        case .osc_52_read, .osc_52_write, .kitty_read, .kitty_write:
             window.title = "Authorize Clipboard Access"
         }
 

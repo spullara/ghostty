@@ -18,6 +18,10 @@ extension Ghostty {
         /// the Kitty clipboard protocol (OSC 5522).
         case kitty_read
 
+        /// An application is attempting to write to the clipboard using
+        /// the Kitty clipboard protocol (OSC 5522).
+        case kitty_write
+
         /// The text to show in the clipboard confirmation prompt for this
         /// request. The name is the requesting program's human friendly
         /// name, when the protocol carries one.
@@ -33,7 +37,7 @@ extension Ghostty {
                 \(program) is attempting to read from the clipboard.
                 The current clipboard contents are shown below.
                 """
-            case .osc_52_write:
+            case .osc_52_write, .kitty_write:
                 return """
                 \(program) is attempting to write to the clipboard.
                 The content to write is shown below.
@@ -51,6 +55,8 @@ extension Ghostty {
                 return .osc_52_write
             case GHOSTTY_CLIPBOARD_REQUEST_KITTY_READ:
                 return .kitty_read
+            case GHOSTTY_CLIPBOARD_REQUEST_KITTY_WRITE:
+                return .kitty_write
             default:
                 return nil
             }

@@ -77,6 +77,11 @@ pub const Message = union(enum) {
     /// it.
     kitty_clipboard_read: *apprt.ClipboardRequest.KittyRead,
 
+    /// A committed Kitty clipboard protocol (OSC 5522) write
+    /// transaction. The receiver takes ownership of the request state
+    /// and must eventually destroy it.
+    kitty_clipboard_write: *apprt.ClipboardRequest.KittyWrite,
+
     /// Write the clipboard contents.
     clipboard_write: struct {
         clipboard_type: apprt.Clipboard,

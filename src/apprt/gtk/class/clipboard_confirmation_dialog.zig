@@ -193,7 +193,7 @@ pub const ClipboardConfirmationDialog = extern struct {
         const priv = self.private();
         const req = priv.request orelse return;
         switch (req.*) {
-            .osc_52_write => {
+            .osc_52_write, .kitty_write => {
                 self.as(Dialog.Parent).setHeading(i18n._("Authorize Clipboard Access"));
                 self.as(Dialog.Parent).setBody(i18n._("An application is attempting to write to the clipboard. The current clipboard contents are shown below."));
             },

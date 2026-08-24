@@ -70,6 +70,7 @@ pub const ClipboardRequestType = enum(u8) {
     osc_52_read,
     osc_52_write,
     kitty_read,
+    kitty_write,
     list,
 };
 
@@ -107,6 +108,10 @@ pub const ClipboardRequest = union(ClipboardRequestType) {
     /// A request to read clipboard contents via the Kitty clipboard
     /// protocol (OSC 5522).
     kitty_read: *KittyRead,
+
+    /// A request to write clipboard contents via the Kitty clipboard
+    /// protocol (OSC 5522), carrying a fully committed transaction.
+    kitty_write: *KittyWrite,
 
     /// A request to list the available clipboard MIME types without
     /// reading any of their data.
@@ -154,6 +159,52 @@ pub const ClipboardRequest = union(ClipboardRequestType) {
         terminator: terminal.osc.Terminator,
 
         pub fn destroy(self: *KittyRead) void {
+            // The struct itself lives in the arena, so move the arena
+            // out before tearing it down.
+            var arena = self.arena;
+            arena.deinit();
+        }
+    };
+
+    /// State for one committed Kitty clipboard protocol write
+    /// transaction. Like KittyRead, this is created on the IO thread
+    /// and completed on the app thread, so everything, including the
+    /// struct itself, is allocated from the arena.
+    pub const KittyWrite = struct {
+        arena: std.heap.ArenaAllocator,
+
+        /// The clipboard being written. The protocol can only name the
+        /// standard clipboard or the primary selection.
+        location: Clipboard,
+
+        /// The committed representations. These are the authoritative
+        /// contents of the write: completions apply these rather than
+        /// any contents echoed back by the apprt. The values are
+        /// sentinel-terminated so they can cross a C apprt boundary
+        /// without copies; data is binary-safe via its length.
+        contents: []const ClipboardContent,
+
+        /// The sanitized request id, echoed in every response packet.
+        id: []const u8,
+
+        /// The effective session password, empty when the request had
+        /// none. A non-empty password means the user's decision may be
+        /// remembered as a session grant.
+        pw: []const u8,
+
+        /// The human friendly name of the requesting program, shown in
+        /// permission prompts. Empty when absent. Sentinel-terminated
+        /// so it can cross a C apprt boundary without copies.
+        name: [:0]const u8,
+
+        /// True when a stored session grant already covers this
+        /// request, so any permission prompt is skipped.
+        granted: bool,
+
+        /// The response terminator, matching the request's.
+        terminator: terminal.osc.Terminator,
+
+        pub fn destroy(self: *KittyWrite) void {
             // The struct itself lives in the arena, so move the arena
             // out before tearing it down.
             var arena = self.arena;

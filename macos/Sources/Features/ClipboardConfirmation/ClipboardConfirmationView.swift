@@ -15,11 +15,13 @@ struct ClipboardConfirmationView: View {
             switch (action, reason) {
             case (.cancel, .paste):
                 return "Cancel"
-            case (.cancel, .osc_52_read), (.cancel, .osc_52_write), (.cancel, .kitty_read):
+            case (.cancel, .osc_52_read), (.cancel, .osc_52_write),
+                 (.cancel, .kitty_read), (.cancel, .kitty_write):
                 return "Deny"
             case (.confirm, .paste):
                 return "Paste"
-            case (.confirm, .osc_52_read), (.confirm, .osc_52_write), (.confirm, .kitty_read):
+            case (.confirm, .osc_52_read), (.confirm, .osc_52_write),
+                 (.confirm, .kitty_read), (.confirm, .kitty_write):
                 return "Allow"
             }
         }

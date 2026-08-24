@@ -72,6 +72,10 @@ pub const StreamHandler = struct {
     /// Requests carrying a granted password skip the permission prompt.
     kitty_clipboard_grants: terminal.kitty.clipboard.Grants = .{},
 
+    /// The in-flight Kitty clipboard protocol (OSC 5522) write
+    /// transaction, if any.
+    kitty_clipboard_write: ?*terminal.kitty.clipboard.WriteState = null,
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -89,6 +93,7 @@ pub const StreamHandler = struct {
     pub fn deinit(self: *StreamHandler) void {
         self.apc.deinit();
         self.dcs.deinit();
+        self.kittyClipboardWriteAbort();
         self.kitty_clipboard_grants.deinit(self.alloc);
         if (comptime tmux_enabled) tmux: {
             const viewer = self.tmux_viewer orelse break :tmux;
@@ -887,8 +892,12 @@ pub const StreamHandler = struct {
 
     /// Record a Kitty clipboard protocol session grant so future
     /// requests with this password skip the permission prompt.
-    pub fn kittyClipboardGrant(self: *StreamHandler, pw: []const u8) !void {
-        try self.kitty_clipboard_grants.grant(self.alloc, pw, .read, false);
+    pub fn kittyClipboardGrant(
+        self: *StreamHandler,
+        pw: []const u8,
+        dir: terminal.kitty.clipboard.Grants.Direction,
+    ) error{OutOfMemory}!void {
+        try self.kitty_clipboard_grants.grant(self.alloc, pw, dir, false);
     }
 
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
@@ -1009,7 +1018,7 @@ pub const StreamHandler = struct {
     fn kittyClipboard(
         self: *StreamHandler,
         v: terminal.osc.Command.KittyClipboardProtocol,
-    ) !void {
+    ) error{ OutOfMemory, WriteFailed }!void {
         const kitty_clipboard = terminal.kitty.clipboard;
 
         // Decode and validate the metadata. Malformed metadata drops
@@ -1028,28 +1037,22 @@ pub const StreamHandler = struct {
                 v.terminator,
             ),
 
-            // Writes aren't implemented in the GUI yet. Failing the
-            // transaction up front matches a libghostty-vt handler
-            // without a clipboard_write effect and spares the program
-            // from waiting on a commit response that never comes.
-            .write => {
-                var stream: std.Io.Writer.Allocating = .init(self.alloc);
-                defer stream.deinit();
-                try (kitty_clipboard.Response{
-                    .op = .write,
-                    .status = .ENOSYS,
-                    .id = meta.id,
-                    .terminator = v.terminator,
-                }).encode(&stream.writer);
-                self.messageWriter(.{ .write_alloc = .{
-                    .alloc = self.alloc,
-                    .data = try stream.toOwnedSlice(),
-                } });
-            },
+            .write => try self.kittyClipboardWriteBegin(
+                &meta,
+                v.terminator,
+            ),
 
-            // Data packets without an accepted write transaction are
-            // silently ignored, matching kitty.
-            .wdata, .walias => {},
+            .wdata => try self.kittyClipboardWriteData(
+                &meta,
+                v.payload orelse "",
+                v.terminator,
+            ),
+
+            .walias => try self.kittyClipboardWriteAlias(
+                &meta,
+                v.payload orelse "",
+                v.terminator,
+            ),
         }
     }
 
@@ -1132,6 +1135,225 @@ pub const StreamHandler = struct {
         };
 
         self.surfaceMessageWriter(.{ .kitty_clipboard_read = req });
+    }
+
+    /// Begin a Kitty clipboard write transaction (type=write).
+    fn kittyClipboardWriteBegin(
+        self: *StreamHandler,
+        meta: *const terminal.kitty.clipboard.Metadata,
+        terminator: terminal.osc.Terminator,
+    ) error{ OutOfMemory, WriteFailed }!void {
+        // A new write silently replaces any in-flight transaction.
+        self.kittyClipboardWriteAbort();
+
+        // A write denied by policy can never succeed, so fail the
+        // transaction up front instead of spooling data we'd only
+        // throw away. Later wdata packets are ignored.
+        if (self.clipboard_write == .deny) {
+            log.info("application attempted to write clipboard, but 'clipboard-write' is set to deny", .{});
+            try self.kittyClipboardWriteStatus(
+                .EPERM,
+                meta.id,
+                terminator,
+            );
+            return;
+        }
+
+        const state = try self.alloc.create(terminal.kitty.clipboard.WriteState);
+        errdefer self.alloc.destroy(state);
+        state.* = try .init(self.alloc, meta);
+        self.kitty_clipboard_write = state;
+    }
+
+    /// Accumulate one wdata chunk, or commit the transaction when the
+    /// chunk carries no MIME type.
+    fn kittyClipboardWriteData(
+        self: *StreamHandler,
+        meta: *const terminal.kitty.clipboard.Metadata,
+        payload: []const u8,
+        terminator: terminal.osc.Terminator,
+    ) error{ OutOfMemory, WriteFailed }!void {
+        // Data without a transaction is silently ignored, matching
+        // kitty.
+        const state = self.kitty_clipboard_write orelse return;
+
+        // A wdata packet without a MIME type commits the transaction.
+        if (meta.mime.len == 0) return self.kittyClipboardWriteCommit(
+            state,
+            terminator,
+        );
+
+        state.data(
+            self.alloc,
+            meta,
+            payload,
+        ) catch |err| switch (err) {
+            // Failing to spool matches kitty's EIO for a failed buffer write.
+            error.OutOfMemory => {
+                try self.kittyClipboardWriteFinish(
+                    state,
+                    .EIO,
+                    terminator,
+                );
+                return error.OutOfMemory;
+            },
+        };
+    }
+
+    /// Register aliases from a walias packet.
+    fn kittyClipboardWriteAlias(
+        self: *StreamHandler,
+        meta: *const terminal.kitty.clipboard.Metadata,
+        payload: []const u8,
+        terminator: terminal.osc.Terminator,
+    ) error{ OutOfMemory, WriteFailed }!void {
+        // Aliases without a transaction or without a target MIME type
+        // are silently ignored, matching kitty.
+        const state = self.kitty_clipboard_write orelse return;
+        if (meta.mime.len == 0) return;
+
+        state.alias(
+            self.alloc,
+            meta,
+            payload,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try self.kittyClipboardWriteFinish(
+                    state,
+                    .EIO,
+                    terminator,
+                );
+                return error.OutOfMemory;
+            },
+
+            // An undecodable alias payload aborts the transaction.
+            error.Invalid => try self.kittyClipboardWriteFinish(
+                state,
+                .EINVAL,
+                terminator,
+            ),
+        };
+    }
+
+    /// Commit the transaction: resolve the final contents and forward
+    /// them to the surface thread, which owns policy, any permission
+    /// prompt, the clipboard write itself, and the final reply.
+    fn kittyClipboardWriteCommit(
+        self: *StreamHandler,
+        state: *terminal.kitty.clipboard.WriteState,
+        terminator: terminal.osc.Terminator,
+    ) error{ OutOfMemory, WriteFailed }!void {
+        self.kittyClipboardWriteSend(
+            state,
+            terminator,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try self.kittyClipboardWriteFinish(
+                    state,
+                    .EIO,
+                    terminator,
+                );
+                return error.OutOfMemory;
+            },
+        };
+
+        // The transaction is complete; the surface owns the reply.
+        self.kittyClipboardWriteAbort();
+    }
+
+    fn kittyClipboardWriteSend(
+        self: *StreamHandler,
+        state: *terminal.kitty.clipboard.WriteState,
+        terminator: terminal.osc.Terminator,
+    ) error{OutOfMemory}!void {
+        const committed = try state.commit(self.alloc);
+        defer committed.deinit(self.alloc);
+
+        // Per the spec a password without a name is no password. A
+        // stored session grant for it lets the surface skip its
+        // permission prompt.
+        const pw: []const u8 = if (committed.name.len > 0) committed.pw else "";
+        const granted = self.kitty_clipboard_grants.use(self.alloc, pw, .write);
+
+        // Everything about the request, including the request struct
+        // itself, lives in a single arena that crosses to the surface
+        // thread, which owns it from the moment the message is sent.
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        const req = try alloc.create(apprt.ClipboardRequest.KittyWrite);
+        const contents = try alloc.alloc(
+            apprt.ClipboardContent,
+            committed.contents.len,
+        );
+        for (committed.contents, contents) |src, *dst| dst.* = .{
+            .mime = try alloc.dupeZ(u8, src.mime),
+            .data = try alloc.dupeZ(u8, src.data),
+        };
+        const id = try alloc.dupe(u8, committed.id);
+        const pw_owned = try alloc.dupe(u8, pw);
+        const name_owned = try alloc.dupeZ(u8, committed.name);
+        req.* = .{
+            // The arena must be copied in last so it tracks every
+            // allocation above.
+            .arena = arena,
+            .location = switch (committed.loc) {
+                .primary => .primary,
+                else => .standard,
+            },
+            .contents = contents,
+            .id = id,
+            .pw = pw_owned,
+            .name = name_owned,
+            .granted = granted,
+            .terminator = terminator,
+        };
+
+        self.surfaceMessageWriter(.{ .kitty_clipboard_write = req });
+    }
+
+    /// Answer the write transaction with its final status and drop it.
+    /// The id echoed is the one from the transaction's opening write
+    /// packet, matching kitty.
+    fn kittyClipboardWriteFinish(
+        self: *StreamHandler,
+        state: *const terminal.kitty.clipboard.WriteState,
+        status: terminal.kitty.clipboard.Status,
+        terminator: terminal.osc.Terminator,
+    ) error{ OutOfMemory, WriteFailed }!void {
+        defer self.kittyClipboardWriteAbort();
+        try self.kittyClipboardWriteStatus(status, state.id, terminator);
+    }
+
+    /// Reply to a write transaction with a single status packet.
+    fn kittyClipboardWriteStatus(
+        self: *StreamHandler,
+        status: terminal.kitty.clipboard.Status,
+        id: []const u8,
+        terminator: terminal.osc.Terminator,
+    ) error{ OutOfMemory, WriteFailed }!void {
+        var stream: std.Io.Writer.Allocating = .init(self.alloc);
+        defer stream.deinit();
+        try (terminal.kitty.clipboard.Response{
+            .op = .write,
+            .status = status,
+            .id = id,
+            .terminator = terminator,
+        }).encode(&stream.writer);
+        self.messageWriter(.{ .write_alloc = .{
+            .alloc = self.alloc,
+            .data = try stream.toOwnedSlice(),
+        } });
+    }
+
+    /// Drop any in-flight write transaction without responding.
+    fn kittyClipboardWriteAbort(self: *StreamHandler) void {
+        if (self.kitty_clipboard_write) |state| {
+            state.deinit(self.alloc);
+            self.alloc.destroy(state);
+            self.kitty_clipboard_write = null;
+        }
     }
 
     fn semanticPrompt(

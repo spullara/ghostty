@@ -711,6 +711,20 @@ pub const Surface = struct {
         clipboard_type: apprt.Clipboard,
         state: apprt.ClipboardRequest,
     ) !apprt.ClipboardReadResult {
+        // Kitty clipboard writes carry their own contents and read
+        // nothing from the clipboard, so they skip the read callback
+        // entirely: the request is completed immediately, and a
+        // completion that requires confirmation diverts into the
+        // apprt confirmation flow just like a read.
+        if (state == .kitty_write) {
+            const alloc = self.app.core_app.alloc;
+            const state_ptr = try alloc.create(apprt.ClipboardRequest);
+            errdefer alloc.destroy(state_ptr);
+            state_ptr.* = state;
+            self.completeKittyClipboardWrite(state_ptr);
+            return .started;
+        }
+
         // The representations the read wants served. Text-only
         // requesters ask for the canonical text type; Kitty clipboard
         // reads ask for exactly what the program requested, with
@@ -734,6 +748,9 @@ pub const Surface = struct {
                 }
                 break :mimes mimes_buf[0..kitty.mimes.len];
             },
+
+            // Handled above.
+            .kitty_write => unreachable,
 
             // No clipboard write code paths travel through this function
             .osc_52_write => unreachable,
@@ -767,6 +784,68 @@ pub const Surface = struct {
         // Only a started request completes later and keeps the state.
         if (result != .started) alloc.destroy(state_ptr);
         return result;
+    }
+
+    /// Complete a Kitty clipboard protocol write request. The apprt
+    /// contributes nothing to the completion (the authoritative
+    /// contents live in the request itself), but a completion that
+    /// requires confirmation diverts into the confirm callback, which
+    /// keeps the state alive for the asynchronous prompt.
+    fn completeKittyClipboardWrite(
+        self: *Surface,
+        state: *apprt.ClipboardRequest,
+    ) void {
+        const alloc = self.app.core_app.alloc;
+        const kitty = state.kitty_write;
+
+        self.core_surface.completeClipboardRequest(
+            state.*,
+            .{},
+        ) catch |err| switch (err) {
+            error.UnauthorizedPaste => {
+                // Convert the would-be contents so the permission
+                // prompt can display exactly what would be written.
+                var stack = std.heap.stackFallback(1024, alloc);
+                const conv_alloc = stack.get();
+                const contents = conv_alloc.alloc(
+                    CAPI.ClipboardContent,
+                    kitty.contents.len,
+                ) catch |alloc_err| {
+                    log.err("error confirming clipboard request err={}", .{alloc_err});
+                    self.core_surface.denyClipboardRequest(state.*);
+                    alloc.destroy(state);
+                    return;
+                };
+                defer conv_alloc.free(contents);
+                for (kitty.contents, contents) |src, *dst| dst.* = .{
+                    .mime = src.mime,
+                    .data = src.data.ptr,
+                    .len = src.data.len,
+                };
+
+                self.app.opts.confirm_read_clipboard(
+                    self.userdata,
+                    &.{
+                        .contents = contents.ptr,
+                        .contents_len = contents.len,
+                        .available = null,
+                        .available_len = 0,
+                        .name = if (kitty.name.len > 0) kitty.name.ptr else null,
+                        .can_remember = kitty.pw.len > 0,
+                    },
+                    state,
+                    state.*,
+                );
+
+                return;
+            },
+
+            else => log.err("error completing clipboard request err={}", .{err}),
+        };
+
+        // We don't defer this because the clipboard confirmation route
+        // preserves the clipboard request.
+        alloc.destroy(state);
     }
 
     fn completeClipboardRequest(
@@ -826,7 +905,7 @@ pub const Surface = struct {
                 // Session grant information for the permission prompt,
                 // carried only by Kitty clipboard protocol requests.
                 const name: ?[*:0]const u8, const can_remember: bool = switch (state.*) {
-                    .kitty_read => |kitty| .{
+                    inline .kitty_read, .kitty_write => |kitty| .{
                         if (kitty.name.len > 0) kitty.name.ptr else null,
                         kitty.pw.len > 0,
                     },
