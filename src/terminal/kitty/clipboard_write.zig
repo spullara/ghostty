@@ -14,9 +14,10 @@ const max_mime_len = clipboard_command.max_mime_len;
 
 const log = std.log.scoped(.kitty_clipboard);
 
-/// Maximum total decoded bytes accumulated by one write transaction.
-/// We hardcode this for now but probably will make this configurable
-/// later.
+/// Default maximum total decoded bytes accumulated by one write
+/// transaction. Embedders can override this per-transaction via
+/// WriteState.Options (Ghostty exposes it as the
+/// `clipboard-write-limit-bytes` configuration).
 pub const max_write_size = 32 * 1024 * 1024;
 
 /// Maximum MIME types and aliases per write transaction.
@@ -41,12 +42,23 @@ pub const WriteState = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     aliases: std.ArrayListUnmanaged(Alias) = .empty,
 
+    /// Maximum total decoded bytes this transaction will accumulate.
+    /// Captured at init so a change to the configured limit doesn't
+    /// apply to a transaction already in flight.
+    max_size: usize,
+
     /// Index into entries currently receiving data.
     current: ?usize = null,
 
-    /// Set when max_write_size was exceeded; excess data is dropped
-    /// but the write still completes.
+    /// Set when max_size was exceeded on text data; excess data is
+    /// dropped but the write still completes. Exceeding the limit
+    /// with non-text data fails the transaction instead (see data).
     truncated: bool = false,
+
+    pub const Options = struct {
+        /// Maximum total decoded bytes accumulated by the transaction.
+        max_size: usize = max_write_size,
+    };
 
     const Entry = struct {
         /// Owned by the transaction arena.
@@ -62,7 +74,11 @@ pub const WriteState = struct {
     };
 
     /// Begin a transaction from a type=write packet.
-    pub fn init(alloc: Allocator, meta: *const Metadata) Allocator.Error!WriteState {
+    pub fn init(
+        alloc: Allocator,
+        meta: *const Metadata,
+        opts: Options,
+    ) Allocator.Error!WriteState {
         assert(meta.op == .write);
         var arena: std.heap.ArenaAllocator = .init(alloc);
         errdefer arena.deinit();
@@ -75,6 +91,7 @@ pub const WriteState = struct {
             .id = id,
             .pw = pw,
             .name = name,
+            .max_size = opts.max_size,
         };
     }
 
@@ -87,12 +104,17 @@ pub const WriteState = struct {
 
     /// Accumulate one wdata chunk carrying data for meta.mime (which
     /// must be non-empty; an empty mime is a commit, not data).
+    ///
+    /// Returns error.TooLarge when non-text data exceeds max_size:
+    /// unlike text, a truncated binary payload is corrupt, and the
+    /// protocol has no partial-success status, so the caller must
+    /// fail the whole transaction (EFBIG) and abort it.
     pub fn data(
         self: *WriteState,
         alloc: Allocator,
         meta: *const Metadata,
         payload: []const u8,
-    ) error{OutOfMemory}!void {
+    ) error{ OutOfMemory, TooLarge }!void {
         assert(meta.op == .wdata);
         assert(meta.mime.len > 0);
         // Switch the receiving entry if this chunk is for a different
@@ -151,12 +173,59 @@ pub const WriteState = struct {
         };
         defer decoded.deinit(alloc);
 
-        const remaining = max_write_size -| self.spool.items.len;
-        const n = @min(decoded.data.len, remaining);
-        try self.spool.appendSlice(alloc, decoded.data[0..n]);
-        if (n < decoded.data.len) {
+        // Empty slice, do nothing.
+        if (decoded.data.len == 0) return;
+
+        // Make sure it fits in our max size. If it does, easy append.
+        const remaining = self.max_size -| self.spool.items.len;
+        if (decoded.data.len <= remaining and !self.truncated) {
+            try self.spool.appendSlice(alloc, decoded.data);
+            return;
+        }
+
+        // Bytes must be dropped. Only text (text/* plus the legacy X11
+        // text names) remains usable after an arbitrary cut; non-text
+        // data would be corrupted, so the whole transaction fails.
+        truncatable: {
+            if (std.mem.startsWith(u8, meta.mime, "text/")) break :truncatable;
+            if (clipboard.isTextMime(meta.mime)) break :truncatable;
+            return error.TooLarge;
+        }
+
+        // Text is truncated at a UTF-8 boundary. Once truncated, all
+        // further data is dropped entirely: the spool may sit below
+        // max_size after the boundary trim, and appending later chunks
+        // there would splice disjoint parts of the stream together.
+        if (!self.truncated) {
+            try self.spool.appendSlice(alloc, decoded.data[0..remaining]);
+            self.trimPartialSequence();
             self.truncated = true;
-            logTruncatedOnce();
+            logTruncatedOnce(self.max_size);
+        }
+    }
+
+    /// Trim a split multi-byte UTF-8 sequence off the spool tail so
+    /// truncated text never ends in a partial codepoint.
+    fn trimPartialSequence(self: *WriteState) void {
+        const idx = self.current orelse return;
+        const start = self.entries.items[idx].start;
+        const items = self.spool.items;
+
+        // Skip trailing continuation bytes (0b10xxxxxx) to find the
+        // sequence's first byte; valid UTF-8 has at most 3.
+        var i = items.len;
+        while (i > start and
+            items.len - i < 3 and
+            (items[i - 1] & 0xC0) == 0x80) i -= 1;
+        if (i == start) return;
+        const lead = items[i - 1];
+        if ((lead & 0xC0) == 0x80) return;
+
+        const seq_len = std.unicode.utf8ByteSequenceLength(lead) catch return;
+        // Equal means the tail is a complete sequence; greater means
+        // invalid input (e.g. a continuation after ASCII).
+        if (items.len - (i - 1) < seq_len) {
+            self.spool.shrinkRetainingCapacity(i - 1);
         }
     }
 
@@ -296,7 +365,7 @@ pub const WriteState = struct {
         };
     }
 
-    fn logTruncatedOnce() void {
+    fn logTruncatedOnce(limit: usize) void {
         // Log spam protection: this can be hit for every chunk of an
         // oversized write.
         const S = struct {
@@ -306,7 +375,7 @@ pub const WriteState = struct {
             S.logged = true;
             log.warn(
                 "clipboard write exceeds {} bytes, truncating",
-                .{max_write_size},
+                .{limit},
             );
         }
     }
@@ -317,7 +386,7 @@ test "write: basic transaction" {
     const alloc = testing.allocator;
 
     const begin_meta: Metadata = .{ .op = .write, .id = "42" };
-    var state: WriteState = try .init(alloc, &begin_meta);
+    var state: WriteState = try .init(alloc, &begin_meta, .{});
     defer state.deinit(alloc);
 
     try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "R2hvc3R0eQ=="); // "Ghostty"
@@ -336,7 +405,7 @@ test "write: chunked data accumulates" {
     const alloc = testing.allocator;
 
     const begin_meta: Metadata = .{ .op = .write };
-    var state: WriteState = try .init(alloc, &begin_meta);
+    var state: WriteState = try .init(alloc, &begin_meta, .{});
     defer state.deinit(alloc);
 
     try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "SGVsbG8="); // "Hello"
@@ -352,7 +421,7 @@ test "write: multiple mimes in order" {
     const alloc = testing.allocator;
 
     const begin_meta: Metadata = .{ .op = .write };
-    var state: WriteState = try .init(alloc, &begin_meta);
+    var state: WriteState = try .init(alloc, &begin_meta, .{});
     defer state.deinit(alloc);
 
     try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "YQ=="); // "a"
@@ -372,7 +441,7 @@ test "write: reused mime overwrites" {
     const alloc = testing.allocator;
 
     const begin_meta: Metadata = .{ .op = .write };
-    var state: WriteState = try .init(alloc, &begin_meta);
+    var state: WriteState = try .init(alloc, &begin_meta, .{});
     defer state.deinit(alloc);
 
     try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "YQ=="); // "a"
@@ -392,7 +461,7 @@ test "write: invalid base64 chunk is dropped, transaction continues" {
     const alloc = testing.allocator;
 
     const begin_meta: Metadata = .{ .op = .write };
-    var state: WriteState = try .init(alloc, &begin_meta);
+    var state: WriteState = try .init(alloc, &begin_meta, .{});
     defer state.deinit(alloc);
 
     try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "SGVsbG8="); // "Hello"
@@ -409,7 +478,7 @@ test "write: aliases resolve at commit" {
     const alloc = testing.allocator;
 
     const begin_meta: Metadata = .{ .op = .write };
-    var state: WriteState = try .init(alloc, &begin_meta);
+    var state: WriteState = try .init(alloc, &begin_meta, .{});
     defer state.deinit(alloc);
 
     try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "R2hvc3R0eQ=="); // "Ghostty"
@@ -427,12 +496,130 @@ test "write: aliases resolve at commit" {
     try testing.expectEqualStrings("Ghostty", committed.contents[2].data);
 }
 
+test "write: default limit when unset" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const begin_meta: Metadata = .{ .op = .write };
+    var state: WriteState = try .init(alloc, &begin_meta, .{});
+    defer state.deinit(alloc);
+    try testing.expectEqual(@as(usize, max_write_size), state.max_size);
+}
+
+test "write: custom limit truncates but commit succeeds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const begin_meta: Metadata = .{ .op = .write };
+    var state: WriteState = try .init(alloc, &begin_meta, .{ .max_size = 8 });
+    defer state.deinit(alloc);
+
+    // First chunk crosses the limit mid-chunk, second is entirely
+    // beyond it and fully dropped.
+    try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "SGVsbG9Xb3JsZA=="); // "HelloWorld"
+    try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "IQ=="); // "!"
+
+    const committed = try state.commit(alloc);
+    defer committed.deinit(alloc);
+    try testing.expect(committed.truncated);
+    try testing.expectEqual(@as(usize, 1), committed.contents.len);
+    try testing.expectEqualStrings("HelloWor", committed.contents[0].data);
+}
+
+test "write: truncation cuts at utf8 boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const begin_meta: Metadata = .{ .op = .write };
+    var state: WriteState = try .init(alloc, &begin_meta, .{ .max_size = 5 });
+    defer state.deinit(alloc);
+
+    // "abcdé": the raw cut at 5 bytes would split é (0xC3 0xA9).
+    try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "YWJjZMOp");
+
+    const committed = try state.commit(alloc);
+    defer committed.deinit(alloc);
+    try testing.expect(committed.truncated);
+    try testing.expectEqualStrings("abcd", committed.contents[0].data);
+}
+
+test "write: truncation cuts utf8 sequence split across chunks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const begin_meta: Metadata = .{ .op = .write };
+    var state: WriteState = try .init(alloc, &begin_meta, .{ .max_size = 5 });
+    defer state.deinit(alloc);
+
+    // "abcd" + 0xC3 exactly fills the limit with a dangling lead
+    // byte...
+    try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "YWJjZMM=");
+    // ...whose continuation (0xA9) arrives in the next chunk.
+    try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "qSE=");
+
+    const committed = try state.commit(alloc);
+    defer committed.deinit(alloc);
+    try testing.expect(committed.truncated);
+    try testing.expectEqualStrings("abcd", committed.contents[0].data);
+}
+
+test "write: non-text under limit is unaffected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const begin_meta: Metadata = .{ .op = .write };
+    var state: WriteState = try .init(alloc, &begin_meta, .{ .max_size = 8 });
+    defer state.deinit(alloc);
+
+    try state.data(alloc, &.{ .op = .wdata, .mime = "image/png" }, "iVBORw=="); // "\x89PNG"
+
+    const committed = try state.commit(alloc);
+    defer committed.deinit(alloc);
+    try testing.expect(!committed.truncated);
+    try testing.expectEqualStrings("\x89PNG", committed.contents[0].data);
+}
+
+test "write: non-text over limit rejects transaction" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const begin_meta: Metadata = .{ .op = .write };
+    var state: WriteState = try .init(alloc, &begin_meta, .{ .max_size = 8 });
+    defer state.deinit(alloc);
+
+    try testing.expectError(error.TooLarge, state.data(
+        alloc,
+        &.{ .op = .wdata, .mime = "image/png" },
+        "SGVsbG9Xb3JsZA==", // "HelloWorld"
+    ));
+}
+
+test "write: non-text after text truncation rejects transaction" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const begin_meta: Metadata = .{ .op = .write };
+    var state: WriteState = try .init(alloc, &begin_meta, .{ .max_size = 8 });
+    defer state.deinit(alloc);
+
+    try state.data(alloc, &.{ .op = .wdata, .mime = "text/plain" }, "SGVsbG9Xb3JsZA=="); // "HelloWorld"
+
+    // An empty chunk drops no bytes so it doesn't reject.
+    try state.data(alloc, &.{ .op = .wdata, .mime = "image/png" }, "");
+
+    try testing.expectError(error.TooLarge, state.data(
+        alloc,
+        &.{ .op = .wdata, .mime = "image/png" },
+        "iVBORw==",
+    ));
+}
+
 test "write: alias without data target is dropped" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
     const begin_meta: Metadata = .{ .op = .write };
-    var state: WriteState = try .init(alloc, &begin_meta);
+    var state: WriteState = try .init(alloc, &begin_meta, .{});
     defer state.deinit(alloc);
 
     const alias_meta: Metadata = .{ .op = .walias, .mime = "text/plain" };

@@ -28,6 +28,7 @@ const selection_c = @import("selection.zig");
 const style_c = @import("style.zig");
 const color = @import("../color.zig");
 const clipboard = @import("../clipboard.zig");
+const kitty_clipboard = @import("../kitty/clipboard.zig");
 const c_io = @import("io.zig");
 const snapshot_core = @import("../snapshot/main.zig");
 const Result = @import("result.zig").Result;
@@ -1217,6 +1218,7 @@ pub const Option = enum(c_int) {
     unknown_max_bytes = 36,
     terminfo_name = 37,
     clipboard_read = 38,
+    clipboard_write_max_bytes = 39,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1252,6 +1254,7 @@ pub const Option = enum(c_int) {
             .scrollback_max_lines,
             .continuation_max_bytes,
             .unknown_max_bytes,
+            .clipboard_write_max_bytes,
             => ?*const usize,
             .selection => ?*const selection_c.CSelection,
             .default_cursor_style => ?*const TerminalCursorStyle,
@@ -1452,6 +1455,8 @@ fn setTyped(
         ),
         .unknown_max_bytes => wrapper.stream.handler.apc_handler.unknown_max_bytes =
             if (value) |ptr| ptr.* else 0,
+        .clipboard_write_max_bytes => wrapper.stream.handler.kitty_clipboard_write_max_bytes =
+            if (value) |ptr| ptr.* else kitty_clipboard.max_write_size,
         .mode, .mode_default => {
             const config = (value orelse return .invalid_value).*;
             const mode = config.toMode() orelse return .invalid_value;
@@ -1585,6 +1590,7 @@ pub const TerminalData = enum(c_int) {
     mode = 37,
     vt_ground = 38,
     cursor_at_prompt = 39,
+    clipboard_write_max_bytes = 40,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1609,6 +1615,7 @@ pub const TerminalData = enum(c_int) {
             .scrollback_max_bytes,
             .scrollback_max_lines,
             .continuation_max_bytes,
+            .clipboard_write_max_bytes,
             => usize,
             .width_px, .height_px => u32,
             .color_foreground,
@@ -1760,6 +1767,7 @@ fn getTyped(
             out.* = max;
         },
         .continuation_max_bytes => out.* = continuationMaxBytes(wrapper),
+        .clipboard_write_max_bytes => out.* = wrapper.stream.handler.kitty_clipboard_write_max_bytes,
         .mode => {
             const mode = out.toMode() orelse return .invalid_value;
             out.value = t.modes.get(mode);
@@ -5047,6 +5055,80 @@ test "kitty clipboard write via C effects" {
         "\x1B]5522;type=write:status=ENOSYS:id=c2\x1B\\",
         S.responses[0..S.responses_len],
     );
+}
+
+test "set clipboard write max bytes" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var responses: [512]u8 = undefined;
+        var responses_len: usize = 0;
+        var write_count: usize = 0;
+
+        fn writePty(
+            _: Terminal,
+            _: ?*anyopaque,
+            ptr: [*]const u8,
+            len: usize,
+        ) callconv(lib.calling_conv) void {
+            @memcpy(responses[responses_len..][0..len], ptr[0..len]);
+            responses_len += len;
+        }
+
+        fn clipboardWrite(
+            _: Terminal,
+            _: ?*anyopaque,
+            request: *const ClipboardWrite,
+        ) callconv(lib.calling_conv) void {
+            write_count += 1;
+            request.reply(request, &.{
+                .size = @sizeOf(ClipboardWriteReply),
+                .result = .success,
+                .remember = false,
+            });
+        }
+    };
+    S.responses_len = 0;
+    S.write_count = 0;
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .clipboard_write, @ptrCast(&S.clipboardWrite)));
+
+    // The built-in default reads back.
+    var max: usize = 0;
+    try testing.expectEqual(Result.success, get(t, .clipboard_write_max_bytes, @ptrCast(&max)));
+    try testing.expectEqual(@as(usize, kitty_clipboard.max_write_size), max);
+
+    // Set a tiny limit; an oversized non-text write fails with EFBIG
+    // and never reaches the callback.
+    const limit: usize = 4;
+    try testing.expectEqual(Result.success, set(t, .clipboard_write_max_bytes, @ptrCast(&limit)));
+    try testing.expectEqual(Result.success, get(t, .clipboard_write_max_bytes, @ptrCast(&max)));
+    try testing.expectEqual(limit, max);
+
+    const seqs = [_][]const u8{
+        "\x1B]5522;type=write:id=c1\x1B\\",
+        "\x1B]5522;type=wdata:mime=aW1hZ2UvcG5n;SGVsbG9Xb3JsZA==\x1B\\", // "HelloWorld"
+        "\x1B]5522;type=wdata\x1B\\",
+    };
+    for (seqs) |seq| vt_write(t, seq.ptr, seq.len);
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=EFBIG:id=c1\x1B\\",
+        S.responses[0..S.responses_len],
+    );
+
+    // A NULL value reverts to the built-in default.
+    try testing.expectEqual(Result.success, set(t, .clipboard_write_max_bytes, null));
+    try testing.expectEqual(Result.success, get(t, .clipboard_write_max_bytes, @ptrCast(&max)));
+    try testing.expectEqual(@as(usize, kitty_clipboard.max_write_size), max);
 }
 
 test "set clipboard_read callback" {

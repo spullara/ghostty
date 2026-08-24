@@ -173,6 +173,11 @@ pub const Read = struct {
     /// True if the terminal already holds a session grant for this
     /// request (kitty clipboard protocol passwords). The embedder should
     /// skip any permission prompt and serve the read.
+    ///
+    /// Always false when mimes is empty: such a request is served
+    /// without a prompt (kitty's targets-listing exemption), so the
+    /// terminal never consults grants for it and a one-time password
+    /// is preserved for the follow-up data read.
     granted: bool,
 
     /// True if the program supplied a session password, so the embedder

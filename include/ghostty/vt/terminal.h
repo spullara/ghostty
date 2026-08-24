@@ -757,6 +757,11 @@ struct GhosttyClipboardRead {
    * True if the terminal already holds a session grant for this request
    * (kitty clipboard protocol passwords). The embedder should skip any
    * permission prompt and serve the read.
+   *
+   * Always false when mimes_len is zero: such a request is served
+   * without a prompt (see the callback docs), so the terminal never
+   * consults grants for it and a one-time password is preserved for
+   * the follow-up data read.
    */
   bool granted;
 
@@ -792,7 +797,9 @@ struct GhosttyClipboardRead {
  * state; a reply that sets `remember` records a session grant so later
  * requests with the same password arrive with `granted` set. Kitty itself
  * serves a request for only the targets listing (`list` with no `mimes`)
- * without prompting.
+ * without prompting, and embedders are expected to do the same; the
+ * terminal never consults grants for such requests (`granted` is false
+ * and one-time passwords are not consumed).
  *
  * Installing this callback also enables Kitty paste events (mode 5522):
  * ghostty_terminal_paste() sends the program an event instead of the text,
@@ -1515,6 +1522,30 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalClipboardReadFn
    */
   GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ = 38,
+
+  /**
+   * Set the maximum total decoded bytes a single Kitty clipboard protocol
+   * (OSC 5522) write transaction may accumulate. The limit is captured
+   * when a transaction begins; an in-flight transaction keeps the limit
+   * it started with.
+   *
+   * Text data (text/* MIME types and the legacy X11 text names) beyond
+   * the limit is truncated at a UTF-8 boundary and the write still
+   * completes with DONE. Non-text data beyond the limit fails the whole
+   * transaction with EFBIG and nothing reaches the clipboard write
+   * callback, since binary formats are corrupted by truncation.
+   *
+   * Transactions are buffered in memory, so this limit bounds how much
+   * memory a single write can make the terminal allocate. Pass SIZE_MAX
+   * to remove the limit. A NULL value pointer reverts to the built-in
+   * default of 32MiB.
+   *
+   * This limit doesn't apply to OSC 52 writes, which are bounded by the
+   * maximum length of an escape sequence instead.
+   *
+   * Input type: size_t*
+   */
+  GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES = 39,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -1912,6 +1943,15 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT = 39,
+
+  /**
+   * The configured maximum decoded bytes per Kitty clipboard protocol
+   * (OSC 5522) write transaction. See
+   * GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES.
+   *
+   * Output type: size_t *
+   */
+  GHOSTTY_TERMINAL_DATA_CLIPBOARD_WRITE_MAX_BYTES = 40,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

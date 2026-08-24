@@ -226,6 +226,12 @@ pub const Payload = struct {
     }
 };
 
+/// Whether a read request with this many data MIME types (the targets
+/// type '.' excluded) is exempt from the user permission prompt.
+pub fn readPromptExempt(data_mimes: usize) bool {
+    return data_mimes == 0;
+}
+
 test "metadata: empty is dropped" {
     const testing = std.testing;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -367,6 +373,16 @@ test "metadata: empty name" {
     defer arena.deinit();
     const meta = (try Metadata.parse(arena.allocator(), "type=read:pw=c2VjcmV0:name=")).?;
     try testing.expectEqual(@as(usize, 0), meta.name.len);
+}
+
+test "read prompt exemption: only requests without data types" {
+    const testing = std.testing;
+
+    // A targets-only ('.') read parses to zero data MIME types and is
+    // served without a prompt; any data type, even alongside the
+    // targets listing, still prompts.
+    try testing.expect(readPromptExempt(0));
+    try testing.expect(!readPromptExempt(1));
 }
 
 test "payload: mime iterator" {

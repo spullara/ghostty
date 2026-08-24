@@ -21,7 +21,11 @@
 //!   * A `type=write` silently replaces any in-flight transaction. A
 //!     commit (`type=wdata` without a MIME type) with no in-flight
 //!     transaction is silently ignored.
-//!   * Oversized writes are truncated and still complete with DONE.
+//!   * Oversized writes of text data are truncated and still complete
+//!     with DONE, matching kitty. Unlike kitty, oversized non-text data
+//!     fails the whole transaction with EFBIG instead: a truncated
+//!     image or other binary payload is corrupt, and the protocol has
+//!     no way to report partial success.
 //!   * Responses never send a payload section for an empty payload,
 //!     except the targets ('.') listing DATA packet which is always sent.
 //!
@@ -44,6 +48,7 @@ pub const Terminator = oscpkg.Terminator;
 
 pub const Metadata = command.Metadata;
 pub const Payload = command.Payload;
+pub const readPromptExempt = command.readPromptExempt;
 pub const max_id_len = command.max_id_len;
 pub const max_pw_len = command.max_pw_len;
 pub const max_mime_len = command.max_mime_len;

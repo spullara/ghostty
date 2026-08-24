@@ -702,7 +702,13 @@ pub const Surface = struct {
     ) bool {
         return switch (clipboard_type) {
             .standard => true,
-            .selection, .primary => self.app.opts.supports_selection_clipboard,
+            .selection => self.app.opts.supports_selection_clipboard,
+
+            // No embedder can serve the primary selection: the embedding
+            // API has no option to declare support for it, and macOS (the
+            // only GUI embedder) has no primary selection. The selection
+            // flag above covers a distinct custom pasteboard, not this.
+            .primary => false,
         };
     }
 
@@ -717,6 +723,14 @@ pub const Surface = struct {
         // completion that requires confirmation diverts into the
         // apprt confirmation flow just like a read.
         if (state == .kitty_write) {
+            // A write to a location the embedder can't serve is
+            // rejected before the transaction completes so the caller
+            // answers ENOSYS without a permission prompt, matching
+            // reads, where the embedder reports an unsupported
+            // location from the read callback. The write callback only
+            // fires after any prompt, so it is too late to reject.
+            if (!self.supportsClipboard(clipboard_type)) return .unsupported;
+
             const alloc = self.app.core_app.alloc;
             const state_ptr = try alloc.create(apprt.ClipboardRequest);
             errdefer alloc.destroy(state_ptr);

@@ -5931,10 +5931,13 @@ pub fn completeClipboardRequest(
             // If we need confirmation we return an error without
             // consuming the request state; the apprt keeps it alive
             // for the confirmation flow. A session grant carried by
-            // the request skips the prompt.
+            // the request skips the prompt, and a request with no
+            // data types is exempt from prompting entirely; see
+            // readPromptExempt.
             if (self.config.clipboard_read == .ask and
                 !complete.confirmed and
-                !kitty.granted)
+                !kitty.granted and
+                !terminal.kitty.clipboard.readPromptExempt(kitty.mimes.len))
             {
                 return error.UnauthorizedPaste;
             }

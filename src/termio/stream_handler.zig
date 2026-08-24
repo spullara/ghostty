@@ -51,6 +51,10 @@ pub const StreamHandler = struct {
     /// The clipboard write access configuration.
     clipboard_write: configpkg.ClipboardAccess,
 
+    /// Maximum total decoded bytes per Kitty clipboard protocol
+    /// (OSC 5522) write transaction; data beyond this is truncated.
+    clipboard_write_limit: usize,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -114,6 +118,7 @@ pub const StreamHandler = struct {
     pub fn changeConfig(self: *StreamHandler, config: *termio.DerivedConfig) void {
         self.osc_color_report_format = config.osc_color_report_format;
         self.clipboard_write = config.clipboard_write;
+        self.clipboard_write_limit = config.clipboard_write_limit;
         self.enquiry_response = config.enquiry_response;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
@@ -1107,7 +1112,7 @@ pub const StreamHandler = struct {
         // stored session grant for it lets the surface skip its
         // permission prompt.
         const pw: []const u8 = if (meta.name.len > 0) meta.pw else "";
-        const granted = self.kitty_clipboard_grants.use(self.alloc, pw, .read);
+        const granted = self.kittyClipboardReadGranted(pw, mimes_len);
 
         const req = try alloc.create(apprt.ClipboardRequest.KittyRead);
         const mimes = try alloc.alloc([:0]const u8, mimes_len);
@@ -1137,6 +1142,19 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .kitty_clipboard_read = req });
     }
 
+    /// Whether a session grant covers a read request, consuming
+    /// one-time grants. A prompt-exempt request never consults the
+    /// grants: consuming a one-time paste password on a listing would
+    /// burn the grant before the follow-up data read.
+    fn kittyClipboardReadGranted(
+        self: *StreamHandler,
+        pw: []const u8,
+        mimes_len: usize,
+    ) bool {
+        if (terminal.kitty.clipboard.readPromptExempt(mimes_len)) return false;
+        return self.kitty_clipboard_grants.use(self.alloc, pw, .read);
+    }
+
     /// Begin a Kitty clipboard write transaction (type=write).
     fn kittyClipboardWriteBegin(
         self: *StreamHandler,
@@ -1161,7 +1179,9 @@ pub const StreamHandler = struct {
 
         const state = try self.alloc.create(terminal.kitty.clipboard.WriteState);
         errdefer self.alloc.destroy(state);
-        state.* = try .init(self.alloc, meta);
+        state.* = try .init(self.alloc, meta, .{
+            .max_size = self.clipboard_write_limit,
+        });
         self.kitty_clipboard_write = state;
     }
 
@@ -1197,6 +1217,14 @@ pub const StreamHandler = struct {
                 );
                 return error.OutOfMemory;
             },
+
+            // Non-text data over the write limit aborts the
+            // transaction: truncated binary data would be corrupt.
+            error.TooLarge => try self.kittyClipboardWriteFinish(
+                state,
+                .EFBIG,
+                terminator,
+            ),
         };
     }
 
@@ -1826,3 +1854,19 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+test "kitty clipboard read: targets-only never consumes a one-time grant" {
+    const testing = std.testing;
+
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.kitty_clipboard_grants = .{};
+    defer handler.kitty_clipboard_grants.deinit(testing.allocator);
+    try handler.kitty_clipboard_grants.grant(testing.allocator, "otp", .read, true);
+
+    // A listing request must not burn the one-time paste password...
+    try testing.expect(!handler.kittyClipboardReadGranted("otp", 0));
+    // ...so the follow-up data read is still granted, exactly once.
+    try testing.expect(handler.kittyClipboardReadGranted("otp", 1));
+    try testing.expect(!handler.kittyClipboardReadGranted("otp", 1));
+}
