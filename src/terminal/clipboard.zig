@@ -32,6 +32,43 @@ pub const Content = struct {
     data: []const u8,
 };
 
+/// Requests content of a specific mime-type. For now this is used for
+/// on-demand clipboard access since content can be large (particularly
+/// non-text content), but it is generic so that this could handle other
+/// mime-typed sources in the future like maybe drag-and-drop.
+///
+/// C: GhosttyMimeReader
+pub const MimeReader = struct {
+    /// Passed through to `read_fn`.
+    ctx: ?*anyopaque = null,
+
+    /// Write all the data of the representation named by `mime` to
+    /// `sink`, in as many writes as is convenient. The mime and sink
+    /// are borrowed, only valid for the duration of the call, and
+    /// nothing written to the sink is retained, so the data may be
+    /// borrowed from anywhere. Return error.ReadFailed if the data
+    /// can't be produced and propagate error.WriteFailed from the
+    /// sink.
+    read_fn: *const fn (
+        ctx: ?*anyopaque,
+        mime: []const u8,
+        sink: *std.Io.Writer,
+    ) Error!void,
+
+    pub const Error = error{
+        /// The data could not be read.
+        ReadFailed,
+    } || std.Io.Writer.Error;
+
+    pub fn read(
+        self: MimeReader,
+        mime: []const u8,
+        sink: *std.Io.Writer,
+    ) Error!void {
+        return self.read_fn(self.ctx, mime, sink);
+    }
+};
+
 /// One atomic clipboard write.
 ///
 /// Contents are borrowed and only valid for the duration of a clipboard write

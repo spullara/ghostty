@@ -3,6 +3,7 @@ const lib = @import("../lib.zig");
 const paste = @import("../../input/paste.zig");
 const terminal_paste_pkg = @import("../paste.zig");
 const clipboard = @import("../clipboard.zig");
+const io = @import("io.zig");
 const terminal_c = @import("terminal.zig");
 const Terminal = terminal_c.Terminal;
 const ClipboardContent = terminal_c.ClipboardContent;
@@ -10,10 +11,15 @@ const ClipboardRead = terminal_c.ClipboardRead;
 const ClipboardReadReply = terminal_c.ClipboardReadReply;
 const Result = @import("result.zig").Result;
 
-/// Why a paste happened.
+/// Why a paste happened. The flat C form of the Zig tagged union
+/// (terminal.paste.Source); the location rides alongside in
+/// GhosttyPaste and only applies to a clipboard paste.
 ///
 /// C: GhosttyPasteSource
-pub const Source = terminal_paste_pkg.Source;
+pub const Source = lib.Enum(lib.target, &.{
+    "clipboard",
+    "text",
+});
 
 /// A paste of clipboard contents into the terminal. Sized struct.
 ///
@@ -22,8 +28,9 @@ pub const Request = extern struct {
     size: usize = @sizeOf(Request),
     location: clipboard.Location,
     source: Source,
-    contents: ?[*]const ClipboardContent,
-    contents_len: usize,
+    mimes: ?[*]const lib.String,
+    mimes_len: usize,
+    reader: io.MimeReader,
     allow_unsafe: bool,
 };
 
@@ -43,40 +50,79 @@ pub fn terminal_paste(
     // a C callback, so the "nothing can be written" check is ours.
     if (wrapper.effects.write_pty == null) return .invalid_value;
 
-    const c_contents: []const ClipboardContent = if (req.contents) |ptr|
-        ptr[0..req.contents_len]
+    const c_mimes: []const lib.String = if (req.mimes) |ptr|
+        ptr[0..req.mimes_len]
     else
         &.{};
+
+    // Only a paste with something to read needs a reader.
+    if (c_mimes.len > 0 and !req.reader.valid()) return .invalid_value;
 
     // A paste carries a handful of representations, so keep the common
     // case allocation-free.
     var sfa = std.heap.stackFallback(256, wrapper.terminal.gpa());
     const alloc = sfa.get();
-    const contents = alloc.alloc(
-        clipboard.Content,
-        c_contents.len,
-    ) catch return .out_of_memory;
-    defer alloc.free(contents);
-    for (contents, c_contents) |*content, c_content| {
-        content.* = .{
-            .mime = c_content.mime.ptr[0..c_content.mime.len],
-            .data = c_content.data.ptr[0..c_content.data.len],
-        };
-    }
+    const mimes = alloc.alloc([]const u8, c_mimes.len) catch return .out_of_memory;
+    defer alloc.free(mimes);
+    for (mimes, c_mimes) |*mime, c_mime| mime.* = c_mime.ptr[0..c_mime.len];
 
     const written = wrapper.stream.handler.paste(.{
-        .location = req.location,
-        .source = req.source,
-        .contents = contents,
+        .source = switch (req.source) {
+            .clipboard => .{ .clipboard = req.location },
+            .text => .text,
+        },
+        .contents = .{ .reader = .{
+            .mimes = mimes,
+            .read = .{ .ctx = @constCast(req), .read_fn = &readTrampoline },
+        } },
         .allow_unsafe = req.allow_unsafe,
     }) catch |err| return switch (err) {
         error.UnsafePaste => .rejected,
         error.NoWritePty => .invalid_value,
         error.OutOfMemory => .out_of_memory,
-        error.EntropyUnavailable, error.Canceled => .io_error,
+        error.ReadFailed,
+        error.EntropyUnavailable,
+        error.Canceled,
+        => .io_error,
     };
     if (out_written) |ptr| ptr.* = written;
     return .success;
+}
+
+/// The sink handed to the C read callback: a GhosttyWriter over the
+/// Zig sink, remembering whether the sink itself failed so that can be
+/// told apart from the callback failing to read.
+const Sink = struct {
+    writer: *std.Io.Writer,
+    write_failed: bool = false,
+
+    fn write(
+        userdata: ?*anyopaque,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(lib.calling_conv) bool {
+        const self: *Sink = @ptrCast(@alignCast(userdata.?));
+        self.writer.writeAll(data[0..len]) catch {
+            self.write_failed = true;
+            return false;
+        };
+        return true;
+    }
+};
+
+fn readTrampoline(
+    ctx: ?*anyopaque,
+    mime: []const u8,
+    writer: *std.Io.Writer,
+) clipboard.MimeReader.Error!void {
+    const req: *const Request = @ptrCast(@alignCast(ctx.?));
+    var sink: Sink = .{ .writer = writer };
+    if (!req.reader.read.?(req.reader.userdata, .init(mime), .{
+        .write = &Sink.write,
+        .userdata = &sink,
+    })) {
+        return if (sink.write_failed) error.WriteFailed else error.ReadFailed;
+    }
 }
 
 pub fn is_safe(data: ?[*]const u8, len: usize) callconv(lib.calling_conv) bool {
@@ -248,21 +294,55 @@ const TerminalPasteCapture = struct {
         return written[0..written_len];
     }
 
-    /// A single text/plain request; the caller provides the content
-    /// storage since the request borrows it.
-    fn textRequest(content: *ClipboardContent, text: []const u8) Request {
-        content.* = .{
-            .mime = .init(@as([]const u8, "text/plain")),
-            .data = .init(text),
-        };
-        return .{
-            .location = .standard,
-            .source = .clipboard,
-            .contents = content[0..1],
-            .contents_len = 1,
-            .allow_unsafe = false,
-        };
-    }
+    /// The representations a test paste serves: the MIME list for the
+    /// request and the data the read callback streams, in pieces.
+    const Contents = struct {
+        mimes: [2]lib.String = undefined,
+        data: [2][]const u8 = undefined,
+        len: usize = 0,
+        reads: [2]usize = @splat(0),
+        fail: bool = false,
+
+        fn init(entries: []const struct { []const u8, []const u8 }) Contents {
+            var self: Contents = .{};
+            for (entries) |entry| {
+                self.mimes[self.len] = .init(entry[0]);
+                self.data[self.len] = entry[1];
+                self.len += 1;
+            }
+            return self;
+        }
+
+        fn request(self: *Contents) Request {
+            return .{
+                .location = .standard,
+                .source = .clipboard,
+                .mimes = &self.mimes,
+                .mimes_len = self.len,
+                .reader = .{ .read = &read, .userdata = self },
+                .allow_unsafe = false,
+            };
+        }
+
+        fn read(userdata: ?*anyopaque, mime: lib.String, writer: io.Writer) callconv(lib.calling_conv) bool {
+            const self: *Contents = @ptrCast(@alignCast(userdata.?));
+            // The mime is the exact string from the request's list, so
+            // identifying it by pointer works.
+            const index: usize = for (self.mimes[0..self.len], 0..) |m, i| {
+                if (m.ptr == mime.ptr and m.len == mime.len) break i;
+            } else return false;
+            self.reads[index] += 1;
+            if (self.fail) return false;
+            const data = self.data[index];
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const n = @min(3, data.len - offset);
+                if (!writer.write.?(writer.userdata, data[offset..].ptr, n)) return false;
+                offset += n;
+            }
+            return true;
+        }
+    };
 };
 
 test "terminal_paste null handling" {
@@ -272,10 +352,11 @@ test "terminal_paste null handling" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 80, 24));
     defer terminal_c.free(t);
+    try testing.expectEqual(Result.success, terminal_c.set(t, .write_pty, @ptrCast(&S.writePty)));
 
     var written: bool = true;
-    var content: ClipboardContent = undefined;
-    const req: Request = S.textRequest(&content, "hello");
+    var contents: S.Contents = .init(&.{.{ "text/plain", "hello" }});
+    const req = contents.request();
     try testing.expectEqual(Result.invalid_value, terminal_paste(null, &req, &written));
     try testing.expectEqual(Result.invalid_value, terminal_paste(t, null, &written));
     try testing.expect(written);
@@ -284,6 +365,15 @@ test "terminal_paste null handling" {
     var small = req;
     small.size = @sizeOf(usize);
     try testing.expectEqual(Result.invalid_value, terminal_paste(t, &small, &written));
+
+    // MIME types without a reader are rejected; none at all is fine.
+    var unreadable = req;
+    unreadable.reader.read = null;
+    try testing.expectEqual(Result.invalid_value, terminal_paste(t, &unreadable, &written));
+    unreadable.mimes = null;
+    unreadable.mimes_len = 0;
+    try testing.expectEqual(Result.success, terminal_paste(t, &unreadable, &written));
+    try testing.expect(!written);
 }
 
 test "terminal_paste without write_pty is invalid" {
@@ -295,8 +385,8 @@ test "terminal_paste without write_pty is invalid" {
     try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 80, 24));
     defer terminal_c.free(t);
 
-    var content: ClipboardContent = undefined;
-    const req: Request = S.textRequest(&content, "hello");
+    var contents: S.Contents = .init(&.{.{ "text/plain", "hello" }});
+    const req = contents.request();
     try testing.expectEqual(Result.invalid_value, terminal_paste(t, &req, null));
 }
 
@@ -310,26 +400,34 @@ test "terminal_paste text and unsafe" {
     defer terminal_c.free(t);
     try testing.expectEqual(Result.success, terminal_c.set(t, .write_pty, @ptrCast(&S.writePty)));
 
-    // Plain text, NULL out_written pointer is fine.
-    var content: ClipboardContent = undefined;
-    const req: Request = S.textRequest(&content, "hel\x1blo");
+    // Plain text, NULL out_written pointer is fine. The text is read
+    // once, the image never.
+    var contents: S.Contents = .init(&.{
+        .{ "image/png", "\x89PNG" },
+        .{ "text/plain", "hel\x1blo" },
+    });
+    const req = contents.request();
     try testing.expectEqual(Result.success, terminal_paste(t, &req, null));
     try testing.expectEqualStrings("hel lo", S.writtenSlice());
     try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqual(@as(usize, 0), contents.reads[0]);
+    try testing.expectEqual(@as(usize, 1), contents.reads[1]);
 
     // Unsafe is refused with nothing written, then allowed.
     S.reset();
     var written: bool = false;
-    var unsafe_content: ClipboardContent = undefined;
-    var unsafe: Request = S.textRequest(&unsafe_content, "rm -rf /\n");
+    var unsafe_contents: S.Contents = .init(&.{.{ "text/plain", "rm -rf /\n" }});
+    var unsafe = unsafe_contents.request();
     try testing.expectEqual(Result.rejected, terminal_paste(t, &unsafe, &written));
     try testing.expectEqual(@as(usize, 0), S.write_count);
     try testing.expect(!written);
+    try testing.expectEqual(@as(usize, 1), unsafe_contents.reads[0]);
 
     unsafe.allow_unsafe = true;
     try testing.expectEqual(Result.success, terminal_paste(t, &unsafe, &written));
     try testing.expect(written);
     try testing.expectEqualStrings("rm -rf /\r", S.writtenSlice());
+    try testing.expectEqual(@as(usize, 2), unsafe_contents.reads[0]);
 
     // Bracketed paste mode frames the text through the real mode path.
     S.reset();
@@ -339,15 +437,19 @@ test "terminal_paste text and unsafe" {
     try testing.expect(written);
     try testing.expectEqualStrings("\x1b[200~hel lo\x1b[201~", S.writtenSlice());
 
-    // No text representation writes nothing. NULL contents with a zero
-    // length is an empty list.
+    // No text representation writes nothing and reads nothing.
     S.reset();
-    var empty_content: ClipboardContent = undefined;
-    var empty: Request = S.textRequest(&empty_content, "");
-    empty.contents = null;
-    empty.contents_len = 0;
-    try testing.expectEqual(Result.success, terminal_paste(t, &empty, &written));
+    var image: S.Contents = .init(&.{.{ "image/png", "\x89PNG" }});
+    const image_req = image.request();
+    try testing.expectEqual(Result.success, terminal_paste(t, &image_req, &written));
     try testing.expect(!written);
+    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqual(@as(usize, 0), image.reads[0]);
+
+    // A failing reader is an I/O error.
+    S.reset();
+    contents.fail = true;
+    try testing.expectEqual(Result.io_error, terminal_paste(t, &req, &written));
     try testing.expectEqual(@as(usize, 0), S.write_count);
 }
 
@@ -364,30 +466,20 @@ test "terminal_paste event" {
 
     // Without a clipboard_read callback the paste stays text.
     var written: bool = false;
-    const contents = [_]ClipboardContent{
-        .{
-            .mime = .init(@as([]const u8, "text/plain")),
-            .data = .init(@as([]const u8, "secret")),
-        },
-        .{
-            .mime = .init(@as([]const u8, "image/png")),
-            .data = .init(@as([]const u8, "")),
-        },
-    };
-    const req: Request = .{
-        .location = .primary,
-        .source = .clipboard,
-        .contents = &contents,
-        .contents_len = contents.len,
-        .allow_unsafe = false,
-    };
+    var contents: S.Contents = .init(&.{
+        .{ "text/plain", "secret" },
+        .{ "image/png", "\x89PNG" },
+    });
+    var req = contents.request();
+    req.location = .primary;
     try testing.expectEqual(Result.success, terminal_paste(t, &req, &written));
     try testing.expect(written);
     try testing.expectEqualStrings("secret", S.writtenSlice());
 
-    // With one, an event is sent listing every MIME type and the data
-    // is never written.
+    // With one, an event is sent listing every MIME type and no data
+    // is read, let alone written.
     S.reset();
+    contents.reads = @splat(0);
     try testing.expectEqual(Result.success, terminal_c.set(t, .clipboard_read, @ptrCast(&S.clipboardRead)));
     try testing.expectEqual(Result.success, terminal_paste(t, &req, &written));
     try testing.expect(written);
@@ -396,6 +488,8 @@ test "terminal_paste event" {
     try testing.expect(std.mem.startsWith(u8, S.writtenSlice(), "\x1b]5522;type=read:status=OK:loc=primary:pw="));
     try testing.expect(std.mem.indexOf(u8, S.writtenSlice(), "secret") == null);
     try testing.expect(std.mem.indexOf(u8, S.writtenSlice(), ";dGV4dC9wbGFpbiBpbWFnZS9wbmcK\x1b\\") != null);
+    try testing.expectEqual(@as(usize, 0), contents.reads[0]);
+    try testing.expectEqual(@as(usize, 0), contents.reads[1]);
 
     // The program's read with the event password is granted once.
     const ok_prefix = "\x1b]5522;type=read:status=OK:loc=primary:pw=";
