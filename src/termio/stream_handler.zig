@@ -68,6 +68,10 @@ pub const StreamHandler = struct {
     /// The tmux control mode viewer state.
     tmux_viewer: if (tmux_enabled) ?*terminal.tmux.Viewer else void = if (tmux_enabled) null else {},
 
+    /// Session password grants for the Kitty clipboard protocol.
+    /// Requests carrying a granted password skip the permission prompt.
+    kitty_clipboard_grants: terminal.kitty.clipboard.Grants = .{},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -85,6 +89,7 @@ pub const StreamHandler = struct {
     pub fn deinit(self: *StreamHandler) void {
         self.apc.deinit();
         self.dcs.deinit();
+        self.kitty_clipboard_grants.deinit(self.alloc);
         if (comptime tmux_enabled) tmux: {
             const viewer = self.tmux_viewer orelse break :tmux;
             viewer.deinit();
@@ -352,11 +357,11 @@ pub const StreamHandler = struct {
             .apc_end => try self.apcEnd(),
             .apc_put => self.apc.feed(self.alloc, value),
             .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
+            .kitty_clipboard => try self.kittyClipboard(value),
 
             // Unimplemented
             .title_push,
             .title_pop,
-            .kitty_clipboard,
             .kitty_dnd,
             => {},
         }
@@ -869,11 +874,21 @@ pub const StreamHandler = struct {
         self.terminal.fullReset();
         try self.setMouseShape(.text);
 
+        // Full reset clears Kitty clipboard session grants.
+        self.kitty_clipboard_grants.deinit(self.alloc);
+        self.kitty_clipboard_grants = .{};
+
         // Reset resets our palette so we report it for mode 2031.
         self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
 
         // Clear the progress bar
         self.progressReport(.{ .state = .remove });
+    }
+
+    /// Record a Kitty clipboard protocol session grant so future
+    /// requests with this password skip the permission prompt.
+    pub fn kittyClipboardGrant(self: *StreamHandler, pw: []const u8) !void {
+        try self.kitty_clipboard_grants.grant(self.alloc, pw, .read, false);
     }
 
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
@@ -988,6 +1003,135 @@ pub const StreamHandler = struct {
                 .clipboard_type = clipboard_type,
             },
         });
+    }
+
+    /// Handle one Kitty clipboard protocol (OSC 5522) packet.
+    fn kittyClipboard(
+        self: *StreamHandler,
+        v: terminal.osc.Command.KittyClipboardProtocol,
+    ) !void {
+        const kitty_clipboard = terminal.kitty.clipboard;
+
+        // Decode and validate the metadata. Malformed metadata drops
+        // the packet without any response, matching kitty.
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const meta = (try kitty_clipboard.Metadata.parse(
+            arena.allocator(),
+            v.metadata,
+        )) orelse return;
+
+        switch (meta.op) {
+            .read => try self.kittyClipboardRead(
+                &meta,
+                v.payload orelse "",
+                v.terminator,
+            ),
+
+            // Writes aren't implemented in the GUI yet. Failing the
+            // transaction up front matches a libghostty-vt handler
+            // without a clipboard_write effect and spares the program
+            // from waiting on a commit response that never comes.
+            .write => {
+                var stream: std.Io.Writer.Allocating = .init(self.alloc);
+                defer stream.deinit();
+                try (kitty_clipboard.Response{
+                    .op = .write,
+                    .status = .ENOSYS,
+                    .id = meta.id,
+                    .terminator = v.terminator,
+                }).encode(&stream.writer);
+                self.messageWriter(.{ .write_alloc = .{
+                    .alloc = self.alloc,
+                    .data = try stream.toOwnedSlice(),
+                } });
+            },
+
+            // Data packets without an accepted write transaction are
+            // silently ignored, matching kitty.
+            .wdata, .walias => {},
+        }
+    }
+
+    fn kittyClipboardRead(
+        self: *StreamHandler,
+        meta: *const terminal.kitty.clipboard.Metadata,
+        payload: []const u8,
+        terminator: terminal.osc.Terminator,
+    ) !void {
+        const kitty_clipboard = terminal.kitty.clipboard;
+
+        // Everything about the request, including the request struct
+        // itself, lives in a single arena that crosses to the surface
+        // thread, which owns it from the moment the message is sent.
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        // The payload is the requested MIME list. A read request with
+        // an undecodable payload is dropped without any response,
+        // matching kitty.
+        const decoded = kitty_clipboard.Payload.init(
+            alloc,
+            payload,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => {
+                arena.deinit();
+                return;
+            },
+        };
+
+        // The targets type ('.') asks for the listing of available
+        // types rather than data. Requested types beyond the cap are
+        // dropped and simply never served, which is how the protocol
+        // reports an unavailable type anyway.
+        var mimes_buf: [kitty_clipboard.max_read_mimes][]const u8 = undefined;
+        var mimes_len: usize = 0;
+        var list = false;
+        var it = decoded.mimeIterator();
+        while (it.next()) |mime| {
+            if (std.mem.eql(u8, mime, kitty_clipboard.targets_mime)) {
+                list = true;
+                continue;
+            }
+            if (mimes_len == mimes_buf.len) continue;
+            mimes_buf[mimes_len] = mime;
+            mimes_len += 1;
+        }
+
+        // Per the spec a password without a name is no password. A
+        // stored session grant for it lets the surface skip its
+        // permission prompt.
+        const pw: []const u8 = if (meta.name.len > 0) meta.pw else "";
+        const granted = self.kitty_clipboard_grants.use(self.alloc, pw, .read);
+
+        const req = try alloc.create(apprt.ClipboardRequest.KittyRead);
+        const mimes = try alloc.alloc([:0]const u8, mimes_len);
+        for (mimes_buf[0..mimes_len], mimes) |src, *dst| {
+            dst.* = try alloc.dupeZ(u8, src);
+        }
+        const id = try alloc.dupe(u8, meta.id);
+        const pw_owned = try alloc.dupe(u8, pw);
+        const name_owned = try alloc.dupeZ(u8, meta.name);
+        req.* = .{
+            // The arena must be copied in last so it tracks every
+            // allocation above.
+            .arena = arena,
+            .location = switch (meta.loc) {
+                .primary => .primary,
+                else => .standard,
+            },
+            .mimes = mimes,
+            .list = list,
+            .id = id,
+            .pw = pw_owned,
+            .name = name_owned,
+            .granted = granted,
+            .terminator = terminator,
+        };
+
+        self.surfaceMessageWriter(.{ .kitty_clipboard_read = req });
     }
 
     fn semanticPrompt(

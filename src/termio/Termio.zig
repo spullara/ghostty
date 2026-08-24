@@ -717,6 +717,15 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
 }
 
 /// Sends a DSR response for the current color scheme to the pty.
+/// Record a Kitty clipboard protocol session grant so future requests
+/// carrying the password skip the permission prompt.
+pub fn kittyClipboardGrant(self: *Termio, pw: []const u8) !void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    try self.terminal_stream.handler.kittyClipboardGrant(pw);
+}
+
 pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());

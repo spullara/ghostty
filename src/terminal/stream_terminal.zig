@@ -81,9 +81,8 @@ pub const Handler = struct {
     kitty_clipboard_write: ?*kitty_clipboard.WriteState = null,
 
     /// Kitty clipboard protocol (OSC 5522) session password grants,
-    /// recorded when a clipboard_read reply asks to remember the user's
-    /// decision. Later requests carrying a granted password are forwarded
-    /// with `granted` set so the embedder can skip its prompt.
+    /// recorded when a clipboard_read or clipboard_write reply asks to
+    /// remember the user's decision.
     kitty_clipboard_grants: kitty_clipboard.Grants = .{},
 
     /// Called for sequence identifiers not supported by this library.
@@ -161,26 +160,8 @@ pub const Handler = struct {
         /// Called when the running program reports progress via OSC 9;4.
         progress_report: ?*const fn (*Handler, osc.Command.ProgressReport) void,
 
-        /// Called when the running program writes to a clipboard. The write
-        /// has a normalized destination and one or more decoded MIME
-        /// representations. All request, MIME, and data memory is borrowed
-        /// and only valid for the duration of the callback.
-        ///
-        /// A write with no contents clears the destination. A content entry
-        /// with empty data is a distinct empty representation.
-        ///
-        /// OSC 52, OSC 1337 Copy, and Kitty clipboard (OSC 5522) writes all
-        /// share this callback. Every call is one complete write whose
-        /// contents replace whatever the destination previously held; there
-        /// is never a partial update. A Kitty clipboard write transaction
-        /// results in exactly one call, at commit, carrying all of the
-        /// transaction's representations, and the returned result is
-        /// reported back to the running program as the commit status (see
-        /// kittyClipboard).
-        ///
-        /// Clipboard read requests (OSC 52 with a "?" payload and OSC 5522
-        /// reads) are delivered to clipboard_read instead.
-        clipboard_write: ?*const fn (*Handler, clipboard.Write) clipboard.WriteResult,
+        /// Called when the running program writes to a clipboard.
+        clipboard_write: ?*const fn (*Handler, clipboard.Write) void,
 
         /// Called when the running program requests clipboard contents
         /// (OSC 52 with a "?" payload, or a Kitty clipboard (OSC 5522)
@@ -661,9 +642,14 @@ pub const Handler = struct {
 
         // OSC 52 uses an empty payload to clear the selected clipboard.
         if (data.len == 0) {
-            _ = func(self, .{
+            func(self, .{
                 .location = location,
                 .contents = &.{},
+                .name = "",
+                .granted = false,
+                .can_remember = false,
+                .reply_ctx = self,
+                .reply_fn = &ignoreWriteReply,
             });
             return;
         }
@@ -680,11 +666,21 @@ pub const Handler = struct {
             .mime = "text/plain",
             .data = decoded,
         }};
-        _ = func(self, .{
+        func(self, .{
             .location = location,
             .contents = &contents,
+            .name = "",
+            .granted = false,
+            .can_remember = false,
+            .reply_ctx = self,
+            .reply_fn = &ignoreWriteReply,
         });
     }
+
+    /// Reply target for clipboard writes on protocols without a write
+    /// acknowledgement (OSC 52, OSC 1337 Copy): the reply is accepted
+    /// and discarded.
+    fn ignoreWriteReply(_: *anyopaque, _: clipboard.Write.Result) void {}
 
     fn clipboardRead(
         self: *Handler,
@@ -1094,27 +1090,86 @@ pub const Handler = struct {
         };
         defer committed.deinit(alloc);
 
-        // The effect result maps 1:1 onto the protocol's commit
-        // statuses. The effect can't be null here (checked when the
-        // transaction began) but if an embedder cleared it
-        // mid-transaction that's ENOSYS.
-        const result: clipboard.WriteResult = if (self.effects.clipboard_write) |func|
-            func(self, .{
-                .location = committed.loc,
-                .contents = committed.contents,
-            })
-        else
-            .unsupported;
+        // The effect can't be null here (checked when the transaction
+        // began) but if an embedder cleared it mid-transaction that's
+        // ENOSYS.
+        const func = self.effects.clipboard_write orelse {
+            self.kittyClipboardFinish(state, .ENOSYS, terminator);
+            return;
+        };
 
-        self.kittyClipboardFinish(state, switch (result) {
-            .success => .DONE,
-            .denied => .EPERM,
-            .unsupported => .ENOSYS,
-            .busy => .EBUSY,
-            .invalid_data => .EINVAL,
-            .io_error, _ => .EIO,
-        }, terminator);
+        // Per the spec a password without a name is no password. A
+        // stored grant for it lets the embedder skip its prompt.
+        const pw: []const u8 = if (committed.name.len > 0) committed.pw else "";
+        const granted = self.kitty_clipboard_grants.use(alloc, pw, .write);
+
+        var reply_state: KittyClipboardWriteReplyState = .{
+            .handler = self,
+            .pw = pw,
+        };
+        func(self, .{
+            .location = committed.loc,
+            .contents = committed.contents,
+            .name = committed.name,
+            .granted = granted,
+            .can_remember = pw.len > 0,
+            .reply_ctx = &reply_state,
+            .reply_fn = &KittyClipboardWriteReplyState.reply,
+        });
+
+        // The program is waiting on the commit status, so a callback
+        // that returned without a reply is answered as a denial rather
+        // than silence.
+        self.kittyClipboardFinish(
+            state,
+            reply_state.status orelse .EPERM,
+            terminator,
+        );
     }
+
+    /// Reply state for one synchronous Kitty clipboard write. This lives
+    /// on the kittyClipboardCommit stack frame, so it is only valid
+    /// during the callback.
+    const KittyClipboardWriteReplyState = struct {
+        handler: *Handler,
+
+        /// The effective password, empty when the request had none.
+        pw: []const u8,
+
+        /// The replied commit status, mapped 1:1 from the reply result;
+        /// null until the callback replies.
+        status: ?kitty_clipboard.Status = null,
+
+        fn reply(ctx: *anyopaque, result: clipboard.Write.Result) void {
+            const self: *KittyClipboardWriteReplyState = @ptrCast(@alignCast(ctx));
+            if (self.status != null) {
+                log.warn("clipboard write replied more than once, ignoring", .{});
+                return;
+            }
+            self.status = switch (result) {
+                .denied => .EPERM,
+                .unsupported => .ENOSYS,
+                .busy => .EBUSY,
+                .invalid_data => .EINVAL,
+                .io_error => .EIO,
+                .success => |success| status: {
+                    // Remembering is only offered when the request
+                    // carried a usable password.
+                    if (success.remember and self.pw.len > 0) {
+                        self.handler.kitty_clipboard_grants.grant(
+                            self.handler.terminal.gpa(),
+                            self.pw,
+                            .write,
+                            false,
+                        ) catch |err| {
+                            log.warn("error recording clipboard grant err={}", .{err});
+                        };
+                    }
+                    break :status .DONE;
+                },
+            };
+        }
+    };
 
     /// Answer a write transaction with its final status and drop it.
     /// The id echoed is the one from the transaction's opening write
@@ -1384,7 +1439,16 @@ pub const Handler = struct {
     }
 
     fn requestMode(self: *Handler, mode: modes.Mode) void {
-        const report = self.terminal.modes.getReport(.fromMode(mode));
+        var report = self.terminal.modes.getReport(.fromMode(mode));
+
+        // Kitty paste events (mode 5522) can't work without a clipboard
+        // read effect, so if that isn't set mark it as unrecognized.
+        if (mode == .kitty_paste_events and
+            self.effects.clipboard_read == null)
+        {
+            report.state = .not_recognized;
+        }
+
         self.sendModeReport(report);
     }
 
@@ -3242,7 +3306,7 @@ test "clipboard_write effect callback" {
 
     const S = struct {
         var count: usize = 0;
-        var result: clipboard.WriteResult = .success;
+        var result: clipboard.Write.Result = .{ .success = .{} };
         var last_location: clipboard.Location = .standard;
         var last_contents_len: usize = 0;
         var last_mime: ?[]u8 = null;
@@ -3256,7 +3320,7 @@ test "clipboard_write effect callback" {
             last_contents_len = 0;
         }
 
-        fn clipboardWrite(_: *Handler, write: clipboard.Write) clipboard.WriteResult {
+        fn clipboardWrite(_: *Handler, write: clipboard.Write) void {
             clearCapture();
             count += 1;
             last_location = write.location;
@@ -3267,7 +3331,7 @@ test "clipboard_write effect callback" {
                 last_data = testing.allocator.dupe(u8, write.contents[0].data) catch
                     @panic("failed to capture clipboard data");
             }
-            return result;
+            write.reply(result);
         }
     };
     S.count = 0;
@@ -3333,9 +3397,9 @@ test "clipboard_write effect callback" {
     try testing.expectEqualStrings("text/plain", S.last_mime.?);
     try testing.expectEqualStrings("fragmented", S.last_data.?);
 
-    // Callback results are intentionally ignored for protocols without a
-    // write acknowledgement. The denied result above did not stop later writes.
-    try testing.expectEqual(clipboard.WriteResult.denied, S.result);
+    // Reply results are intentionally ignored for protocols without a
+    // write acknowledgement. The denied reply above did not stop later writes.
+    try testing.expect(S.result == .denied);
 }
 
 test "clipboard_read effect callback" {
@@ -3459,9 +3523,9 @@ test "clipboard_write allocation failure is ignored" {
     const S = struct {
         var count: usize = 0;
 
-        fn clipboardWrite(_: *Handler, _: clipboard.Write) clipboard.WriteResult {
+        fn clipboardWrite(_: *Handler, write: clipboard.Write) void {
             count += 1;
-            return .success;
+            write.reply(.{ .success = .{} });
         }
     };
     S.count = 0;
@@ -3489,14 +3553,21 @@ test "clipboard_write allocation failure is ignored" {
 const KittyClipboardCapture = struct {
     var responses: [1024]u8 = undefined;
     var responses_len: usize = 0;
+
+    // Write capture. A null write_result returns without replying.
     var write_count: usize = 0;
-    var result: clipboard.WriteResult = .success;
+    var write_result: ?clipboard.Write.Result = .{ .success = .{} };
+    var write_reply_twice: bool = false;
     var last_location: clipboard.Location = .standard;
     var last_contents_len: usize = 0;
     var last_mimes: [8][64]u8 = undefined;
     var last_mime_lens: [8]usize = @splat(0);
     var last_data: [8][256]u8 = undefined;
     var last_data_lens: [8]usize = @splat(0);
+    var last_write_name: [64]u8 = undefined;
+    var last_write_name_len: usize = 0;
+    var last_write_granted: bool = false;
+    var last_write_can_remember: bool = false;
 
     // Read capture. A null read_result returns without replying.
     var read_count: usize = 0;
@@ -3515,11 +3586,15 @@ const KittyClipboardCapture = struct {
     fn reset() void {
         responses_len = 0;
         write_count = 0;
-        result = .success;
+        write_result = .{ .success = .{} };
+        write_reply_twice = false;
         last_location = .standard;
         last_contents_len = 0;
         last_mime_lens = @splat(0);
         last_data_lens = @splat(0);
+        last_write_name_len = 0;
+        last_write_granted = false;
+        last_write_can_remember = false;
         read_count = 0;
         read_result = null;
         read_reply_twice = false;
@@ -3537,7 +3612,7 @@ const KittyClipboardCapture = struct {
         responses_len += data.len;
     }
 
-    fn clipboardWrite(_: *Handler, write: clipboard.Write) clipboard.WriteResult {
+    fn clipboardWrite(_: *Handler, write: clipboard.Write) void {
         write_count += 1;
         last_location = write.location;
         last_contents_len = write.contents.len;
@@ -3547,7 +3622,12 @@ const KittyClipboardCapture = struct {
             last_data_lens[i] = content.data.len;
             @memcpy(last_data[i][0..content.data.len], content.data);
         }
-        return result;
+        last_write_name_len = write.name.len;
+        @memcpy(last_write_name[0..write.name.len], write.name);
+        last_write_granted = write.granted;
+        last_write_can_remember = write.can_remember;
+        if (write_result) |r| write.reply(r);
+        if (write_reply_twice) write.reply(.io_error);
     }
 
     fn clipboardRead(_: *Handler, read: clipboard.Read) void {
@@ -3577,6 +3657,10 @@ const KittyClipboardCapture = struct {
 
     fn readName() []const u8 {
         return last_read_name[0..last_read_name_len];
+    }
+
+    fn writeName() []const u8 {
+        return last_write_name[0..last_write_name_len];
     }
 
     fn mimeAt(i: usize) []const u8 {
@@ -3647,20 +3731,22 @@ test "kitty clipboard write result maps to response status" {
     defer s.deinit();
 
     const cases = [_]struct {
-        result: clipboard.WriteResult,
+        result: ?clipboard.Write.Result,
         response: []const u8,
     }{
-        .{ .result = .success, .response = "\x1B]5522;type=write:status=DONE\x1B\\" },
+        .{ .result = .{ .success = .{} }, .response = "\x1B]5522;type=write:status=DONE\x1B\\" },
         .{ .result = .denied, .response = "\x1B]5522;type=write:status=EPERM\x1B\\" },
         .{ .result = .unsupported, .response = "\x1B]5522;type=write:status=ENOSYS\x1B\\" },
         .{ .result = .busy, .response = "\x1B]5522;type=write:status=EBUSY\x1B\\" },
         .{ .result = .invalid_data, .response = "\x1B]5522;type=write:status=EINVAL\x1B\\" },
         .{ .result = .io_error, .response = "\x1B]5522;type=write:status=EIO\x1B\\" },
+        // No reply at all is a denial rather than silence.
+        .{ .result = null, .response = "\x1B]5522;type=write:status=EPERM\x1B\\" },
     };
 
     for (cases) |case| {
         S.reset();
-        S.result = case.result;
+        S.write_result = case.result;
 
         // An immediately-committed write with no data is a clear.
         s.nextSlice("\x1B]5522;type=write\x1B\\");
@@ -3669,6 +3755,16 @@ test "kitty clipboard write result maps to response status" {
         try testing.expectEqual(@as(usize, 0), S.last_contents_len);
         try testing.expectEqualStrings(case.response, S.responseSlice());
     }
+
+    // A second reply is ignored.
+    S.reset();
+    S.write_reply_twice = true;
+    s.nextSlice("\x1B]5522;type=write\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=DONE\x1B\\",
+        S.responseSlice(),
+    );
 
     // The response echoes the request terminator, unlike kitty which
     // always uses ST.
@@ -3941,6 +4037,70 @@ test "kitty clipboard read password grants" {
     try testing.expect(S.last_read_granted);
     try testing.expectEqualStrings(
         "\x1B]5522;type=read:status=EPERM:id=d\x1B\\",
+        S.responseSlice(),
+    );
+
+    // Grants are freed with the stream (the testing allocator catches
+    // the leak otherwise).
+}
+
+test "kitty clipboard write password grants" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // pw="secret", name="app": the first commit isn't granted but the
+    // reply may ask to remember it.
+    S.write_result = .{ .success = .{ .remember = true } };
+    s.nextSlice("\x1B]5522;type=write:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqualStrings("app", S.writeName());
+    try testing.expect(!S.last_write_granted);
+    try testing.expect(S.last_write_can_remember);
+
+    // The same password is now granted; a different one is not.
+    S.write_result = .{ .success = .{} };
+    s.nextSlice("\x1B]5522;type=write:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expect(S.last_write_granted);
+    s.nextSlice("\x1B]5522;type=write:pw=b3RoZXI=:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expect(!S.last_write_granted);
+    try testing.expect(S.last_write_can_remember);
+
+    // Directions are independent: a write grant doesn't satisfy reads.
+    S.read_result = .{ .success = .{} };
+    s.nextSlice("\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw\x1B\\");
+    try testing.expect(!S.last_read_granted);
+
+    // A password without a name doesn't count: it is neither granted
+    // nor rememberable, even if the reply asks.
+    S.write_result = .{ .success = .{ .remember = true } };
+    s.nextSlice("\x1B]5522;type=write:pw=c2VjcmV0\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expectEqualStrings("", S.writeName());
+    try testing.expect(!S.last_write_granted);
+    try testing.expect(!S.last_write_can_remember);
+
+    // A grant is advisory: the request is still forwarded and the
+    // embedder may deny it.
+    S.responses_len = 0;
+    S.write_result = .denied;
+    s.nextSlice("\x1B]5522;type=write:id=d:pw=c2VjcmV0:name=YXBw\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+    try testing.expect(S.last_write_granted);
+    try testing.expectEqualStrings(
+        "\x1B]5522;type=write:status=EPERM:id=d\x1B\\",
         S.responseSlice(),
     );
 
@@ -5185,10 +5345,10 @@ test "continuation reconstructs standard stream without duplicate effects" {
 
         fn clipboardWrite(
             _: *Handler,
-            _: clipboard.Write,
-        ) clipboard.WriteResult {
+            write: clipboard.Write,
+        ) void {
             clipboard_count += 1;
-            return .success;
+            write.reply(.{ .success = .{} });
         }
 
         fn reset() void {
@@ -6041,7 +6201,7 @@ test "paste: mode 5522 without entropy fails and records no grant" {
     try testing.expectEqualStrings("hello", S.written.items);
 }
 
-test "paste: mode 5522 is settable and reported in the lib build" {
+test "paste: mode 5522 DECRQM requires clipboard read effect" {
     if (comptime build_options.artifact != .lib) return error.SkipZigTest;
 
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
@@ -6056,18 +6216,34 @@ test "paste: mode 5522 is settable and reported in the lib build" {
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
-    // Recognized and reset by default, so programs can detect support.
+    // A paste event is unusable if its follow-up read can't be served, so
+    // the mode isn't advertised without a clipboard read effect.
     s.nextSlice("\x1B[?5522$p");
-    try testing.expectEqualStrings("\x1B[?5522;2$y", S.written.items);
+    try testing.expectEqualStrings("\x1B[?5522;0$y", S.written.items);
 
     S.reset();
     s.nextSlice("\x1B[?5522h");
     try testing.expect(t.modes.get(.kitty_paste_events));
     s.nextSlice("\x1B[?5522$p");
+    try testing.expectEqualStrings("\x1B[?5522;0$y", S.written.items);
+
+    // Installing the effect makes the current mode state reportable.
+    S.reset();
+    s.handler.effects.clipboard_read = &S.clipboardRead;
+    s.nextSlice("\x1B[?5522$p");
     try testing.expectEqualStrings("\x1B[?5522;1$y", S.written.items);
 
+    S.reset();
     s.nextSlice("\x1B[?5522l");
     try testing.expect(!t.modes.get(.kitty_paste_events));
+    s.nextSlice("\x1B[?5522$p");
+    try testing.expectEqualStrings("\x1B[?5522;2$y", S.written.items);
+
+    // Removing the effect stops advertising the capability again.
+    S.reset();
+    s.handler.effects.clipboard_read = null;
+    s.nextSlice("\x1B[?5522$p");
+    try testing.expectEqualStrings("\x1B[?5522;0$y", S.written.items);
 }
 
 test "full reset drops kitty clipboard grants" {
