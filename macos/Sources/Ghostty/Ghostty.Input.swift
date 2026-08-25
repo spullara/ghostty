@@ -29,9 +29,11 @@ extension Ghostty {
                     Self.writingSystemKeyRange.contains(physical.rawValue),
                     let inputKey = Input.Key(cKey: physical),
                     let keyCode = inputKey.keyCode,
+                    // Command can select a distinct layout table. Other modifiers remain
+                    // separate in the menu's modifier mask and must not affect this character.
                     let character = KeyboardLayout.character(
                         for: keyCode,
-                        modifiers: modifierFlags)
+                        modifiers: modifierFlags.intersection(.command))
                 else { return nil }
 
                 // Printable physical keys must be translated through the current layout.
