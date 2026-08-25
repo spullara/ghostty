@@ -52,7 +52,7 @@ pub const StreamHandler = struct {
     clipboard_write: configpkg.ClipboardAccess,
 
     /// Maximum total decoded bytes per Kitty clipboard protocol
-    /// (OSC 5522) write transaction; data beyond this is truncated.
+    /// (OSC 5522) write transaction; exceeding it aborts with EFBIG.
     clipboard_write_limit: usize,
 
     //---------------------------------------------------------------
@@ -1026,14 +1026,29 @@ pub const StreamHandler = struct {
     ) error{ OutOfMemory, WriteFailed }!void {
         const kitty_clipboard = terminal.kitty.clipboard;
 
-        // Decode and validate the metadata. Malformed metadata drops
-        // the packet without any response, matching kitty.
+        // Decode and validate the metadata. Malformed structure drops
+        // the packet without a response. Invalid decoded text on a write
+        // data or alias packet aborts an in-flight transaction.
         var arena: std.heap.ArenaAllocator = .init(self.alloc);
         defer arena.deinit();
-        const meta = (try kitty_clipboard.Metadata.parse(
+        const meta = (kitty_clipboard.Metadata.parse(
             arena.allocator(),
             v.metadata,
-        )) orelse return;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidValue => {
+                const state = self.kitty_clipboard_write orelse return;
+                switch (kitty_clipboard.Metadata.operation(v.metadata) orelse return) {
+                    .wdata, .walias => try self.kittyClipboardWriteFinish(
+                        state,
+                        .EINVAL,
+                        v.terminator,
+                    ),
+                    .read, .write => {},
+                }
+                return;
+            },
+        }) orelse return;
 
         switch (meta.op) {
             .read => try self.kittyClipboardRead(
@@ -1089,6 +1104,10 @@ pub const StreamHandler = struct {
                 return;
             },
         };
+        if (!decoded.isValidUtf8()) {
+            arena.deinit();
+            return;
+        }
 
         // The targets type ('.') asks for the listing of available
         // types rather than data. Requested types beyond the cap are
@@ -1218,8 +1237,8 @@ pub const StreamHandler = struct {
                 return error.OutOfMemory;
             },
 
-            // Non-text data over the write limit aborts the
-            // transaction: truncated binary data would be corrupt.
+            // Data over the write limit aborts the transaction and is
+            // reported to the client.
             error.TooLarge => try self.kittyClipboardWriteFinish(
                 state,
                 .EFBIG,
@@ -1235,10 +1254,15 @@ pub const StreamHandler = struct {
         payload: []const u8,
         terminator: terminal.osc.Terminator,
     ) error{ OutOfMemory, WriteFailed }!void {
-        // Aliases without a transaction or without a target MIME type
-        // are silently ignored, matching kitty.
+        // Aliases without a transaction are silently ignored. Once a
+        // transaction exists, a missing target MIME type is invalid and
+        // aborts the transaction.
         const state = self.kitty_clipboard_write orelse return;
-        if (meta.mime.len == 0) return;
+        if (meta.mime.len == 0) return self.kittyClipboardWriteFinish(
+            state,
+            .EINVAL,
+            terminator,
+        );
 
         state.alias(
             self.alloc,
@@ -1869,4 +1893,63 @@ test "kitty clipboard read: targets-only never consumes a one-time grant" {
     // ...so the follow-up data read is still granted, exactly once.
     try testing.expect(handler.kittyClipboardReadGranted("otp", 1));
     try testing.expect(!handler.kittyClipboardReadGranted("otp", 1));
+}
+
+test "kitty clipboard write: oversized text replies EFBIG" {
+    const testing = std.testing;
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = undefined,
+    };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.termio_mailbox = &mailbox;
+    handler.renderer_state = &renderer_state;
+    handler.clipboard_write = .allow;
+    handler.clipboard_write_limit = 4;
+    handler.kitty_clipboard_write = null;
+    defer handler.kittyClipboardWriteAbort();
+
+    const begin: terminal.kitty.clipboard.Metadata = .{
+        .op = .write,
+        .id = "macos",
+    };
+    try handler.kittyClipboardWriteBegin(&begin, .st);
+    const state = handler.kitty_clipboard_write.?;
+    try state.data(
+        testing.allocator,
+        &.{ .op = .wdata, .mime = "text/plain" },
+        "SGVsbA==", // "Hell"
+    );
+    try testing.expectError(error.TooLarge, state.data(
+        testing.allocator,
+        &.{ .op = .wdata, .mime = "text/plain" },
+        "bw==", // "o"
+    ));
+    try handler.kittyClipboardWriteFinish(state, .EFBIG, .st);
+    try testing.expect(handler.kitty_clipboard_write == null);
+
+    const response = mailbox.spsc.queue.pop(global.io());
+    try testing.expect(response != null);
+    const msg = response.?;
+    defer msg.deinit();
+    switch (msg) {
+        .write_alloc => |v| try testing.expectEqualStrings(
+            "\x1B]5522;type=write:status=EFBIG:id=macos\x1B\\",
+            v.data,
+        ),
+        else => try testing.expect(false),
+    }
+
+    // Teardown leaves no transaction that could be committed and
+    // forwarded to the macOS clipboard path.
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
 }

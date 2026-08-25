@@ -11,6 +11,9 @@
 //!     metadata section), an unknown or missing `type`, and invalid
 //!     base64 in `mime`, `name`, or `pw` all silently drop the request
 //!     with no response.
+//!   * Decoded metadata and MIME-list payloads must be valid UTF-8. An
+//!     invalid value on `wdata` or `walias`, or a `walias` without a
+//!     target MIME type, aborts an in-flight write with EINVAL.
 //!   * `mime`, `name`, and `pw` metadata values are base64-encoded UTF-8;
 //!     everything else is verbatim. Unknown keys are ignored.
 //!   * `id` is sanitized by stripping characters outside [a-zA-Z0-9-_+.]
@@ -21,11 +24,6 @@
 //!   * A `type=write` silently replaces any in-flight transaction. A
 //!     commit (`type=wdata` without a MIME type) with no in-flight
 //!     transaction is silently ignored.
-//!   * Oversized writes of text data are truncated and still complete
-//!     with DONE, matching kitty. Unlike kitty, oversized non-text data
-//!     fails the whole transaction with EFBIG instead: a truncated
-//!     image or other binary payload is corrupt, and the protocol has
-//!     no way to report partial success.
 //!   * Responses never send a payload section for an empty payload,
 //!     except the targets ('.') listing DATA packet which is always sent.
 //!

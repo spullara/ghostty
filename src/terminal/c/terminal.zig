@@ -5106,8 +5106,8 @@ test "set clipboard write max bytes" {
     try testing.expectEqual(Result.success, get(t, .clipboard_write_max_bytes, @ptrCast(&max)));
     try testing.expectEqual(@as(usize, kitty_clipboard.max_write_size), max);
 
-    // Set a tiny limit; an oversized non-text write fails with EFBIG
-    // and never reaches the callback.
+    // Set a tiny limit; an oversized text write fails with EFBIG and
+    // never reaches the callback.
     const limit: usize = 4;
     try testing.expectEqual(Result.success, set(t, .clipboard_write_max_bytes, @ptrCast(&limit)));
     try testing.expectEqual(Result.success, get(t, .clipboard_write_max_bytes, @ptrCast(&max)));
@@ -5115,7 +5115,8 @@ test "set clipboard write max bytes" {
 
     const seqs = [_][]const u8{
         "\x1B]5522;type=write:id=c1\x1B\\",
-        "\x1B]5522;type=wdata:mime=aW1hZ2UvcG5n;SGVsbG9Xb3JsZA==\x1B\\", // "HelloWorld"
+        "\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;SGVsbA==\x1B\\", // "Hell"
+        "\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;bw==\x1B\\", // "o"
         "\x1B]5522;type=wdata\x1B\\",
     };
     for (seqs) |seq| vt_write(t, seq.ptr, seq.len);

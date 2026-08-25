@@ -87,8 +87,8 @@ pub const Handler = struct {
 
     /// Maximum total decoded bytes accumulated by one Kitty clipboard
     /// protocol (OSC 5522) write transaction, captured when the
-    /// transaction begins. Text data beyond the limit is truncated;
-    /// non-text data fails the transaction with EFBIG.
+    /// transaction begins. Data beyond the limit fails the transaction
+    /// with EFBIG.
     kitty_clipboard_write_max_bytes: usize = kitty_clipboard.max_write_size,
 
     /// Called for sequence identifiers not supported by this library.
@@ -784,10 +784,24 @@ pub const Handler = struct {
         // Decode and validate the metadata.
         var arena: std.heap.ArenaAllocator = .init(self.terminal.gpa());
         defer arena.deinit();
-        const meta = (try kitty_clipboard.Metadata.parse(
+        const meta = (kitty_clipboard.Metadata.parse(
             arena.allocator(),
             v.metadata,
-        )) orelse return;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidValue => {
+                const state = self.kitty_clipboard_write orelse return;
+                switch (kitty_clipboard.Metadata.operation(v.metadata) orelse return) {
+                    .wdata, .walias => self.kittyClipboardFinish(
+                        state,
+                        .EINVAL,
+                        v.terminator,
+                    ),
+                    .read, .write => {},
+                }
+                return;
+            },
+        }) orelse return;
 
         const payload = v.payload orelse "";
         switch (meta.op) {
@@ -815,6 +829,7 @@ pub const Handler = struct {
             error.Invalid => return,
         };
         defer decoded.deinit(alloc);
+        if (!decoded.isValidUtf8()) return;
 
         // Without a clipboard_read effect nothing can serve the read.
         // EPERM is the protocol's denial so clients degrade gracefully.
@@ -1053,8 +1068,8 @@ pub const Handler = struct {
                 return error.OutOfMemory;
             },
 
-            // Non-text data over the write limit aborts the
-            // transaction: truncated binary data would be corrupt.
+            // Data over the write limit aborts the transaction and is
+            // reported to the client.
             error.TooLarge => self.kittyClipboardFinish(
                 state,
                 .EFBIG,
@@ -1069,10 +1084,15 @@ pub const Handler = struct {
         payload: []const u8,
         terminator: osc.Terminator,
     ) error{OutOfMemory}!void {
-        // Aliases without a transaction or without a target MIME type
-        // are silently ignored.
+        // Aliases without a transaction are silently ignored. Once a
+        // transaction exists, a missing target MIME type is invalid and
+        // aborts the transaction.
         const state = self.kitty_clipboard_write orelse return;
-        if (meta.mime.len == 0) return;
+        if (meta.mime.len == 0) return self.kittyClipboardFinish(
+            state,
+            .EINVAL,
+            terminator,
+        );
 
         state.alias(
             self.terminal.gpa(),
@@ -4236,7 +4256,7 @@ test "kitty clipboard new write replaces in-flight transaction" {
     );
 }
 
-test "kitty clipboard invalid walias payload aborts with EINVAL" {
+test "kitty clipboard invalid write packets abort with EINVAL" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
 
@@ -4249,25 +4269,71 @@ test "kitty clipboard invalid walias payload aborts with EINVAL" {
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
+    const invalid_packets = [_][]const u8{
+        // Alias payload decodes to a non-UTF-8 byte.
+        "\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;/w==\x1B\\",
+        // Alias has no target MIME type.
+        "\x1B]5522;type=walias;VEVYVA==\x1B\\",
+        // Alias target MIME decodes to non-UTF-8 bytes.
+        "\x1B]5522;type=walias:mime=//4=;VEVYVA==\x1B\\",
+        // Write data MIME decodes to non-UTF-8 bytes.
+        "\x1B]5522;type=wdata:mime=//4=;R2hvc3Q=\x1B\\",
+    };
+
+    for (invalid_packets) |packet| {
+        S.responses_len = 0;
+        s.nextSlice("\x1B]5522;type=write:id=w\x1B\\");
+        s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+        s.nextSlice(packet);
+        try testing.expectEqualStrings(
+            "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+            S.responseSlice(),
+        );
+        try testing.expect(!s.handler.semantic_failure);
+
+        // The transaction is gone: a commit does nothing further.
+        s.nextSlice("\x1B]5522;type=wdata\x1B\\");
+        try testing.expectEqual(@as(usize, 0), S.write_count);
+        try testing.expectEqualStrings(
+            "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+            S.responseSlice(),
+        );
+    }
+}
+
+test "kitty clipboard invalid read text does not abort a write" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = KittyClipboardCapture;
+    S.reset();
+    S.read_result = .{ .success = .{} };
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
     s.nextSlice("\x1B]5522;type=write:id=w\x1B\\");
     s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
-    s.nextSlice("\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;!!!\x1B\\");
-    try testing.expectEqualStrings(
-        "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
-        S.responseSlice(),
-    );
-    try testing.expect(!s.handler.semantic_failure);
 
-    // The transaction is gone: a commit does nothing further.
+    // The read payload decodes to a non-UTF-8 byte. It is dropped without
+    // invoking the clipboard effect or disturbing the write transaction.
+    s.nextSlice("\x1B]5522;type=read;/w==\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.read_count);
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+
     s.nextSlice("\x1B]5522;type=wdata\x1B\\");
-    try testing.expectEqual(@as(usize, 0), S.write_count);
+    try testing.expectEqual(@as(usize, 1), S.write_count);
     try testing.expectEqualStrings(
-        "\x1B]5522;type=write:status=EINVAL:id=w\x1B\\",
+        "\x1B]5522;type=write:status=DONE:id=w\x1B\\",
         S.responseSlice(),
     );
 }
 
-test "kitty clipboard oversized non-text write aborts with EFBIG" {
+test "kitty clipboard oversized text write aborts with EFBIG" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
 
@@ -4281,18 +4347,21 @@ test "kitty clipboard oversized non-text write aborts with EFBIG" {
     defer s.deinit();
 
     // Shrink the limit so the test doesn't have to stream the
-    // default 32MiB.
+    // default 64MiB.
     s.handler.kitty_clipboard_write_max_bytes = 4;
 
     s.nextSlice("\x1B]5522;type=write:id=w\x1B\\");
-    s.nextSlice("\x1B]5522;type=wdata:mime=aW1hZ2UvcG5n;SGVsbG9Xb3JsZA==\x1B\\");
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;SGVsbA==\x1B\\"); // "Hell"
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;bw==\x1B\\"); // "o"
     try testing.expectEqualStrings(
         "\x1B]5522;type=write:status=EFBIG:id=w\x1B\\",
         S.responseSlice(),
     );
     try testing.expect(!s.handler.semantic_failure);
 
-    // The transaction is gone: a commit does nothing further.
+    // The transaction is gone: later data and the commit do nothing.
+    s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;IQ==\x1B\\");
     s.nextSlice("\x1B]5522;type=wdata\x1B\\");
     try testing.expectEqual(@as(usize, 0), S.write_count);
     try testing.expectEqualStrings(

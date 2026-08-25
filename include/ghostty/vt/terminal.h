@@ -1529,16 +1529,15 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * when a transaction begins; an in-flight transaction keeps the limit
    * it started with.
    *
-   * Text data (text/* MIME types and the legacy X11 text names) beyond
-   * the limit is truncated at a UTF-8 boundary and the write still
-   * completes with DONE. Non-text data beyond the limit fails the whole
-   * transaction with EFBIG and nothing reaches the clipboard write
-   * callback, since binary formats are corrupted by truncation.
+   * Data beyond the limit fails the whole transaction with EFBIG. The
+   * transaction is discarded, later write-related packets are ignored
+   * until a new write begins, and nothing reaches the clipboard write
+   * callback.
    *
    * Transactions are buffered in memory, so this limit bounds how much
    * memory a single write can make the terminal allocate. Pass SIZE_MAX
    * to remove the limit. A NULL value pointer reverts to the built-in
-   * default of 32MiB.
+   * default of 64MiB, the minimum required by the protocol.
    *
    * This limit doesn't apply to OSC 52 writes, which are bounded by the
    * maximum length of an escape sequence instead.

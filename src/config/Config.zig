@@ -2459,29 +2459,26 @@ keybind: Keybinds = .{},
 /// This doesn't apply to OSC 52, which is limited by the maximum length
 /// of an escape sequence hardcoded into Ghostty for now.
 ///
-/// Text data (`text/*` MIME types) beyond this limit is truncated at
-/// a UTF-8 boundary and the write still completes successfully with
-/// the clipped text.
-///
-/// Non-text data beyond the limit instead fails the entire write with an
-/// `EFBIG` status and leaves the clipboard untouched, since binary formats
-/// such as images are corrupted by truncation.
+/// Data beyond the limit fails the entire write with an `EFBIG` status,
+/// discards the transaction, and leaves the clipboard untouched. Later
+/// write-related packets are ignored until a new write begins.
 ///
 /// The data is buffered in memory while the write is in progress, so
 /// this limit bounds how much memory a program can make Ghostty
 /// allocate per write. A future improvement will attempt to spool large
 /// writes to disk.
 ///
-/// Set this to `unlimited` to remove the limit, allowing writes bounded only
-/// by available memory. A value of `0` truncates every text write to empty
-/// contents and rejects every non-text write. To reject clipboard writes
-/// entirely, use `clipboard-write = deny` instead.
+/// The default is 64 MiB, the minimum a conforming implementation must
+/// accept. Set this to `unlimited` to remove the limit, allowing writes
+/// bounded only by available memory. A value of `0` rejects every non-empty
+/// write. To reject clipboard writes entirely, use `clipboard-write = deny`
+/// instead.
 ///
 /// This can be changed at runtime and applies to writes that begin
 /// after the change.
 ///
 /// Available since: 1.4.0
-@"clipboard-write-limit-bytes": Limit(usize, 32 * 1024 * 1024) = .default,
+@"clipboard-write-limit-bytes": Limit(usize, 64 * 1024 * 1024) = .default,
 
 /// Trims trailing whitespace on data that is copied to the clipboard. This does
 /// not affect data sent to the clipboard via `clipboard-write`. This only
@@ -11072,7 +11069,7 @@ test "clipboard write limit" {
     var cfg = try Config.default(alloc);
     defer cfg.deinit();
     try testing.expectEqual(
-        @as(usize, 32 * 1024 * 1024),
+        @as(usize, 64 * 1024 * 1024),
         cfg.@"clipboard-write-limit-bytes".value,
     );
 
