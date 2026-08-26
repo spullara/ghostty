@@ -136,6 +136,7 @@ class TerminalWindow: NSWindow {
             resetZoomAccessory.layoutAttribute = .right
             resetZoomAccessory.view = NSHostingView(rootView: ResetZoomAccessoryView(
                 viewModel: viewModel,
+                isInToolbar: true,
                 action: { [weak self] in
                     guard let self else { return }
                     self.terminalController?.splitZoom(self)
@@ -197,14 +198,8 @@ class TerminalWindow: NSWindow {
         super.close()
     }
 
-    override func becomeKey() {
-        super.becomeKey()
-        resetZoomTabButton.contentTintColor = .controlAccentColor
-    }
-
     override func resignKey() {
         super.resignKey()
-        resetZoomTabButton.contentTintColor = .secondaryLabelColor
         tabTitleEditor.finishEditing(commit: true)
     }
 
@@ -369,19 +364,16 @@ class TerminalWindow: NSWindow {
         }
     }
 
-    private lazy var resetZoomTabButton: NSButton = generateResetZoomButton()
+    private lazy var resetZoomTabButton: NSView = generateResetZoomButton()
 
-    private func generateResetZoomButton() -> NSButton {
-        let button = NSButton()
-        button.isHidden = true
-        button.target = terminalController
-        button.action = #selector(TerminalController.splitZoom(_:))
-        button.isBordered = false
-        button.allowsExpansionToolTips = true
-        button.toolTip = "Reset Zoom"
-        button.contentTintColor = isMainWindow ? .controlAccentColor : .secondaryLabelColor
-        button.state = .on
-        button.image = NSImage(named: "ResetZoom")
+    private func generateResetZoomButton() -> NSView {
+        let button = NSHostingView(rootView: ResetZoomAccessoryView(
+            viewModel: viewModel,
+            isInToolbar: false,
+            action: { [weak self] in
+                guard let self else { return }
+                self.terminalController?.splitZoom(self)
+            }))
         button.frame = NSRect(x: 0, y: 0, width: 20, height: 20)
         button.translatesAutoresizingMaskIntoConstraints = false
         button.widthAnchor.constraint(equalToConstant: 20).isActive = true
@@ -641,26 +633,35 @@ extension TerminalWindow {
 
     struct ResetZoomAccessoryView: View {
         @ObservedObject var viewModel: ViewModel
+        let isInToolbar: Bool
         let action: () -> Void
 
         var body: some View {
             if viewModel.isSurfaceZoomed {
-                VStack {
-                    Button(action: action) {
-                        Image("ResetZoom")
-                            .foregroundColor(viewModel.isMainWindow ? .accentColor : .secondary)
+                if isInToolbar {
+                    VStack {
+                        button
+                        Spacer()
                     }
-                    .buttonStyle(.plain)
-                    .help("Reset Split Zoom")
-                    .frame(width: 20, height: 20)
-                    Spacer()
+                    // With a toolbar, the window title is taller, so we need more padding
+                    // to properly align.
+                    .padding(.top, viewModel.accessoryTopPadding)
+                    // We always need space at the end of the titlebar
+                    .padding(.trailing, 10)
+                } else {
+                    button
                 }
-                // With a toolbar, the window title is taller, so we need more padding
-                // to properly align.
-                .padding(.top, viewModel.accessoryTopPadding)
-                // We always need space at the end of the titlebar
-                .padding(.trailing, 10)
             }
+        }
+
+        var button: some View {
+            Button(action: action) {
+                Image("ResetZoom")
+                    .foregroundColor(viewModel.isMainWindow ? .accentColor : .secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Reset Split Zoom")
+            .frame(width: 20, height: 20)
         }
     }
 
@@ -676,7 +677,6 @@ extension TerminalWindow {
                 .padding(.trailing, viewModel.accessoryTopPadding)
         }
     }
-
 }
 
 /// A small circle indicator displayed in the tab accessory view that shows
