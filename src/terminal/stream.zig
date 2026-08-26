@@ -718,7 +718,10 @@ pub fn Stream(comptime H: type) type {
                 var i: usize = 0;
                 while (i < cps.len) {
                     const cp = cps[i];
-                    if (cp <= 0xF) {
+                    // C0 controls execute rather than print. ESC can
+                    // never appear here because the decoder stops at it,
+                    // so this is every C0 except ESC.
+                    if (cp <= 0x1F) {
                         @branchHint(.unlikely);
                         self.execute(@intCast(cp));
                         i += 1;
@@ -735,7 +738,7 @@ pub fn Stream(comptime H: type) type {
                     scan: {
                         if (simd.lanes(u32)) |lanes| {
                             const V = @Vector(lanes, u32);
-                            const threshold: V = @splat(0xF);
+                            const threshold: V = @splat(0x1F);
                             while (end + lanes <= cps.len) {
                                 const v: V = cps[end..][0..lanes].*;
                                 const gt = v > threshold;
@@ -747,7 +750,7 @@ pub fn Stream(comptime H: type) type {
                                 end += lanes;
                             }
                         }
-                        while (end < cps.len and cps[end] > 0xF) end += 1;
+                        while (end < cps.len and cps[end] > 0x1F) end += 1;
                     }
                     self.handler.vt(.print_slice, .{ .cps = cps[i..end] });
                     i = end;
@@ -1146,15 +1149,17 @@ pub fn Stream(comptime H: type) type {
             @setEvalBranchQuota(200_000);
 
             // C0 control
-            if (c <= 0xF) {
+            if (c <= 0x1F) {
                 @branchHint(.unlikely);
+
+                // ESC
+                if (c == 0x1B) {
+                    self.parser.state = .escape;
+                    self.parser.clear();
+                    return;
+                }
+
                 self.execute(@intCast(c));
-                return;
-            }
-            // ESC
-            if (c == 0x1B) {
-                self.parser.state = .escape;
-                self.parser.clear();
                 return;
             }
             self.print(@intCast(c));
@@ -3113,6 +3118,72 @@ test "simd: complete incomplete utf-8" {
     try testing.expect(s.handler.c == null);
     s.nextSlice(&.{0x80});
     try testing.expectEqual(@as(u21, 0x800), s.handler.c.?);
+}
+
+test "stream: ground state C0 controls are executed, not printed" {
+    const H = struct {
+        buf: [128]u21 = undefined,
+        len: usize = 0,
+
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            switch (action) {
+                .print => {
+                    self.buf[self.len] = value.cp;
+                    self.len += 1;
+                },
+                .print_slice => for (value.cps) |cp| {
+                    self.buf[self.len] = @intCast(cp);
+                    self.len += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    // Every C0 control except ESC must never produce a print action
+    // in the ground state. ESC is excluded because it begins an
+    // escape sequence rather than executing.
+    for (0..0x20) |c| {
+        if (c == 0x1B) continue;
+
+        // Scalar path.
+        {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            s.next('A');
+            s.next(@intCast(c));
+            s.next('B');
+            try testing.expectEqual(@as(usize, 2), s.handler.len);
+            try testing.expectEqual(@as(u21, 'A'), s.handler.buf[0]);
+            try testing.expectEqual(@as(u21, 'B'), s.handler.buf[1]);
+        }
+
+        // Batched path.
+        {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            s.nextSlice(&.{ 'A', 'B', @intCast(c), 'C', 'D' });
+            try testing.expectEqual(@as(usize, 4), s.handler.len);
+            for ("ABCD", 0..) |expected, i| {
+                try testing.expectEqual(@as(u21, expected), s.handler.buf[i]);
+            }
+        }
+
+        // Batched path with a run long enough to exercise the
+        // vectorized printable-run scan on either side of the control.
+        {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            var input: [65]u8 = @splat('A');
+            input[32] = @intCast(c);
+            s.nextSlice(&input);
+            try testing.expectEqual(@as(usize, 64), s.handler.len);
+            for (s.handler.buf[0..s.handler.len]) |cp| {
+                try testing.expectEqual(@as(u21, 'A'), cp);
+            }
+        }
+    }
 }
 
 test "stream: cursor right (CUF)" {
