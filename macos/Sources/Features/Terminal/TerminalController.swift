@@ -1386,21 +1386,58 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // if we're closing the window. If we don't have a tabgroup for any
         // reason we check ourselves.
         let windows: [NSWindow] = window.tabGroup?.windows ?? [window]
-        guard let confirmController = windows
+        let confirmControllers = windows
             .compactMap({ $0.windowController as? TerminalController })
-            .first(where: { $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })
+            .filter({ $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })
+        guard
+            !confirmControllers.isEmpty
         else {
             closeWindowImmediately()
             return
         }
+        if confirmControllers.count == 1 {
+            // We call confirmClose on the proper controller so the alert is
+            // attached to the window that needs confirmation.
+            confirmControllers[0].confirmClose(
+                messageText: "Close Window?",
+                informativeText: "All terminal sessions in this window will be terminated.",
+            ) {
+                self.closeWindowImmediately()
+            }
+            return
+        }
 
-        // We call confirmClose on the proper controller so the alert is
-        // attached to the window that needs confirmation.
-        confirmController.confirmClose(
-            messageText: "Close Window?",
-            informativeText: "All terminal sessions in this window will be terminated.",
-        ) {
-            self.closeWindowImmediately()
+        Task {
+            let alert = NSAlert.reviewWindowsAlert(
+                messageText: "You have \(confirmControllers.count) windows with running processes. Do you want to review these windows before closing?",
+                terminateNowButtonTitle: "Close"
+            )
+            switch await alert.beginSheetModal(for: window) {
+            case .alertFirstButtonReturn:
+                await reviewWindows(confirmControllers, window: window)
+            case .alertSecondButtonReturn:
+                closeWindowImmediately()
+            default:
+                break
+            }
+        }
+    }
+
+    private func reviewWindows(_ controllers: [TerminalController], window: NSWindow) async {
+        for controller in controllers {
+            let response = await controller.confirmCloseAsync(
+                messageText: "Close Window?",
+                informativeText: "All terminal sessions in this window will be terminated.",
+            )
+
+            if [.OK, .alertFirstButtonReturn].contains(response) {
+                // Close this tab
+                controller.closeTabImmediately()
+                continue
+            } else {
+                // Cancel the review
+                return
+            }
         }
     }
 
