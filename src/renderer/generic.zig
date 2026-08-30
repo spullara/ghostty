@@ -1194,8 +1194,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const should_run =
                 // Non-visible windows never vsync
                 self.visible and
-                // Non-focused windows only render on-demand
-                self.focused and
                 // Only vsync if we have cell changes or animation
                 (self.cells_rebuilt or self.animationWake() != null);
 
