@@ -349,6 +349,16 @@ comptime {
             @export(&c.selection_gesture_event_free, .{ .name = "ghostty_selection_gesture_event_free" });
             @export(&c.selection_gesture_event_set, .{ .name = "ghostty_selection_gesture_event_set" });
         }
+        if (features.search) {
+            @export(&c.search_new, .{ .name = "ghostty_search_new" });
+            @export(&c.search_free, .{ .name = "ghostty_search_free" });
+            @export(&c.search_tick, .{ .name = "ghostty_search_tick" });
+            @export(&c.search_feed, .{ .name = "ghostty_search_feed" });
+            @export(&c.search_run, .{ .name = "ghostty_search_run" });
+            @export(&c.search_set, .{ .name = "ghostty_search_set" });
+            @export(&c.search_get, .{ .name = "ghostty_search_get" });
+            @export(&c.search_get_multi, .{ .name = "ghostty_search_get_multi" });
+        }
         // Selections are expressed in grid references, so the untracked
         // reference constructors are required by both features.
         if (features.grid_introspection or features.selection) {

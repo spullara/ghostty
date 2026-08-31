@@ -88,6 +88,15 @@ pub const Options = struct {
         /// `ghostty_terminal_selection_*`, `ghostty_selection_gesture_*`.
         selection: bool = true,
 
+        /// Terminal search: find matches for a string in the active
+        /// area and scrollback (ASCII case-insensitive), with results
+        /// that survive primary/alternate screen switches, resize, and
+        /// scrollback pruning, plus match selection with wrap-around
+        /// and viewport scrolling. Used to implement find bars.
+        ///
+        /// C API: `ghostty_search_*`.
+        search: bool = true,
+
         /// The render state API: a coherent, update-in-place view of
         /// the visible screen (rows, cells, styles, cursor, colors,
         /// palette) designed to drive a renderer at frame rates. This
