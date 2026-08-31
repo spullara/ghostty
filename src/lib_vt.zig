@@ -424,6 +424,15 @@ comptime {
 pub const std_options: std.Options = opts: {
     var options: std.Options = .{};
 
+    if (native_freestanding) {
+        // Freestanding targets don't have an OS page size. We still need an
+        // alignment for terminal page allocations, and 16 covers everything
+        // stored in a page without requiring 4 KiB-aligned embedded heaps.
+        options.page_size_min = 16;
+        options.page_size_max = 16;
+        options.allow_stack_tracing = false;
+    }
+
     if (builtin.target.cpu.arch.isWasm()) {
         // In non-debug modes, we want to ship effectively no logging
         // warn and lower add ~200KB at the time of this comment.
@@ -464,10 +473,14 @@ pub const std_options: std.Options = opts: {
 /// traces on panic, std.debug.print, etc.). These builds are for
 /// development, where the roughly 160KB of binary size it costs is
 /// worth it.
-const debug_machinery: bool = builtin.is_test or switch (builtin.mode) {
-    .Debug, .ReleaseSafe => true,
-    .ReleaseFast, .ReleaseSmall => false,
-};
+const native_freestanding = builtin.target.os.tag == .freestanding and
+    !builtin.target.cpu.arch.isWasm();
+
+const debug_machinery: bool = !native_freestanding and
+    (builtin.is_test or switch (builtin.mode) {
+        .Debug, .ReleaseSafe => true,
+        .ReleaseFast, .ReleaseSmall => false,
+    });
 
 /// The panic handler for when this file is the root module.
 ///

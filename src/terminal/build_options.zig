@@ -263,8 +263,7 @@ pub const Options = struct {
     /// targets, so it is always disabled there regardless of the
     /// feature setting.
     pub fn kittyGraphics(self: Options, target: std.Target) bool {
-        if (target.cpu.arch == .wasm32 and target.os.tag == .freestanding)
-            return false;
+        if (target.os.tag == .freestanding) return false;
         return self.features.kitty_graphics;
     }
 
