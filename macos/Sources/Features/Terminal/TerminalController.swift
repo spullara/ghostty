@@ -283,12 +283,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             }
         }
 
+        // We moved out showWindow again because it involves positioning and we need to
+        // apply the cascading in the next event loop tick after the position changes.
+        // This is still our guess, but at least it's working so far.
+        c.showWindowSafely(self)
         // We're dispatching this async because otherwise the lastCascadePoint doesn't
         // take effect. Our best theory is there is some next-event-loop-tick logic
         // that Cocoa is doing that we need to be after.
         c.scheduleInitialPresentation {
-            c.showWindow(self)
-
             // Only cascade if we aren't fullscreen.
             if let window = c.window {
                 if !window.styleMask.contains(.fullScreen) {
@@ -353,8 +355,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             c.isBackgroundOpaque = inheritBackgroundOpacity
         }
 
+        c.showWindowSafely(self)
         c.scheduleInitialPresentation {
-            c.showWindow(self)
             if let window = c.window {
                 // If we have a tree size, resize the window's content to match
                 if let treeSize, treeSize.width > 0, treeSize.height > 0 {
