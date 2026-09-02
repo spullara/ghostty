@@ -48,7 +48,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     /// The initial window presentation is deferred by one runloop turn in a few places so
     /// AppKit can settle tab/window state first. Close actions must cancel it to avoid
-    /// re-showing a tab that was already closed.
+    /// re-showing a tab/window that was already closed.
     private var pendingInitialPresentation: DispatchWorkItem?
 
     /// This is set to false by init if the window managed by this controller should not be restorable.
@@ -283,18 +283,22 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             }
         }
 
-        // We moved out showWindow again because it involves positioning and we need to
-        // apply the cascading in the next event loop tick after the position changes.
-        // This is still our guess, but at least it's working so far.
-        c.showWindowSafely(self)
-        // We're dispatching this async because otherwise the lastCascadePoint doesn't
-        // take effect. Our best theory is there is some next-event-loop-tick logic
-        // that Cocoa is doing that we need to be after.
         c.scheduleInitialPresentation {
+            // We're dispatching this async because in some cases AppKit will tab this window,
+            // although we have a check in `windowDidLoad` and it works in most cases, but not for AppIntent
+            //
+            // That weird tabbing behavior only happens in the following cases at the point of writing.
+            // - Creating a window via the Shortcuts app for now.
+            // - Creating a window via `New Ghostty Window Here` service.
+            c.showWindowSafely(self)
+
             // Only cascade if we aren't fullscreen.
             if let window = c.window {
                 if !window.styleMask.contains(.fullScreen) {
                     let hasFixedPos = c.derivedConfig.windowPositionX != nil && c.derivedConfig.windowPositionY != nil
+                    // We're dispatching this async because otherwise the lastCascadePoint doesn't
+                    // take effect. Our best theory is there is some next-event-loop-tick logic
+                    // that Cocoa is doing that we need to be after.
                     Self.applyCascade(to: window, hasFixedPos: hasFixedPos)
                 }
             }
@@ -355,6 +359,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             c.isBackgroundOpaque = inheritBackgroundOpacity
         }
 
+        // Showing window in current event loop works so far with dragging surface into
+        // a new window, but remember to defer the cascade when you move it inside
+        // `scheduleInitialPresentation` to solve other issues in the future.
         c.showWindowSafely(self)
         c.scheduleInitialPresentation {
             if let window = c.window {
@@ -480,9 +487,19 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             }
         }
 
+        // showWindow makes regular windows key and ordered front. AppKit can
+        // throw while selecting a tab if its fullscreen stack is inconsistent,
+        // so this must cross the Objective-C exception bridge.
+        // We don't need to dispatch this because `tabbingMode = .disallowed`
+        // for HiddenTitlebarTerminalWindow.
+        controller.showWindowSafely(self)
+
+        // Windows with `macos-titlebar-style = hidden` create new windows when the
+        // new tab binding is pressed, we should cascade those windows as well.
+
         // We're dispatching this async because otherwise the lastCascadePoint doesn't
-        // take effect. Our best theory is there is some next-event-loop-tick logic
-        // that Cocoa is doing that we need to be after.
+        // take effect after position in `showWindow`. Our best theory is there is some
+        // next-event-loop-tick logic that Cocoa is doing that we need to be after.
         controller.scheduleInitialPresentation {
             // Only cascade if we aren't fullscreen and are alone in the tab group.
             if !window.styleMask.contains(.fullScreen) &&
@@ -490,11 +507,6 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 let hasFixedPos = controller.derivedConfig.windowPositionX != nil && controller.derivedConfig.windowPositionY != nil
                 Self.applyCascade(to: window, hasFixedPos: hasFixedPos)
             }
-
-            // showWindow makes regular windows key and ordered front. AppKit can
-            // throw while selecting a tab if its fullscreen stack is inconsistent,
-            // so this must cross the Objective-C exception bridge.
-            controller.showWindowSafely(self)
 
             // We also activate our app so that it becomes front. This may be
             // necessary for the dock menu.
