@@ -12,7 +12,7 @@ const fastmem = @import("../fastmem.zig");
 const simd = @import("../simd/main.zig");
 const tripwire = @import("../tripwire.zig");
 const DoublyLinkedList = @import("../datastruct/main.zig").IntrusiveDoublyLinkedList;
-const WasmPagePool = @import("../datastruct/main.zig").WasmPagePool;
+const datastruct = @import("../datastruct/main.zig");
 const color = @import("color.zig");
 const compression = @import("compress.zig");
 const highlight = @import("highlight.zig");
@@ -313,7 +313,7 @@ const std_size = Page.layout(std_capacity).total_size;
 /// through a free list shared by the whole module instance instead of
 /// dying with the pool.
 ///
-/// Test builds use the std pool even on wasm so that pool memory goes
+/// Test builds use the native pool even on wasm so that pool memory goes
 /// through the testing allocator and participates in leak detection.
 const wasm_page_pool = builtin.target.cpu.arch.isWasm() and !builtin.is_test;
 
@@ -321,12 +321,20 @@ const wasm_page_pool = builtin.target.cpu.arch.isWasm() and !builtin.is_test;
 /// so we can allocate these with a page allocator. We have to use a page
 /// allocator because we need memory that is zero-initialized and page-aligned.
 const PagePool = if (wasm_page_pool)
-    WasmPagePool([std_size]u8)
-else
-    std.heap.memory_pool.AlignedManaged(
+    datastruct.WasmPagePool([std_size]u8)
+else untouched: {
+    // Untouched pools never read/write to the items so that we can
+    // use demand-paging on operating systems that support it. This makes
+    // it so that an idle item in the pool costs no physical memory,
+    // only virtual memory.
+    //
+    // Contract for PageList is that every path that returns an item
+    // to the pool must zero it.
+    break :untouched datastruct.UntouchedPool(
         [std_size]u8,
         .fromByteUnits(std.heap.page_size_min),
     );
+};
 
 /// List of pins, known as "tracked" pins. These are pins that are kept
 /// up to date automatically through page-modifying operations.
@@ -350,7 +358,7 @@ pub const MemoryPool = struct {
     ) Allocator.Error!MemoryPool {
         var node_pool = try NodePool.initCapacity(gen_alloc, preheat);
         errdefer node_pool.deinit();
-        var page_pool = try PagePool.initCapacity(page_alloc, preheat);
+        var page_pool = try PagePool.initCapacity(gen_alloc, page_alloc, preheat);
         errdefer page_pool.deinit();
         var pin_pool = try PinPool.initCapacity(gen_alloc, 8);
         errdefer pin_pool.deinit();
@@ -636,6 +644,7 @@ pub fn init(
         cols,
         rows,
     );
+    errdefer releasePages(&pool, page_list);
 
     var limits: Limits = .init(cols, rows);
     limits.set(.bytes, opts.max_size);
@@ -698,17 +707,8 @@ fn initPages(
     // redundant here for safety.
     assert(layout.total_size <= size.max_page_size);
 
-    // If we have an error, we need to clean up our pages: heap-owned
-    // pages are freed directly and pool-owned pages are reclaimed.
-    errdefer {
-        var it = page_list.first;
-        while (it) |node| : (it = node.next) {
-            switch (node.owned) {
-                .pool => reclaimPoolPage(pool, node.page()),
-                .heap => page_alloc.free(node.page().memory),
-            }
-        }
-    }
+    // If we have an error, we need to release the pages we created.
+    errdefer releasePages(pool, page_list);
 
     var rem = rows;
     while (rem > 0) {
@@ -897,18 +897,42 @@ fn verifyIntegrity(self: *const PageList) IntegrityError!void {
     }
 }
 
-/// Return a pool-owned page buffer to the page pool during a teardown
-/// walk, zeroed for reuse (mirroring destroyNodeExt). Teardown walks
-/// call this unconditionally for every pool-owned page.
-fn reclaimPoolPage(pool: *MemoryPool, page: *const Page) void {
-    // Only wasm requires this
-    if (comptime !wasm_page_pool) return;
+/// Release every page in the list during a teardown walk (deinit,
+/// reset, or an errdefer unwinding a partially built list): heap-owned
+/// pages go back to the page allocator and pool-owned pages back to the
+/// page pool. The nodes themselves are not touched; they live in the
+/// node pool.
+fn releasePages(pool: *MemoryPool, list: List) void {
+    const page_alloc = pool.pages.allocator;
+    var it = list.first;
+    while (it) |node| : (it = node.next) {
+        const page = node.restore(.discard);
+        switch (node.owned) {
+            .pool => releasePoolPage(pool, page),
+            .heap => page_alloc.free(page.memory),
+        }
+    }
+}
 
+/// Release a pool-owned page during a teardown walk. Unlike
+/// destroyNodeExt, this does not zero the page: on native, the item goes
+/// straight back to the page allocator, and zeroing it first would write
+/// the whole page (and fault a decommitted mapping back in) only for it
+/// to be unmapped.
+fn releasePoolPage(pool: *MemoryPool, page: *const Page) void {
     const item: *align(std.heap.page_size_min) [std_size]u8 =
         @ptrCast(@alignCast(page.memory.ptr));
-    // We have to zero the item
-    _ = terminal_mem.decommit(.zero, item, page.memory.len);
-    pool.pages.destroy(item);
+
+    // The wasm pool's items are shared by every pool in the module and
+    // never return to the allocator, so they go back to the free list
+    // zeroed for reuse (mirroring destroyNodeExt).
+    if (comptime wasm_page_pool) {
+        _ = terminal_mem.decommit(.zero, item, page.memory.len);
+        pool.pages.destroy(item);
+        return;
+    }
+
+    pool.pages.release(item);
 }
 
 /// Deinit the pagelist, freeing all page memory and the memory pool.
@@ -919,20 +943,9 @@ pub fn deinit(self: *PageList) void {
     // Always deallocate our hashmap.
     self.tracked_pins.deinit(self.pool.alloc);
 
-    // Go through our linked list and release every page: heap-owned
-    // pages are freed directly and pool-owned pages are reclaimed.
-    const page_alloc = self.pool.pages.allocator;
-    var it = self.pages.first;
-    while (it) |node| : (it = node.next) {
-        const page = node.restore(.discard);
-        switch (node.owned) {
-            .pool => reclaimPoolPage(&self.pool, page),
-            .heap => page_alloc.free(page.memory),
-        }
-    }
-
-    // Deallocate all the pages. We don't need to deallocate the list or
+    // Release every page. We don't need to deallocate the list or
     // nodes because they all reside in the pool.
+    releasePages(&self.pool, self.pages);
     self.pool.deinit();
 }
 
@@ -968,83 +981,24 @@ pub fn reset(self: *PageList) void {
         cap.rows,
     ) catch unreachable;
 
-    // Before resetting our pools we need to release our pages:
-    // heap-owned pages are freed since they were allocated outside
-    // the pool, and pool-owned pages are reclaimed.
-    {
-        const page_alloc = self.pool.pages.allocator;
-        var it = self.pages.first;
-        while (it) |node| : (it = node.next) {
-            const page = node.restore(.discard);
-            switch (node.owned) {
-                .pool => reclaimPoolPage(&self.pool, page),
-                .heap => page_alloc.free(page.memory),
-            }
-        }
-    }
+    // Before resetting our pools we need to release our pages: heap-owned
+    // pages go back to the page allocator and pool-owned pages back to
+    // the page pool.
+    releasePages(&self.pool, self.pages);
 
     // Reset our pools to free as much memory as possible while retaining
     // the capacity for at least the minimum number of pages we need.
     // The return value is whether memory was reclaimed or not, but in
     // either case the pool is left in a valid state.
+    //
+    // Retained page pool items are zero (see PagePool), so there is
+    // nothing to scrub before initPages reuses them.
     _ = self.pool.pages.reset(.{
         .retain_with_limit = page_count * PagePool.item_size,
     });
     _ = self.pool.nodes.reset(.{
         .retain_with_limit = page_count * NodePool.item_size,
     });
-
-    // Our page pool relies on mmap to zero our page memory. Since we're
-    // retaining a certain amount of memory, it won't use mmap and won't
-    // be zeroed. This block zeroes out all the memory in the pool arena.
-    //
-    // The wasm page pool has no arena to scrub: its free-list items were
-    // zeroed by reclaimPoolPage above.
-    //
-    // Note: we only have to do this for the page pool because the nodes are
-    // always fully overwritten on each allocation.
-    if (comptime !wasm_page_pool) {
-        inline for (.{
-            self.pool.pages.unmanaged.arena_state.used_list,
-            self.pool.pages.unmanaged.arena_state.free_list,
-        }) |first| {
-            var node_ = first;
-            while (node_) |node| : (node_ = node.next) {
-                // NOTE: Zig 0.16.0's arenas don't use the linked list types
-                // anymore, so we can just reference fields directly. The node
-                // type is still private though, so we have to parse out some
-                // of the internal methods to work with the buffer - namely
-                // Node.loadBuf and Node.Size.toInt. They are combined below.
-                //
-                // PS: My (vancluever's) reading of the code gives me the
-                // impression that we no longer need to offset the data by the
-                // header, because there's no linked list overhead anymore. But
-                // I'm sure we'll see pretty quick when I run the tests. :)
-                //
-                const BufNode = struct {
-                    size: Size,
-                    end_index: usize,
-                    next: ?*@This(),
-
-                    const Size = packed struct(usize) {
-                        resizing: bool,
-                        _: @Int(.unsigned, @bitSizeOf(usize) - 1) = 0,
-
-                        fn toInt(s: Size) usize {
-                            var int = s;
-                            int.resizing = false;
-                            return @bitCast(int);
-                        }
-                    };
-                };
-
-                const buf_node_ptr: *BufNode = @ptrCast(node);
-                const buf_node_size = @atomicLoad(BufNode.Size, &buf_node_ptr.size, .monotonic);
-                const buf = @as([*]u8, @ptrCast(node))[0..buf_node_size.toInt()][@sizeOf(BufNode)..];
-                @memset(buf, 0);
-            }
-        }
-    }
 
     // Initialize our pages. This should not be able to fail since
     // we retained the capacity for the minimum number of pages we need.
@@ -1140,16 +1094,7 @@ pub fn clone(
 
     // Our list of pages
     var page_list: List = .{};
-    errdefer {
-        const page_alloc = pool.pages.allocator;
-        var page_it = page_list.first;
-        while (page_it) |node| : (page_it = node.next) {
-            switch (node.owned) {
-                .pool => reclaimPoolPage(&pool, node.page()),
-                .heap => page_alloc.free(node.page().memory),
-            }
-        }
-    }
+    errdefer releasePages(&pool, page_list);
 
     // Copy our pages
     var page_serial: u64 = 0;
@@ -1164,6 +1109,11 @@ pub fn clone(
             &page_serial,
             &page_size,
         );
+
+        // Add the page to the list immediately so that the errdefer
+        // above releases it if cloning fails.
+        page_list.append(node);
+
         const dst_page = node.page();
         const src_page = chunk.node.page();
         assert(node.capacity().rows >= chunk.end - chunk.start);
@@ -1177,8 +1127,6 @@ pub fn clone(
         );
 
         dst_page.dirty = src_page.dirty;
-
-        page_list.append(node);
 
         total_rows += node.rows();
 
@@ -4586,12 +4534,9 @@ inline fn createPageExt(
     // (WASM), the WasmAllocator reuses freed slots without zeroing.
     //
     // Otherwise, we rely on pool item buffers being zeroed: fresh items
-    // come from the OS page allocator (zeroed pages) and destroyNodeExt
-    // zeroes buffers before returning them to the pool. The one
-    // exception is the first pointer-size bytes, which hold the pool's
-    // free list node while a buffer is in the free list; initBuf below
-    // always overwrites those since the page rows start at offset 0
-    // (comptime-asserted in Page).
+    // come from the OS page allocator (zeroed pages), destroyNodeExt
+    // zeroes buffers before returning them to the pool, and the pool
+    // never writes into its items (see PagePool).
     if (comptime std.debug.runtime_safety or builtin.os.tag == .freestanding)
         @memset(page_buf, 0);
 
@@ -20401,4 +20346,76 @@ test "PageList resize trimmed rows have default state" {
         try testing.expectEqual(.none, rac.row.semantic_prompt);
         try testing.expect(rac.cell.isZero());
     }
+}
+
+test "PageList memory pool never touches idle page memory" {
+    const testing = std.testing;
+    const preheat = page_preheat;
+
+    // Back the page allocator with memory we can inspect.
+    const backing = try testing.allocator.alignedAlloc(
+        u8,
+        .fromByteUnits(std.heap.page_size_min),
+        preheat * std_size,
+    );
+    defer testing.allocator.free(backing);
+    var fba: std.heap.FixedBufferAllocator = .init(backing);
+
+    var pool: MemoryPool = try .init(testing.allocator, fba.allocator(), preheat);
+    defer pool.deinit();
+
+    // Preheat allocated exactly the items.
+    try testing.expectEqual(preheat * std_size, fba.end_index);
+
+    // Lay the sentinel down after preheat: allocation itself may write
+    // (the Allocator interface fills fresh memory with undefined in
+    // safe builds, which valgrind also tracks). The sentinel must differ
+    // from Zig's 0xAA undefined pattern so that any write is visible.
+    const sentinel: u8 = 0x5A;
+    @memset(backing, sentinel);
+
+    // Every preheated item is handed out untouched and without going
+    // back to the page allocator, and destroying it doesn't touch it.
+    var items: [preheat]PagePool.ItemPtr = undefined;
+    for (&items) |*item| {
+        item.* = try pool.pages.create();
+        try testing.expectEqual(preheat * std_size, fba.end_index);
+        try testing.expect(std.mem.allEqual(u8, item.*, sentinel));
+    }
+    for (items) |item| pool.pages.destroy(item);
+    try testing.expect(std.mem.allEqual(u8, backing, sentinel));
+}
+
+test "PageList memory pool fast path does not allocate" {
+    const testing = std.testing;
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+
+    var pool: MemoryPool = try .init(
+        testing.allocator,
+        counting.allocator(),
+        page_preheat,
+    );
+    defer pool.deinit();
+    try testing.expectEqual(page_preheat, counting.allocations);
+
+    // Cycle a few thousand pages through the preheated items. As long
+    // as no more than the preheat are live at once, create is a
+    // free-list pop and never touches the page allocator.
+    var items: [page_preheat]PagePool.ItemPtr = undefined;
+    for (0..1024) |_| {
+        for (&items) |*item| item.* = try pool.pages.create();
+        for (items) |item| pool.pages.destroy(item);
+    }
+    try testing.expectEqual(page_preheat, counting.allocations);
+    try testing.expectEqual(0, counting.deallocations);
+
+    // Going past the preheat allocates the extra items once; they are
+    // recycled from then on.
+    var extra: [page_preheat + 2]PagePool.ItemPtr = undefined;
+    for (0..1024) |_| {
+        for (&extra) |*item| item.* = try pool.pages.create();
+        for (extra) |item| pool.pages.destroy(item);
+    }
+    try testing.expectEqual(extra.len, counting.allocations);
+    try testing.expectEqual(0, counting.deallocations);
 }

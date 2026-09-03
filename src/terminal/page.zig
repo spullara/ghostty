@@ -151,15 +151,6 @@ pub const Page = struct {
             @alignOf(Cell),
             StyleSet.base_align.toByteUnits(),
         ) == 0);
-
-        // The PageList memory pool requires that initBuf overwrites at
-        // least the first pointer-size bytes of the backing buffer:
-        // std.heap.MemoryPool stores its free list node there when a
-        // page buffer is returned to it, and pool reuse skips zeroing
-        // in release builds. This holds because the rows array is at
-        // offset 0 (see layout), a page always has at least one row,
-        // and initBuf fully rewrites every row.
-        assert(@sizeOf(Row) >= @sizeOf(usize));
     }
 
     /// The backing memory for the page. A page is always made up of a
@@ -254,10 +245,7 @@ pub const Page = struct {
     pub inline fn initBuf(buf: OffsetBuf, l: Layout) Page {
         const cap = l.capacity;
 
-        // A page must always have at least one row. Aside from being
-        // useless otherwise, the row initialization below must always
-        // overwrite the start of the buffer for pool reuse. See the
-        // comptime assert at the top of Page.
+        // A page must always have at least one row.
         assert(cap.rows > 0);
 
         const rows = buf.member(Row, l.rows_start);
@@ -1745,10 +1733,6 @@ pub const Page = struct {
     pub inline fn layout(cap: Capacity) Layout {
         const rows_count: usize = @intCast(cap.rows);
 
-        // The rows array must stay at offset 0: the PageList memory
-        // pool relies on initBuf overwriting the first bytes of a
-        // reused page buffer, which hold the pool's free list node.
-        // See the comptime assert at the top of Page.
         const rows_start = 0;
         const rows_end: usize = rows_start + (rows_count * @sizeOf(Row));
 
