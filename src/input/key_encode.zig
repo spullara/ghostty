@@ -379,42 +379,10 @@ fn legacy(
         return try writer.writeAll(sequence);
     }
 
-    // If we match a control sequence, we output that directly. For
-    // ctrlSeq we have to use all mods because we want it to only
-    // match ctrl+<char>.
-    if (ctrlSeq(
-        event.key,
-        event.utf8,
-        event.unshifted_codepoint,
-        all_mods,
-    )) |char| {
-        // C0 sequences support alt-as-esc prefixing.
-        if (binding_mods.alt) {
-            try writer.writeByte(0x1B);
-            try writer.writeByte(char);
-            return;
-        }
-
-        try writer.writeByte(char);
-        return;
-    }
-
-    // If we have no UTF8 text then the only possibility is the
-    // alt-prefix handling of unshifted codepoints... so we process that.
-    const utf8 = event.utf8;
-    if (utf8.len == 0) {
-        if (try legacyAltPrefix(
-            event,
-            binding_mods,
-            all_mods,
-            opts,
-        )) |byte| try writer.print("\x1B{c}", .{byte});
-        return;
-    }
-
     // In modify other keys state 2, we send the CSI 27 sequence
-    // for any char with a modifier. Ctrl sequences like Ctrl+a
-    // are already handled above.
+    // for any char with a modifier. This must happen before converting
+    // Ctrl+<char> to a C0 byte because mode 2 encodes those keys, too.
+    const utf8 = event.utf8;
     if (opts.modify_other_keys_state_2) modify_other: {
         const view = std.unicode.Utf8View.init(utf8) catch {
             // Assume invalid UTF-8 means we no UTF-8.
@@ -474,6 +442,38 @@ fn legacy(
                 );
             }
         }
+    }
+
+    // If we match a control sequence, we output that directly. For
+    // ctrlSeq we have to use all mods because we want it to only
+    // match ctrl+<char>.
+    if (ctrlSeq(
+        event.key,
+        event.utf8,
+        event.unshifted_codepoint,
+        all_mods,
+    )) |char| {
+        // C0 sequences support alt-as-esc prefixing.
+        if (binding_mods.alt) {
+            try writer.writeByte(0x1B);
+            try writer.writeByte(char);
+            return;
+        }
+
+        try writer.writeByte(char);
+        return;
+    }
+
+    // If we have no UTF8 text then the only possibility is the
+    // alt-prefix handling of unshifted codepoints... so we process that.
+    if (utf8.len == 0) {
+        if (try legacyAltPrefix(
+            event,
+            binding_mods,
+            all_mods,
+            opts,
+        )) |byte| try writer.print("\x1B{c}", .{byte});
+        return;
     }
 
     // Let's see if we should apply fixterms to this codepoint.
@@ -2217,6 +2217,30 @@ test "legacy: ctrl+shift+char with modify other state 2" {
         .modify_other_keys_state_2 = true,
     });
     try testing.expectEqualStrings("\x1b[27;6;72~", writer.buffered());
+}
+
+test "legacy: ctrl+char with modify other state 2" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .key_p,
+        .mods = .{ .ctrl = true },
+        .utf8 = "p",
+    }, .{
+        .modify_other_keys_state_2 = true,
+    });
+    try testing.expectEqualStrings("\x1b[27;5;112~", writer.buffered());
+}
+
+test "legacy: ctrl+char without modify other state 2" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .key_p,
+        .mods = .{ .ctrl = true },
+        .utf8 = "p",
+    }, .{});
+    try testing.expectEqualStrings("\x10", writer.buffered());
 }
 
 test "legacy: ctrl+shift+char with modify other state 2 and consumed mods" {
