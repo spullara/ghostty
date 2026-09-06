@@ -19,9 +19,9 @@
   },
   {
     "type": "archive",
-    "url": "https://deps.files.ghostty.org/fontconfig-2.14.2.tar.gz",
-    "dest": "vendor/p/N-V-__8AAIrfdwARSa-zMmxWwFuwpXf1T3asIN7s5jqi9c1v",
-    "sha256": "3ba2dd92158718acec5caaf1a716043b5aa055c27b081d914af3ccb40dce8a55"
+    "url": "https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz",
+    "dest": "vendor/p/N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ",
+    "sha256": "4f7b554a38cdf78c033f666c8871f3749e14a094f65a07f630c91ed0b43d35e3"
   },
   {
     "type": "archive",
@@ -73,9 +73,9 @@
   },
   {
     "type": "archive",
-    "url": "https://deps.files.ghostty.org/ghostty-themes-release-20260824-153547-75c93ee.tgz",
-    "dest": "vendor/p/N-V-__8AAGZkBACH0haGC9R-hfNPYWxu16hr-ydEsolad9GV",
-    "sha256": "b1fd1f31057f97c1274db03c6ce44960837a1a41f52275cbc64aee2e6e34eb9e"
+    "url": "https://deps.files.ghostty.org/ghostty-themes-release-20260831-151010-752a9c0.tgz",
+    "dest": "vendor/p/N-V-__8AAEFmBABuDGOKxAI6VMg41b9euMZ-z7HS9EcUdaor",
+    "sha256": "83653eb837baeb5bfc7d50c91b7d44772796e08c1c243134e11c5edf6c8d15c5"
   },
   {
     "type": "archive",
