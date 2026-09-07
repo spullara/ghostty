@@ -1,8 +1,8 @@
 {
-  "aro-0.0.0-JSD1Qk8rOQDnuVcD4jAwMpHitA6pADRKzQ7M7hKRwxvD": {
+  "aro-0.0.0-JSD1Qk6lNgDdcDV4Vh7Sfy-34m2TluIVOdPzMmj_0BjX": {
     "name": "aro",
-    "url": "https://github.com/vancluever/arocc/archive/ecbc5c799574e0da2758a961b12efa586007f03c.tar.gz",
-    "hash": "sha256-rjNfhWjmA/1WR/xuHo4ls4fnDCbsI1VZSvb8SFRvwso="
+    "url": "https://github.com/vancluever/arocc/archive/f97cdfc3779aec4b242299e2fc9a1c828c3547c6.tar.gz",
+    "hash": "sha256-G/NNgk7KhJSLdy17ip1igIzpYhAUlzO7ef8r3/iCv/s="
   },
   "N-V-__8AANT61wB--nJ95Gj_ctmzAtcjloZ__hRqNw5lC1Kr": {
     "name": "bindings",
@@ -114,10 +114,10 @@
     "url": "https://deps.files.ghostty.org/spirv_cross-1220fb3b5586e8be67bc3feb34cbe749cf42a60d628d2953632c2f8141302748c8da.tar.gz",
     "hash": "sha256-tStvz8Ref6abHwahNiwVVHNETizAmZVVaxVsU7pmV+M="
   },
-  "translate_c-0.0.0-Q_BUWmU6BwB_9JKG2l2W7i_mhmYWeRseTGBEHi_YlV5f": {
+  "translate_c-0.0.0-Q_BUWhVNBwDOEcIqub4VFPJPB6D9dgwzUMHTX5KWr8Xr": {
     "name": "translate_c",
-    "url": "https://deps.files.ghostty.org/translate_c-80f8b6e4f45a303268717d8e5f4f91d7837138bb.tar.gz",
-    "hash": "sha256-fB7OsZ2PIijMzVMYg8SzDBtTKX7IZHbEvPuBTdyGtWk="
+    "url": "https://codeberg.org/vancluever/translate-c/archive/4e879eb8aba615de112eabd1231ea6e01920cead.tar.gz",
+    "hash": "sha256-/sT7W8Kp+O11xaFBgpb/kDiWzfQ0MuXk/d/TuGq1Am8="
   },
   "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA": {
     "name": "uucode",
