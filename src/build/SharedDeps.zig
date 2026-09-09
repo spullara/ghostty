@@ -76,6 +76,12 @@ pub fn init(b: *std.Build, cfg: *const Config) !SharedDeps {
         .build_config_path = b.path("src/build/uucode_config.zig"),
     }).module("uucode");
 
+    // Re-export the uucode module so that Zig programs that embed libgtostty-vt
+    // can use it. This is necessary to use libraries like libvaxis in
+    // the embedding program that need uucode as well (libvaxis provides
+    // -Dexternal_uucode for this).
+    try b.modules.put(b.allocator, b.dupe("uucode"), uucode_mod);
+
     var result: SharedDeps = .{
         .config = cfg,
         .help_strings = try .init(b, cfg),
