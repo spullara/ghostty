@@ -73,6 +73,7 @@ pub const TRUE: windows.BOOL = .fromBool(true);
 
 // Bit-field and enum constant values
 pub const CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+pub const ERROR_SUCCESS = 0;
 pub const EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
 pub const FILE_ATTRIBUTE_NORMAL = 0x80;
 pub const FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000;
@@ -213,6 +214,11 @@ pub const exp = struct {
             dwSize: SIZE_T,
             dwFreeType: DWORD,
         ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-discardvirtualmemory
+        pub extern "kernel32" fn DiscardVirtualMemory(
+            VirtualAddress: PVOID,
+            Size: SIZE_T,
+        ) callconv(.winapi) DWORD;
         pub extern "kernel32" fn WaitForSingleObject(
             hHandle: HANDLE,
             dwMilliseconds: DWORD,
