@@ -317,9 +317,6 @@ pub const ImguiWidget = extern struct {
             cimgui.c.ImGui_Render();
         }
 
-        // OpenGL final render
-        gl.clearColor(0x28 / 0xFF, 0x2C / 0xFF, 0x34 / 0xFF, 1.0);
-        gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
         cimgui.ImGui_ImplOpenGL3_RenderDrawData(cimgui.c.ImGui_GetDrawData());
 
         return @intFromBool(true);

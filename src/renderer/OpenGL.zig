@@ -59,12 +59,16 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !OpenGL {
     // Choose a config. We need a config that is renderable with
     // OpenGL and a RGBA8 color buffer.
     const config = egl.Config.choose(display, &.{
+        // EGL_SURFACE_TYPE defaults to EGL_WINDOW_BIT even though
+        // we are rendering exclusively through surfaceless mode.
+        // This is no problem on Mesa but we need to specify this
+        // explicitly for proprietary Nvidia drivers.
+        egl.c.EGL_SURFACE_TYPE,    0,
         egl.c.EGL_RENDERABLE_TYPE, egl.c.EGL_OPENGL_BIT,
         egl.c.EGL_RED_SIZE,        8,
         egl.c.EGL_GREEN_SIZE,      8,
         egl.c.EGL_BLUE_SIZE,       8,
         egl.c.EGL_ALPHA_SIZE,      8,
-        egl.c.EGL_NONE,
     }) catch |err| {
         log.warn("failed to choose config err={}", .{err});
         return err;
@@ -75,7 +79,6 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !OpenGL {
         egl.c.EGL_CONTEXT_MAJOR_VERSION,       MIN_VERSION_MAJOR,
         egl.c.EGL_CONTEXT_MINOR_VERSION,       MIN_VERSION_MINOR,
         egl.c.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-        egl.c.EGL_NONE,
     }) catch |err| {
         log.warn("failed to create EGL context err={}", .{err});
         return err;

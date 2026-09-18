@@ -3376,31 +3376,22 @@ const Action = struct {
 fn setGtkEnv(config: *const CoreConfig) std.Io.Writer.Error!void {
     assert(gtk.isInitialized() == 0);
 
-    var gdk_debug: struct {
-        /// output OpenGL debug information
+    const gdk_debug: struct {
+        /// Output OpenGL debug information,
+        /// `gtk-opengl-debug` dumps logs directly to stderr so both must be true
+        /// to enable OpenGL debugging.
         opengl: bool = false,
-        // GTK's new renderer can cause blurry font when using fractional scaling.
-        @"gl-no-fractional": bool = false,
     } = .{
-        // `gtk-opengl-debug` dumps logs directly to stderr so both must be true
-        // to enable OpenGL debugging.
         .opengl = global.logging().stderr and config.@"gtk-opengl-debug",
     };
 
-    var gdk_disable: struct {
-        /// current gtk implementation for color management is not good enough.
-        /// see: https://bugs.kde.org/show_bug.cgi?id=495647
-        /// gtk issue: https://gitlab.gnome.org/GNOME/gtk/-/issues/6864
-        @"color-mgmt": bool = true,
+    const gdk_disable: struct {
+        // Even though we don't use GTK's GL context anymore, there can still
+        // occasionally be conflicts when Vulkan and OpenGL are used together.
+        // Disabling Vulkan also saves hundreds of milliseconds of initialization
+        // time on certain systems.
+        vulkan: bool = true,
     } = .{};
-
-    if (gtk_version.runtimeAtLeast(4, 18, 0)) {
-        gdk_disable.@"color-mgmt" = false;
-    }
-    if (gtk_version.runtimeUntil(4, 17, 5)) {
-        // Removed at GTK v4.17.5
-        gdk_debug.@"gl-no-fractional" = true;
-    }
 
     {
         var buf: [1024]u8 = undefined;
