@@ -257,6 +257,7 @@ const Effects = struct {
     clipboard_write: ?ClipboardWriteFn = null,
     clipboard_read: ?ClipboardReadFn = null,
     unknown_sequence: ?UnknownSequenceFn = null,
+    render_hold: ?RenderHoldFn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
     /// trampoline converts C feature codes into this buffer and returns
@@ -303,6 +304,9 @@ const Effects = struct {
 
     /// C function pointer type for the title_changed callback.
     pub const TitleChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for the render_hold callback.
+    pub const RenderHoldFn = *const fn (Terminal, ?*anyopaque, bool) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the pwd_changed callback.
     pub const PwdChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
@@ -588,6 +592,12 @@ const Effects = struct {
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
+    fn renderHoldTrampoline(handler: *Handler, held: bool) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.render_hold orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata, held);
+    }
+
     fn pwdChangedTrampoline(handler: *Handler) void {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.pwd_changed orelse return;
@@ -674,6 +684,7 @@ fn wrap(
         .pwd_changed = &Effects.pwdChangedTrampoline,
         .progress_report = &Effects.progressReportTrampoline,
         .size = &Effects.sizeTrampoline,
+        .render_hold = &Effects.renderHoldTrampoline,
 
         // Installed dynamically when the callback is set; see Effects.
         .clipboard_write = null,
@@ -1175,6 +1186,7 @@ pub const Option = enum(c_int) {
     clipboard_read = 38,
     clipboard_write_max_bytes = 39,
     resize_pull_scrollback = 40,
+    render_hold = 41,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1194,6 +1206,7 @@ pub const Option = enum(c_int) {
             .clipboard_write => ?Effects.ClipboardWriteFn,
             .clipboard_read => ?Effects.ClipboardReadFn,
             .unknown_sequence => ?Effects.UnknownSequenceFn,
+            .render_hold => ?Effects.RenderHoldFn,
             .title, .pwd, .terminfo_name => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
@@ -1262,6 +1275,7 @@ fn setTyped(
         .pwd_changed => wrapper.effects.pwd_changed = value,
         .progress_report => wrapper.effects.progress_report = value,
         .size_cb => wrapper.effects.size_cb = value,
+        .render_hold => wrapper.effects.render_hold = value,
         .clipboard_write => {
             wrapper.effects.clipboard_write = value;
             wrapper.stream.handler.effects.clipboard_write = if (value != null)
@@ -1504,8 +1518,13 @@ pub fn resize(
 }
 
 pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
-    const t: *ZigTerminal = (terminal_ orelse return).terminal;
+    const wrapper = terminal_ orelse return;
+    const t: *ZigTerminal = wrapper.terminal;
+
+    // A reset always turns off synchronized output, ending its hold.
+    const sync = t.modes.get(.synchronized_output);
     t.fullReset();
+    if (sync) Effects.renderHoldTrampoline(&wrapper.stream.handler, false);
 }
 
 /// C: GhosttyKittyGraphics
@@ -4344,6 +4363,65 @@ test "set title_changed callback" {
     // Another title change
     vt_write(t, "\x1B]2;World\x1B\\", 10);
     try testing.expectEqual(@as(usize, 2), S.title_count);
+}
+
+test "set render_hold callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var events: [8]bool = undefined;
+        var len: usize = 0;
+        var last_userdata: ?*anyopaque = null;
+
+        fn hold(_: Terminal, ud: ?*anyopaque, held: bool) callconv(lib.calling_conv) void {
+            events[len] = held;
+            len += 1;
+            last_userdata = ud;
+        }
+    };
+    S.len = 0;
+    S.last_userdata = null;
+
+    var sentinel: u8 = 0;
+    try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
+    try testing.expectEqual(Result.success, set(t, .render_hold, @ptrCast(&S.hold)));
+
+    // A set during a hold and a reset without a hold are ignored.
+    const frame = "\x1b[?2026h\x1b[?2026hA\x1b[?2026l\x1b[?2026l";
+    vt_write(t, frame, frame.len);
+    try testing.expectEqualSlices(bool, &.{ true, false }, S.events[0..S.len]);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+
+    // Resize and reset turn the mode off and end the hold.
+    const begin = "\x1b[?2026h";
+    S.len = 0;
+    vt_write(t, begin, begin.len);
+    try testing.expectEqual(Result.success, resize(t, 80, 24, 9, 18));
+    vt_write(t, begin, begin.len);
+    reset(t);
+    reset(t);
+    try testing.expectEqualSlices(bool, &.{ true, false, true, false }, S.events[0..S.len]);
+
+    // Changing the mode ourselves (e.g. for a timeout) isn't reported.
+    S.len = 0;
+    vt_write(t, begin, begin.len);
+    const off: ModeConfig = .{ .mode = 2026, .value = false };
+    try testing.expectEqual(Result.success, set(t, .mode, @ptrCast(&off)));
+    try testing.expect(!t.?.terminal.modes.get(.synchronized_output));
+    try testing.expectEqualSlices(bool, &.{true}, S.events[0..S.len]);
+
+    // Clearing the callback silences it.
+    S.len = 0;
+    try testing.expectEqual(Result.success, set(t, .render_hold, null));
+    vt_write(t, frame, frame.len);
+    try testing.expectEqual(0, S.len);
 }
 
 test "title_changed without callback is silent" {
