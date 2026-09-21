@@ -39,6 +39,7 @@ const RenderSurface = @import("render_surface.zig").RenderSurface;
 const i18n = @import("../../../os/i18n.zig");
 const global = @import("../../../global.zig");
 const gtk_version = @import("../gtk_version.zig");
+const Overrides = @import("Overrides.zig");
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -742,14 +743,7 @@ pub const Surface = extern struct {
         pub var offset: c_int = 0;
     };
 
-    pub fn new(overrides: struct {
-        command: ?configpkg.Command = null,
-        shell_integration: ?configpkg.Config.ShellIntegration = null,
-        working_directory: ?[:0]const u8 = null,
-        title: ?[:0]const u8 = null,
-
-        pub const none: @This() = .{};
-    }) *Self {
+    pub fn new(overrides: Overrides) *Self {
         const self = gobject.ext.newInstance(Self, .{
             .@"title-override" = overrides.title,
         });

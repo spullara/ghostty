@@ -46,6 +46,7 @@ const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialo
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
 const OpenURI = @import("../portal.zig").OpenURI;
 const media = @import("../media.zig");
+const Overrides = @import("Overrides.zig");
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -1848,7 +1849,7 @@ pub const Application = extern struct {
             var arguments_it: glib.VariantIter = undefined;
             _ = arguments_it.init(arguments);
 
-            break :overrides parseOverrides(alloc, &arguments_it) catch null;
+            break :overrides Overrides.parse(alloc, &arguments_it) catch null;
         };
 
         Action.newWindow(
@@ -1909,7 +1910,7 @@ pub const Application = extern struct {
 
             const arguments_it = arguments_it_ orelse return;
 
-            const overrides = parseOverrides(alloc, arguments_it) catch return;
+            const overrides = Overrides.parse(alloc, arguments_it) catch return;
 
             break :result .{ if (surface_id == 0) null else surface_id, overrides };
         };
@@ -1958,108 +1959,6 @@ pub const Application = extern struct {
                 log.warn("new-tab: unable to create new window: {t}", .{err});
             };
         }
-    }
-
-    fn parseOverrides(arena_alloc: Allocator, arguments_it: *glib.VariantIter) (Allocator.Error || error{ValueRequired})!struct {
-        command: ?configpkg.Command = null,
-        shell_integration: ?configpkg.Config.ShellIntegration = null,
-        working_directory: ?[:0]const u8 = null,
-        title: ?[:0]const u8 = null,
-    } {
-        var args: std.ArrayList([:0]const u8) = .empty;
-
-        var working_directory: ?[:0]const u8 = null;
-        var title: ?[:0]const u8 = null;
-        var command: ?configpkg.Command = null;
-        var parsed_shell_integration: struct {
-            @"shell-integration": ?configpkg.Config.ShellIntegration = null,
-        } = .{};
-
-        const s_variant_type = glib.VariantType.new("s");
-        defer s_variant_type.free();
-
-        var e_seen: bool = false;
-        var i: usize = 0;
-
-        while (arguments_it.nextValue()) |value| : (i += 1) {
-            defer value.unref();
-
-            // just to be sure
-            if (value.isOfType(s_variant_type) == 0) continue;
-
-            var len: usize = undefined;
-            const buf = value.getString(&len);
-            const str = buf[0..len];
-
-            log.debug("argument: {d} {s}", .{ i, str });
-
-            if (e_seen) {
-                const copy = arena_alloc.dupeZ(u8, str) catch |err| {
-                    log.warn("unable to duplicate argument {d} {s}: {t}", .{ i, str, err });
-                    return err;
-                };
-                args.append(arena_alloc, copy) catch |err| {
-                    log.warn("unable to append argument {d} {s}: {t}", .{ i, str, err });
-                    return err;
-                };
-                continue;
-            }
-
-            if (std.mem.eql(u8, str, "-e")) {
-                e_seen = true;
-                continue;
-            }
-
-            if (std.mem.cutPrefix(u8, str, "--command=")) |v| {
-                var cmd: configpkg.Command = undefined;
-                cmd.parseCLI(arena_alloc, v) catch |err| {
-                    log.warn("unable to parse command: {t}", .{err});
-                    return err;
-                };
-                command = cmd;
-                continue;
-            }
-            if (std.mem.cutPrefix(u8, str, "--shell-integration=")) |v| {
-                cli.args.parseIntoField(
-                    @TypeOf(parsed_shell_integration),
-                    arena_alloc,
-                    &parsed_shell_integration,
-                    "shell-integration",
-                    std.mem.trim(u8, v, &std.ascii.whitespace),
-                ) catch |err| {
-                    log.warn("unable to parse shell integration {s}: {t}", .{ v, err });
-                    continue;
-                };
-                continue;
-            }
-            if (std.mem.cutPrefix(u8, str, "--working-directory=")) |v| {
-                working_directory = arena_alloc.dupeZ(u8, std.mem.trim(u8, v, &std.ascii.whitespace)) catch |err| {
-                    log.warn("unable to duplicate working directory: {t}", .{err});
-                    return err;
-                };
-                continue;
-            }
-            if (std.mem.cutPrefix(u8, str, "--title=")) |v| {
-                title = arena_alloc.dupeZ(u8, std.mem.trim(u8, v, &std.ascii.whitespace)) catch |err| {
-                    log.warn("unable to duplicate title: {t}", .{err});
-                    return err;
-                };
-                continue;
-            }
-        }
-
-        if (args.items.len > 0) {
-            command = .{
-                .direct = args.items,
-            };
-        }
-
-        return .{
-            .command = command,
-            .shell_integration = parsed_shell_integration.@"shell-integration",
-            .working_directory = working_directory,
-            .title = title,
-        };
     }
 
     pub fn actionOpenConfig(
@@ -2654,17 +2553,7 @@ const Action = struct {
         }
     }
 
-    pub fn newTab(
-        target: apprt.Target,
-        overrides: struct {
-            command: ?configpkg.Command = null,
-            shell_integration: ?configpkg.Config.ShellIntegration = null,
-            working_directory: ?[:0]const u8 = null,
-            title: ?[:0]const u8 = null,
-
-            pub const none: @This() = .{};
-        },
-    ) bool {
+    pub fn newTab(target: apprt.Target, overrides: Overrides) bool {
         switch (target) {
             .app => {
                 log.warn("new tab to app is unexpected", .{});
@@ -2694,18 +2583,7 @@ const Action = struct {
         }
     }
 
-    pub fn newWindow(
-        self: *Application,
-        parent: ?*CoreSurface,
-        overrides: struct {
-            command: ?configpkg.Command = null,
-            shell_integration: ?configpkg.Config.ShellIntegration = null,
-            working_directory: ?[:0]const u8 = null,
-            title: ?[:0]const u8 = null,
-
-            pub const none: @This() = .{};
-        },
-    ) !void {
+    pub fn newWindow(self: *Application, parent: ?*CoreSurface, overrides: Overrides) !void {
         // Note that we've requested a window at least once. This is used
         // to trigger quit on no windows. Note I'm not sure if this is REALLY
         // necessary, but I don't want to risk a bug where on a slow machine
@@ -2733,14 +2611,7 @@ const Action = struct {
         self: *Application,
         win: *Window,
         parent: ?*CoreSurface,
-        overrides: struct {
-            command: ?configpkg.Command = null,
-            shell_integration: ?configpkg.Config.ShellIntegration = null,
-            working_directory: ?[:0]const u8 = null,
-            title: ?[:0]const u8 = null,
-
-            pub const none: @This() = .{};
-        },
+        overrides: Overrides,
     ) void {
         // Setup a binding so that whenever our config changes so does the
         // window. There's never a time when the window config should be out
@@ -2819,6 +2690,8 @@ const Action = struct {
                 Action.newWindow(self, null, .{
                     .command = command,
                     .title = title,
+                    .shell_integration = null,
+                    .working_directory = null,
                 }) catch |err| {
                     log.warn("unable to create new window: {t}", .{err});
                     return false;
