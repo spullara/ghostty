@@ -204,6 +204,7 @@ pub fn exportDmabuf(
         &planes.strides,
         &planes.offsets,
     );
+    try planes.validate();
 
     return .{
         .width = @intCast(self.width),
