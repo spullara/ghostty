@@ -49,7 +49,11 @@ egl_context: *gl.egl.Context,
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !OpenGL {
     try egl.load();
 
-    const display: *egl.Display = try .init(egl.c.EGL_DEFAULT_DISPLAY);
+    const display: *egl.Display = try .initPlatform(
+        egl.c.EGL_PLATFORM_SURFACELESS_MESA,
+        egl.c.EGL_DEFAULT_DISPLAY,
+        null,
+    );
 
     log.info("EGL vendor={s}", .{display.queryString(.vendor) orelse "(unknown)"});
     log.info("EGL extensions={s}", .{display.queryString(.extensions) orelse "(unknown)"});

@@ -762,6 +762,8 @@ pub const Application = extern struct {
 
             .resize_split => return Action.resizeSplit(target, value),
 
+            .resize_window => return Action.resizeWindow(target, value),
+
             .ring_bell => Action.ringBell(target),
 
             // GTK has no accessibility consumer for this yet.
@@ -2898,6 +2900,30 @@ const Action = struct {
                         return false;
                     },
                 };
+            },
+        }
+    }
+
+    pub fn resizeWindow(
+        target: apprt.Target,
+        value: apprt.action.ResizeWindow,
+    ) bool {
+        switch (target) {
+            .app => {
+                log.warn("resize_window to app is unexpected", .{});
+                return false;
+            },
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const window = ext.getAncestor(
+                    Window,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a window, ignoring resize_window", .{});
+                    return false;
+                };
+
+                return window.resizeSurface(surface, value);
             },
         }
     }
