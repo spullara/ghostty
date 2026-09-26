@@ -921,6 +921,19 @@ pub fn activateInspector(self: *Surface) !void {
     self.queueIo(.{ .inspector = true }, .unlocked);
 }
 
+/// Report to the renderer how well the apprt can present the frames
+/// the renderer exports. See `renderer.Health` and the renderer's
+/// `presentation_health` state for the semantics.
+pub fn reportPresentationHealth(self: *Surface, health: rendererpkg.Health) void {
+    _ = self.renderer_thread.mailbox.push(
+        global.io(),
+        .{ .presentation_health = health },
+        .forever,
+    );
+    self.renderer_thread.wakeup.notify() catch |err|
+        log.warn("failed to wake up renderer err={}", .{err});
+}
+
 /// Deactivate the inspector and stop collecting any information.
 pub fn deactivateInspector(self: *Surface) void {
     const insp = self.inspector orelse return;

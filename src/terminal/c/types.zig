@@ -203,6 +203,8 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyReader", io.Reader),
     .initStruct("GhosttyRenderStateColors", render.Colors),
     .initStruct("GhosttyRenderStateCursor", render.Cursor),
+    .initStruct("GhosttyRenderStateOverscan", render.Overscan),
+    .initStruct("GhosttyRenderStateRowId", render.RowId),
     .initStruct("GhosttyRenderStateRowSelection", render.RowSelection),
     .initStruct("GhosttySelection", selection.CSelection),
     .initStruct("GhosttySelectionBuffer", selection.CSelectionBuffer),
@@ -904,6 +906,39 @@ test "manifest describes enums, arrays, and tagged unions" {
     try std.testing.expectEqualStrings("tag", value.get("tag").?.string);
     try std.testing.expectEqualStrings("palette", value.get("arms").?.object.get("PALETTE").?.string);
     try std.testing.expect(value.get("arms").?.object.get("NONE").? == .null);
+}
+
+test "manifest describes render state overscan types" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const manifest_types = parsed.value.object.get("types").?.object;
+
+    const overscan = manifest_types.get("GhosttyRenderStateOverscan").?.object;
+    try std.testing.expectEqual(@as(i64, 4), overscan.get("size").?.integer);
+    const overscan_fields = overscan.get("fields").?.object;
+    try std.testing.expectEqual(@as(i64, 0), overscan_fields.get("above").?.object.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), overscan_fields.get("below").?.object.get("offset").?.integer);
+
+    const row_id = manifest_types.get("GhosttyRenderStateRowId").?.object;
+    try std.testing.expectEqual(@as(i64, 16), row_id.get("size").?.integer);
+    const bits = row_id.get("fields").?.object.get("bits").?.object;
+    try std.testing.expectEqual(@as(i64, 0), bits.get("offset").?.integer);
+    try std.testing.expectEqualStrings("array", bits.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 2), bits.get("count").?.integer);
+
+    const data_values = manifest_types.get("GhosttyRenderStateData").?.object
+        .get("values").?.object;
+    try std.testing.expectEqual(@as(i64, 20), data_values.get("OVERSCAN").?.integer);
+    try std.testing.expectEqual(@as(i64, 21), data_values.get("OVERSCAN_REQUEST").?.integer);
+
+    const row_data_values = manifest_types.get("GhosttyRenderStateRowData").?.object
+        .get("values").?.object;
+    try std.testing.expectEqual(@as(i64, 6), row_data_values.get("VIEWPORT_Y").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), row_data_values.get("ID").?.integer);
+
+    const option_values = manifest_types.get("GhosttyRenderStateOption").?.object
+        .get("values").?.object;
+    try std.testing.expectEqual(@as(i64, 1), option_values.get("OVERSCAN").?.integer);
 }
 
 test "manifest describes the complete packed cell layout" {

@@ -295,18 +295,27 @@ pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
 /// of the frame and is responsible for freeing it.
 ///
 /// This runs on the render thread.
-pub fn present(self: *OpenGL, target: Target) !ExportedFrame {
-    if (target.exportDmabuf(self.egl_display, self.egl_context)) |dmabuf| {
-        return .{ .dmabuf = dmabuf };
-    } else |_| {
-        // If DMABUFs fail, then use CPU buffers
-        return .{ .memory = .{
-            .width = @intCast(target.width),
-            .height = @intCast(target.height),
-            .pixels = try target.readPixelsAlloc(self.alloc),
-            .alloc = self.alloc,
-        } };
+pub fn present(
+    self: *OpenGL,
+    target: Target,
+    presentation_health: rendererpkg.Health,
+) !ExportedFrame {
+    // We only export DMABUFs when the apprt can present them.
+    // Otherwise, use CPU buffers.
+    if (presentation_health == .healthy) {
+        if (target.exportDmabuf(self.egl_display, self.egl_context)) |dmabuf| {
+            return .{ .dmabuf = dmabuf };
+        } else |_| {
+            log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
+        }
     }
+
+    return .{ .memory = .{
+        .width = @intCast(target.width),
+        .height = @intCast(target.height),
+        .pixels = try target.readPixelsAlloc(self.alloc),
+        .alloc = self.alloc,
+    } };
 }
 
 /// A finished frame exported for presentation by the apprt.
