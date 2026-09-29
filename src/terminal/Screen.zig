@@ -1816,14 +1816,8 @@ pub fn clearCells(
     }
 
     if (comptime build_options.kitty_graphics) {
-        if (row.kitty_virtual_placeholder and
-            cells.len == page.size.cols)
-        {
-            for (cells) |c| {
-                if (c.codepoint() == kitty.graphics.unicode.placeholder) {
-                    break;
-                }
-            } else row.kitty_virtual_placeholder = false;
+        if (cells.len == page.size.cols) {
+            row.kitty_virtual_placeholder = false;
         }
     }
 

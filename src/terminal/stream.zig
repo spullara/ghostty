@@ -131,6 +131,7 @@ pub const Action = union(Key) {
     kitty_clipboard: KittyClipboard,
     kitty_dnd: KittyDnd,
     resize_window: ResizeWindow,
+    osc_unknown: osc.Command.Unknown,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -233,6 +234,7 @@ pub const Action = union(Key) {
             "kitty_clipboard",
             "kitty_dnd",
             "resize_window",
+            "osc_unknown",
         },
     );
 
@@ -522,6 +524,17 @@ pub fn Stream(comptime H: type) type {
             /// unfinished state without repeating committed terminal effects.
             /// Continuation tracking is only supported by TerminalStream.
             continuation_max_bytes: ?usize = null,
+
+            /// The most bytes to keep from each OSC sequence whose number
+            /// the OSC parser does not implement. Zero, the default,
+            /// discards these sequences. Any other value sends them to the
+            /// handler as `osc_unknown` actions. See
+            /// `osc.Parser.unknown_max_bytes` for how the limit behaves.
+            ///
+            /// This only affects OSC. Other kinds of unknown sequences,
+            /// such as APC, are collected by the handler and have their own
+            /// limits there.
+            osc_unknown_max_bytes: usize = 0,
         };
 
         /// Initialize a stream. Without an allocator, operations that require
@@ -537,6 +550,7 @@ pub fn Stream(comptime H: type) type {
             // Initialize the parser
             var parser: Parser = .init();
             if (options.allocator) |alloc| parser.osc_parser.alloc = alloc;
+            parser.osc_parser.unknown_max_bytes = options.osc_unknown_max_bytes;
 
             // Initialize the continuation tracker if one is requested.
             var tracker: ?continuationpkg.Tracker = null;
@@ -2702,6 +2716,11 @@ pub fn Stream(comptime H: type) type {
 
                 .kitty_dnd_protocol => |v| {
                     self.handler.vt(.kitty_dnd, v);
+                },
+
+                .unknown => |v| {
+                    @branchHint(.unlikely);
+                    self.handler.vt(.osc_unknown, v);
                 },
 
                 .conemu_sleep,

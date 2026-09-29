@@ -199,14 +199,20 @@ pub const UnknownStringSequence = extern struct {
     content: lib.String,
 };
 
+/// An OSC sequence whose number is not implemented.
+///
+/// C: GhosttyTerminalUnknownOscSequence
+pub const UnknownOscSequence = osc.Command.Unknown.C;
+
 /// An unsupported terminal sequence reported to the C callback.
 ///
 /// C: GhosttyTerminalUnknownSequence
 pub const UnknownSequence = union(Tag) {
     apc: UnknownStringSequence,
+    osc: UnknownOscSequence,
 
     /// C: GhosttyTerminalUnknownSequenceTag
-    pub const Tag = lib.Enum(lib.target, &.{"apc"});
+    pub const Tag = lib.Enum(lib.target, &.{ "apc", "osc" });
 
     const c_union = lib.TaggedUnion(
         lib.target,
@@ -632,6 +638,7 @@ const Effects = struct {
                     .content = .init(apc_value.content),
                 },
             },
+            .osc => |osc_value| .{ .osc = osc_value.cval() },
         });
         func(@ptrCast(wrapper), wrapper.effects.userdata, &value);
     }
@@ -1435,8 +1442,12 @@ fn setTyped(
             wrapper,
             if (value) |ptr| ptr.* else default_continuation_max_bytes,
         ),
-        .unknown_max_bytes => wrapper.stream.handler.apc_handler.unknown_max_bytes =
-            if (value) |ptr| ptr.* else 0,
+        .unknown_max_bytes => {
+            // One limit applies to every unknown sequence type.
+            const max_bytes = if (value) |ptr| ptr.* else 0;
+            wrapper.stream.handler.apc_handler.unknown_max_bytes = max_bytes;
+            wrapper.stream.parser.osc_parser.unknown_max_bytes = max_bytes;
+        },
         .clipboard_write_max_bytes => wrapper.stream.handler.kitty_clipboard_write_max_bytes =
             if (value) |ptr| ptr.* else kitty_clipboard.max_write_size,
         .resize_pull_scrollback => wrapper.terminal.flags.resize_pull_scrollback =
@@ -4617,6 +4628,7 @@ test "set unknown_sequence callback" {
         var last_userdata: ?*anyopaque = null;
         var last_tag: UnknownSequence.Tag = .apc;
         var last_truncated: bool = false;
+        var last_terminator: osc.Terminator.C = .st;
         var content: [64]u8 = undefined;
         var content_len: usize = 0;
 
@@ -4629,10 +4641,21 @@ test "set unknown_sequence callback" {
             last_terminal = terminal_;
             last_userdata = ud;
             last_tag = sequence.tag;
-            const apc_value = sequence.value.apc;
-            last_truncated = apc_value.truncated;
-            content_len = @min(apc_value.content.len, content.len);
-            @memcpy(content[0..content_len], apc_value.content.ptr[0..content_len]);
+            const str: lib.String = switch (sequence.tag) {
+                .apc => str: {
+                    const apc_value = sequence.value.apc;
+                    last_truncated = apc_value.truncated;
+                    break :str apc_value.content;
+                },
+                .osc => str: {
+                    const osc_value = sequence.value.osc;
+                    last_truncated = osc_value.truncated;
+                    last_terminator = osc_value.terminator;
+                    break :str osc_value.content;
+                },
+            };
+            content_len = @min(str.len, content.len);
+            @memcpy(content[0..content_len], str.ptr[0..content_len]);
         }
     };
     S.count = 0;
@@ -4652,6 +4675,7 @@ test "set unknown_sequence callback" {
         @ptrCast(&max_bytes),
     ));
     try testing.expectEqual(max_bytes, t.?.stream.handler.apc_handler.unknown_max_bytes);
+    try testing.expectEqual(max_bytes, t.?.stream.parser.osc_parser.unknown_max_bytes);
 
     // A byte limit without a callback performs no external effect.
     const before_callback = "\x1B_abc;xy\x1B\\";
@@ -4691,11 +4715,34 @@ test "set unknown_sequence callback" {
     vt_write(t, aborted, aborted.len);
     try testing.expectEqual(@as(usize, 2), S.count);
 
+    // Unknown OSCs share the callback and the byte limit.
+    const osc_st = "\x1B]7400;x\x1B\\";
+    vt_write(t, osc_st, osc_st.len);
+    try testing.expectEqual(@as(usize, 3), S.count);
+    try testing.expectEqual(UnknownSequence.Tag.osc, S.last_tag);
+    try testing.expect(!S.last_truncated);
+    try testing.expectEqual(osc.Terminator.C.st, S.last_terminator);
+    try testing.expectEqualStrings("7400;x", S.content[0..S.content_len]);
+
+    const osc_bel = "\x1B]7400;abcdef\x07";
+    vt_write(t, osc_bel, osc_bel.len);
+    try testing.expectEqual(@as(usize, 4), S.count);
+    try testing.expectEqual(UnknownSequence.Tag.osc, S.last_tag);
+    try testing.expect(S.last_truncated);
+    try testing.expectEqual(osc.Terminator.C.bel, S.last_terminator);
+    try testing.expectEqualStrings("7400;abc", S.content[0..S.content_len]);
+
+    // Aborted unknown OSCs and supported OSCs are not reported.
+    const osc_aborted = "\x1B]7400;x\x18\x1B]2;title\x07";
+    vt_write(t, osc_aborted, osc_aborted.len);
+    try testing.expectEqual(@as(usize, 4), S.count);
+
     // Clearing the callback restores the null fast path immediately.
     try testing.expectEqual(Result.success, set(t, .unknown_sequence, null));
     try testing.expect(t.?.stream.handler.unknown_sequence == null);
     vt_write(t, before_callback, before_callback.len);
-    try testing.expectEqual(@as(usize, 2), S.count);
+    vt_write(t, osc_st, osc_st.len);
+    try testing.expectEqual(@as(usize, 4), S.count);
 
     // A NULL limit disables capture even after reinstalling the callback.
     try testing.expectEqual(Result.success, set(
@@ -4705,8 +4752,10 @@ test "set unknown_sequence callback" {
     ));
     try testing.expectEqual(Result.success, set(t, .unknown_max_bytes, null));
     try testing.expectEqual(@as(usize, 0), t.?.stream.handler.apc_handler.unknown_max_bytes);
+    try testing.expectEqual(@as(usize, 0), t.?.stream.parser.osc_parser.unknown_max_bytes);
     vt_write(t, before_callback, before_callback.len);
-    try testing.expectEqual(@as(usize, 2), S.count);
+    vt_write(t, osc_st, osc_st.len);
+    try testing.expectEqual(@as(usize, 4), S.count);
 }
 
 test "set pwd_changed callback" {

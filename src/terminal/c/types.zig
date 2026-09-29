@@ -235,6 +235,7 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyTerminalSelectWordOptions", selection.SelectWordOptions),
     .initStruct("GhosttyTerminalSelectionFormatOptions", selection.FormatOptions),
     .initTaggedStruct("GhosttyTerminalUnknownSequence", terminal.UnknownSequence.C, "tag", "value", .generated),
+    .initStruct("GhosttyTerminalUnknownOscSequence", terminal.UnknownOscSequence),
     .initStruct("GhosttyTerminalUnknownStringSequence", terminal.UnknownStringSequence),
     .initUnion(
         "GhosttyTerminalUnknownSequenceValue",
@@ -275,6 +276,8 @@ const type_decls = [_]TypeDecl{
     .initEnum("GhosttyMouseTrackingMode", mouse_pkg.Event, "GHOSTTY_MOUSE_TRACKING_"),
     .initEnum("GhosttyOptionAsAlt", input_config.OptionAsAlt, "GHOSTTY_OPTION_AS_ALT_"),
     .initEnum("GhosttyOscCommandData", osc.CommandData, "GHOSTTY_OSC_DATA_"),
+    .initEnum("GhosttyOscOption", osc.Option, "GHOSTTY_OSC_OPT_"),
+    .initEnum("GhosttyOscTerminator", osc.Terminator, "GHOSTTY_OSC_TERMINATOR_"),
     .initEnumSentinel(
         "GhosttyOscCommandType",
         osc.CommandType,

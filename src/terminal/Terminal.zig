@@ -14165,6 +14165,25 @@ test "Terminal: eraseLine complete resets wrap" {
     }
 }
 
+test "Terminal: eraseLine complete clears kitty placeholder flag" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    try t.print(kitty.graphics.unicode.placeholder);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(list_cell.row.kitty_virtual_placeholder);
+    }
+    t.eraseLine(.complete, false);
+
+    const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(!list_cell.row.kitty_virtual_placeholder);
+}
+
 test "Terminal: eraseLine complete protected attributes respected with iso" {
     const alloc = testing.allocator;
     const io_impl = testing.io;

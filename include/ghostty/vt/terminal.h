@@ -14,6 +14,7 @@
 #include <ghostty/vt/allocator.h>
 #include <ghostty/vt/device.h>
 #include <ghostty/vt/modes.h>
+#include <ghostty/vt/osc.h>
 #include <ghostty/vt/size_report.h>
 #include <ghostty/vt/grid_ref.h>
 #include <ghostty/vt/io.h>
@@ -99,7 +100,7 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_READ`   | `GhosttyTerminalClipboardReadFn`  | Clipboard read via OSC 52 "?" / OSC 5522  |
  * | `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION`| `GhosttyTerminalDesktopNotificationFn` | Desktop notification via OSC 9 / OSC 777 |
  * | `GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT`  | `GhosttyTerminalProgressReportFn` | Progress report via OSC 9;4               |
- * | `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` | `GhosttyTerminalUnknownSequenceFn` | Unsupported sequence identifier          |
+ * | `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` | `GhosttyTerminalUnknownSequenceFn` | APC or OSC sequence that libghostty-vt does not implement (see Unsupported Sequences) |
  * | `GHOSTTY_TERMINAL_OPT_RENDER_HOLD`      | `GhosttyTerminalRenderHoldFn`     | Synchronized output (mode 2026) begins or ends |
  *
  * ### Defining a write_pty callback
@@ -122,6 +123,74 @@ extern "C" {
  *
  * ### Registering effects and processing VT data
  * @snippet c-vt-effects/src/main.c effects-register
+ *
+ * ## Unsupported Sequences
+ *
+ * Programs sometimes send escape sequences that libghostty-vt does not
+ * implement, such as a newer protocol or one specific to your application.
+ * The terminal discards these by default. You can ask it to hand them to
+ * you instead, so your application can implement the protocol itself.
+ *
+ * Two options work together, and both must be set:
+ *
+ * - `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` installs the callback.
+ * - `GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES` sets how many bytes of each
+ *   sequence to keep. It defaults to zero, which turns the feature off.
+ *
+ * The callback receives a `GhosttyTerminalUnknownSequence`. Its tag says
+ * which kind of sequence arrived. APC and OSC sequences are reported today,
+ * and more kinds may be added later, so ignore any tag you don't handle.
+ *
+ * For OSC, the content is everything between `ESC ]` and the terminator,
+ * including the number that identifies the sequence. As an example,
+ * suppose your application invents its own OSC 7400 so that programs can
+ * report their status. If a program writes
+ * `ESC ] 7400;status=busy BEL`, the callback receives the content
+ * `7400;status=busy` and the terminator `GHOSTTY_OSC_TERMINATOR_BEL`.
+ * Match on the number followed by `;`, so that `7400;` does not also
+ * match an unrelated `74000;` sequence.
+ *
+ * Only numbers libghostty-vt does not recognize are reported. A sequence
+ * that uses a number it does implement, such as OSC 2 for the window title,
+ * is never reported, even when its contents are malformed.
+ *
+ * The callback runs while the terminal is processing input, so it can
+ * answer a query by writing straight to the pty. The reply stays in order
+ * with the terminal's own replies. Use the terminator from the request in
+ * your reply, since that is what the program expects.
+ *
+ * @code{.c}
+ * static void on_unknown_sequence(GhosttyTerminal terminal,
+ *                                 void* userdata,
+ *                                 const GhosttyTerminalUnknownSequence* seq) {
+ *   (void)terminal;
+ *   if (seq->tag != GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_OSC) return;
+ *
+ *   const GhosttyTerminalUnknownOscSequence* osc = &seq->value.osc;
+ *
+ *   // This protocol needs the whole sequence, so skip cut-off ones.
+ *   if (osc->truncated) return;
+ *
+ *   // Only handle OSC 7400. Everything else is ignored.
+ *   const char prefix[] = "7400;";
+ *   const size_t prefix_len = sizeof(prefix) - 1;
+ *   if (osc->content.len < prefix_len ||
+ *       memcmp(osc->content.ptr, prefix, prefix_len) != 0) return;
+ *
+ *   // The content is only valid during this call. Copy it if you need it
+ *   // later. my_app_handle_status is your own function.
+ *   my_app_handle_status(userdata,
+ *                        osc->content.ptr + prefix_len,
+ *                        osc->content.len - prefix_len);
+ * }
+ *
+ * // Keep up to 4 KiB of each unknown sequence and report them.
+ * size_t max_bytes = 4096;
+ * ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE,
+ *                      (const void*)on_unknown_sequence);
+ * ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES,
+ *                      &max_bytes);
+ * @endcode
  *
  * ## Color Theme
  *
@@ -342,16 +411,20 @@ typedef void (*GhosttyTerminalBellFn)(GhosttyTerminal terminal,
                                       void* userdata);
 
 /**
- * Unsupported terminal sequence tags.
+ * The kind of unsupported sequence passed to a
+ * GhosttyTerminalUnknownSequenceFn callback.
  *
- * Only APC sequences are currently reported. Additional sequence types may
- * be added without changing the callback shape.
+ * New kinds may be added in later versions. Callbacks should ignore any
+ * tag they don't handle.
  *
  * @ingroup terminal
  */
 typedef enum GHOSTTY_ENUM_TYPED {
   /** Application Program Command (APC). */
   GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_APC = 0,
+
+  /** Operating System Command (OSC). The value is in `value.osc`. */
+  GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_OSC = 1,
   GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalUnknownSequenceTag;
 
@@ -373,6 +446,47 @@ typedef struct {
 } GhosttyTerminalUnknownStringSequence;
 
 /**
+ * An OSC sequence whose number libghostty-vt does not implement.
+ *
+ * OSC sequences start with `ESC ]`, followed by a number that identifies
+ * the command, usually a `;`, and then the command's data. The sequence
+ * ends with either BEL or ESC followed by a backslash. For example, a
+ * program might write:
+ *
+ * @code
+ * ESC ] 7400;status=busy BEL
+ * @endcode
+ *
+ * For that sequence, `content` is `7400;status=busy` and `terminator`
+ * is GHOSTTY_OSC_TERMINATOR_BEL. See the Unsupported Sequences section of
+ * the terminal documentation for a complete example.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /**
+   * True if the sequence was longer than
+   * GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES, or memory ran out while
+   * reading it. In that case `content` holds only the beginning of the
+   * sequence.
+   */
+  bool truncated;
+
+  /**
+   * Everything between `ESC ]` and the terminator, including the number
+   * at the start. The bytes are not null-terminated and are only valid
+   * until the callback returns. Copy them if you need them later.
+   */
+  GhosttyString content;
+
+  /**
+   * How the program ended the sequence. If you send a reply, end it the
+   * same way.
+   */
+  GhosttyOscTerminator terminator;
+} GhosttyTerminalUnknownOscSequence;
+
+/**
  * Unsupported terminal sequence value.
  *
  * @ingroup terminal
@@ -380,6 +494,9 @@ typedef struct {
 typedef union {
   /** Application Program Command (APC). */
   GhosttyTerminalUnknownStringSequence apc;
+
+  /** Operating System Command (OSC). */
+  GhosttyTerminalUnknownOscSequence osc;
 
   /**
    * Padding for ABI compatibility. Do not use.
@@ -404,13 +521,25 @@ typedef struct {
 /**
  * Callback function type for unsupported terminal sequences.
  *
- * Called synchronously for normally terminated sequences whose identifier is
- * not supported by the active terminal handler. Aborted sequences, malformed
- * recognized commands, and explicitly disabled known protocols are ignored.
+ * Called once for each complete sequence that libghostty-vt does not
+ * implement. Check `sequence->tag` first, because more kinds of sequences
+ * may be reported in later versions.
  *
- * Capture must also be enabled with a nonzero
- * GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES value. Installing this callback alone
- * does not retain sequence content or allocate memory.
+ * These are not reported:
+ *
+ * - Sequences the program cancelled partway through with CAN or SUB.
+ * - Sequences libghostty-vt implements, even when their contents are
+ *   malformed.
+ * - Supported protocols that the embedder turned off.
+ *
+ * The callback runs during ghostty_terminal_vt_write(). It may write a reply
+ * to the pty, and that reply stays in order with the terminal's own
+ * replies. It must not call ghostty_terminal_vt_write() on the same
+ * terminal.
+ *
+ * Nothing is reported until GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES is also
+ * set to a nonzero value. Installing the callback by itself keeps no data
+ * and allocates no memory.
  *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
@@ -1597,21 +1726,33 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_OPT_MODE = 34,
 
   /**
-   * Callback invoked for unsupported terminal sequence identifiers. Set to
-   * NULL to ignore unsupported sequences. Capture must also be enabled with
-   * GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES.
+   * Callback for escape sequences that libghostty-vt does not implement.
+   * Set to NULL to stop receiving them.
+   *
+   * GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES must also be set, or the
+   * callback is never called. See the Unsupported Sequences section of the
+   * terminal documentation for an example.
    *
    * Input type: GhosttyTerminalUnknownSequenceFn
    */
   GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE = 35,
 
   /**
-   * Set the maximum content bytes retained for each unsupported terminal
-   * sequence. A NULL value pointer or zero disables capture and prevents
-   * unknown-sequence callbacks.
+   * The most bytes of each unsupported sequence to keep and pass to the
+   * GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE callback. The same limit applies
+   * to APC and OSC sequences.
    *
-   * When this limit is hit, the unknown sequence callback will still
-   * be invoked but `truncated` will be set to true.
+   * Zero, the default, turns unsupported sequence reporting off. A NULL
+   * value pointer also sets it to zero.
+   *
+   * A sequence longer than the limit is still reported. Its content holds
+   * the first bytes up to the limit, and `truncated` is true.
+   *
+   * Choose a limit that fits the largest sequence you expect. Unknown OSC
+   * sequences up to 2048 bytes are kept in a buffer the terminal already
+   * owns, so limits up to 2048 add no memory allocations for OSC. Larger
+   * limits allocate memory for each unknown OSC sequence. Unknown APC
+   * sequences are always kept in allocated memory.
    *
    * Input type: size_t*
    */

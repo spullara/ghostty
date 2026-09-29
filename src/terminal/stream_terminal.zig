@@ -91,10 +91,45 @@ pub const Handler = struct {
     /// with EFBIG.
     kitty_clipboard_write_max_bytes: usize = kitty_clipboard.max_write_size,
 
-    /// Called for sequence identifiers not supported by this library.
-    /// Currently, only APC is reported. Content is borrowed and only valid
-    /// for the duration of the callback. Set `apc_handler.unknown_max_bytes`
-    /// before starting the Stream to enable APC capture.
+    /// Called for escape sequences this library does not implement, so you
+    /// can implement them yourself. See `UnknownSequence` for the kinds of
+    /// sequences that are reported.
+    ///
+    /// Nothing is reported until you also set a byte limit for each kind
+    /// you want. The limits default to zero, which turns reporting off:
+    ///
+    ///   - APC: `apc_handler.unknown_max_bytes`
+    ///   - OSC: `Stream.Options.osc_unknown_max_bytes` when creating the
+    ///     stream, or `stream.parser.osc_parser.unknown_max_bytes` later.
+    ///
+    /// This example handles a made-up OSC 7400 and ignores everything
+    /// else:
+    ///
+    /// ```zig
+    /// fn onUnknown(handler: *Handler, seq: Handler.UnknownSequence) void {
+    ///     const v = switch (seq) {
+    ///         .osc => |v| v,
+    ///         else => return,
+    ///     };
+    ///
+    ///     // Match the number and its ";" so "74000;" is not included.
+    ///     const prefix = "7400;";
+    ///     if (v.truncated or !std.mem.startsWith(u8, v.content, prefix)) return;
+    ///     handleStatus(handler, v.content[prefix.len..]);
+    /// }
+    ///
+    /// var handler: Handler = .init(&terminal);
+    /// handler.unknown_sequence = &onUnknown;
+    /// var stream: Stream = .init(.{
+    ///     .allocator = alloc,
+    ///     .handler = handler,
+    ///     .osc_unknown_max_bytes = 4096,
+    /// });
+    /// ```
+    ///
+    /// The callback runs while the stream processes input. It may write a
+    /// reply to the pty, and the reply stays in order with the terminal's
+    /// own replies. It must not feed more input to the same stream.
     unknown_sequence: ?*const fn (*Handler, UnknownSequence) void = null,
 
     /// The name of the terminfo entry this terminal runs as, reported in
@@ -250,16 +285,27 @@ pub const Handler = struct {
         };
     };
 
-    /// A sequence unsupported by the active handler. Payload data is borrowed
-    /// only for the duration of the handler callback.
+    /// A sequence this library does not implement, passed to the
+    /// `unknown_sequence` callback. The data is only valid until the
+    /// callback returns. Copy it if you need it later.
+    ///
+    /// More kinds of sequences may be added later, so switch on this with
+    /// an `else` branch that ignores kinds you don't handle.
     pub const UnknownSequence = union(enum) {
+        /// An APC sequence (`ESC _`) whose identifier is not implemented.
         apc: String,
+
+        /// An OSC sequence (`ESC ]`) whose number is not implemented.
+        osc: Osc,
 
         /// Content between a string sequence's introducer and terminator.
         pub const String = struct {
             content: []const u8,
             truncated: bool,
         };
+
+        /// An OSC sequence whose number is not implemented.
+        pub const Osc = osc.Command.Unknown;
     };
 
     pub fn init(terminal: *Terminal) Handler {
@@ -525,6 +571,10 @@ pub const Handler = struct {
             .apc_put => self.apc_handler.feed(self.terminal.gpa(), value),
             .apc_put_slice => self.apc_handler.feedSlice(self.terminal.gpa(), value.bytes),
             .apc_end => self.apcEnd(value.terminated),
+
+            // Unrecognized OSC. The OSC parser already dropped aborted
+            // sequences, so everything that reaches here is reported.
+            .osc_unknown => self.unknownSequence(.{ .osc = value }),
 
             // Effect-based handlers
             .bell => self.bell(),
@@ -2108,6 +2158,7 @@ test "unknown APC effect callback" {
 
     const S = struct {
         var count: usize = 0;
+        var osc_count: usize = 0;
         var content: [16]u8 = undefined;
         var content_len: usize = undefined;
         var truncated: bool = undefined;
@@ -2119,11 +2170,13 @@ test "unknown APC effect callback" {
                     @memcpy(content[0..apc_value.content.len], apc_value.content);
                     truncated = apc_value.truncated;
                 },
+                .osc => osc_count += 1,
             }
             count += 1;
         }
     };
     S.count = 0;
+    S.osc_count = 0;
 
     var handler: Handler = .init(&t);
     handler.unknown_sequence = &S.unknownSequence;
@@ -2134,17 +2187,91 @@ test "unknown APC effect callback" {
     });
     defer s.deinit();
 
-    // Unknown OSC commands retain their legacy behavior and are ignored.
+    // The APC limit does not enable OSC capture, so unknown OSCs are
+    // still ignored.
     s.nextSlice("\x1B]999;abcdef\x07");
     s.nextSlice("\x1B_abcd;payload\x1B\\");
 
     try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqual(@as(usize, 0), S.osc_count);
     try testing.expectEqualStrings("abcd;pay", S.content[0..S.content_len]);
     try testing.expect(S.truncated);
 
     // Aborted unknown APCs are suppressed.
     s.nextSlice("\x1B_Xpayload\x18");
     try testing.expectEqual(@as(usize, 1), S.count);
+}
+
+test "unknown OSC effect callback" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var count: usize = 0;
+        var content: [32]u8 = undefined;
+        var content_len: usize = undefined;
+        var terminator: osc.Terminator = undefined;
+
+        fn unknownSequence(_: *Handler, value: Handler.UnknownSequence) void {
+            const v = switch (value) {
+                .osc => |v| v,
+                .apc => unreachable,
+            };
+            content_len = v.content.len;
+            @memcpy(content[0..v.content.len], v.content);
+            terminator = v.terminator;
+            count += 1;
+        }
+    };
+    S.count = 0;
+
+    var handler: Handler = .init(&t);
+    handler.unknown_sequence = &S.unknownSequence;
+    var s: Stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = handler,
+        .osc_unknown_max_bytes = 24,
+    });
+    defer s.deinit();
+
+    // ST through the stream's fast path.
+    s.nextSlice("\x1B]7400;status=busy\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqualStrings("7400;status=busy", S.content[0..S.content_len]);
+    try testing.expectEqual(osc.Terminator.st, S.terminator);
+
+    // BEL through the stream's fast path.
+    s.nextSlice("\x1B]7400;?\x07");
+    try testing.expectEqual(@as(usize, 2), S.count);
+    try testing.expectEqualStrings("7400;?", S.content[0..S.content_len]);
+    try testing.expectEqual(osc.Terminator.bel, S.terminator);
+
+    // Split across writes.
+    s.nextSlice("\x1B]74");
+    s.nextSlice("00;a");
+    s.nextSlice("b\x07");
+    try testing.expectEqual(@as(usize, 3), S.count);
+    try testing.expectEqualStrings("7400;ab", S.content[0..S.content_len]);
+
+    // Byte-at-a-time through the scalar path.
+    for ("\x1B]7400;cd\x1B\\") |ch| s.next(ch);
+    try testing.expectEqual(@as(usize, 4), S.count);
+    try testing.expectEqualStrings("7400;cd", S.content[0..S.content_len]);
+
+    // CAN and SUB abort through the generic parser and are suppressed.
+    s.nextSlice("\x1B]7400;x\x18");
+    s.nextSlice("\x1B]7400;x\x1A");
+    try testing.expectEqual(@as(usize, 4), S.count);
+
+    // Supported OSCs still take their normal path.
+    s.nextSlice("\x1B]2;title\x07");
+    try testing.expectEqual(@as(usize, 4), S.count);
+    try testing.expectEqualStrings("title", t.getTitle().?);
+
+    // Clearing the limit restores the old behavior.
+    s.parser.osc_parser.unknown_max_bytes = 0;
+    s.nextSlice("\x1B]7400;x\x07");
+    try testing.expectEqual(@as(usize, 4), S.count);
 }
 
 test "resize reports mode 2048 geometry" {
@@ -4922,6 +5049,50 @@ test "window_title effect with empty title" {
     s.nextSlice("\x1b]2;\x1b\\");
     try testing.expect(t.getTitle() == null);
     try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+}
+
+test "window_title not changed by cancelled OSC" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var title_changed_count: usize = 0;
+        fn titleChanged(_: *Handler) void {
+            title_changed_count += 1;
+        }
+    };
+    S.title_changed_count = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.title_changed = &S.titleChanged;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1b]2;before\x07");
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+
+    // Cancelled with CAN and SUB, fed in one slice.
+    s.nextSlice("\x1b]2;can\x18");
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+    s.nextSlice("\x1b]2;sub\x1a");
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+
+    // Cancelled with CAN and SUB, fed one byte at a time.
+    for ("\x1b]2;can\x18") |c| s.next(c);
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+    for ("\x1b]2;sub\x1a") |c| s.next(c);
+    try testing.expectEqualStrings("before", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 1), S.title_changed_count);
+
+    // An OSC that ends normally after a cancel still takes effect.
+    s.nextSlice("\x1b]2;after\x1b\\");
+    try testing.expectEqualStrings("after", t.getTitle().?);
+    try testing.expectEqual(@as(usize, 2), S.title_changed_count);
 }
 
 test "kitty_keyboard_query" {
