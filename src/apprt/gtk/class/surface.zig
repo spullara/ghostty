@@ -1543,7 +1543,7 @@ pub const Surface = extern struct {
         const gtk_scale: f32 = scale: {
             const surface_scale = scale_util.widgetSurfaceScale(widget);
             if (surface_scale <= 0) {
-                log.warn("widget surface scale was non-positive: {d}", .{surface_scale});
+                logWarnOnce("widget surface scale was non-positive: {d}", .{surface_scale});
                 break :scale 1.0;
             }
             break :scale @floatCast(surface_scale);
@@ -1555,7 +1555,7 @@ pub const Surface = extern struct {
             // gtk-xft-dpi is font DPI multiplied by 1024. See
             // https://docs.gtk.org/gtk4/property.Settings.gtk-xft-dpi.html
             const gtk_xft_dpi = gsettings.get(.@"gtk-xft-dpi") orelse {
-                log.warn("gtk-xft-dpi was not set, using default value", .{});
+                logWarnOnce("gtk-xft-dpi was not set, using default value", .{});
                 break :xft_scale 1.0;
             };
 
@@ -1567,7 +1567,7 @@ pub const Surface = extern struct {
                 // -1 is a valid value which specifies default scale.
                 // https://docs.gtk.org/gtk4/property.Settings.gtk-xft-dpi.html
                 if (gtk_xft_dpi != -1) {
-                    log.warn("gtk-xft-dpi has invalid value ({}), using default", .{gtk_xft_dpi});
+                    logWarnOnce("gtk-xft-dpi has invalid value ({}), using default", .{gtk_xft_dpi});
                 }
                 break :xft_scale 1.0;
             }
@@ -3944,6 +3944,23 @@ pub const Surface = extern struct {
         );
     };
 };
+
+/// Logs a warning once-ish for the given format string and argument types. It may log duplicates if called from
+/// multiple threads but will eventually stop.
+fn logWarnOnce(comptime format: []const u8, args: anytype) void {
+    const Static = struct {
+        /// key forces the compiler to instantiate this container per (format, argument type) i.e. roughly per call
+        /// site.
+        const key = .{ format, @TypeOf(args) };
+        var flag = false;
+    };
+    if (Static.flag) return else {
+        @branchHint(.unlikely);
+        // Don't care about load/store orders here. A few duplicates aren't critical.
+        Static.flag = true;
+    }
+    log.warn(format, args);
+}
 
 /// The state of the key event while we're doing IM composition.
 /// See gtkKeyPressed for detailed descriptions.

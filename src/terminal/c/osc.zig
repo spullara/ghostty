@@ -130,7 +130,7 @@ fn commandDataTyped(
     comptime data: CommandData,
     out: *data.OutType(),
 ) bool {
-    const command = command_.?;
+    const command = command_ orelse return false;
     switch (data) {
         .invalid => return false,
         .change_window_title_str => switch (command.*) {
@@ -167,6 +167,12 @@ test "alloc" {
 test "command type null" {
     const testing = std.testing;
     try testing.expectEqual(.invalid, commandType(null));
+}
+
+test "command data null" {
+    const testing = std.testing;
+    var title: [*:0]const u8 = undefined;
+    try testing.expect(!commandData(null, .change_window_title_str, @ptrCast(&title)));
 }
 
 test "change window title" {

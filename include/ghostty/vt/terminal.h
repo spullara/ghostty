@@ -102,6 +102,8 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT`  | `GhosttyTerminalProgressReportFn` | Progress report via OSC 9;4               |
  * | `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` | `GhosttyTerminalUnknownSequenceFn` | APC or OSC sequence that libghostty-vt does not implement (see Unsupported Sequences) |
  * | `GHOSTTY_TERMINAL_OPT_RENDER_HOLD`      | `GhosttyTerminalRenderHoldFn`     | Synchronized output (mode 2026) begins or ends |
+ * | `GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT`  | `GhosttyTerminalSemanticPromptFn` | Shell reports a prompt or command step via OSC 133 |
+ * | `GHOSTTY_TERMINAL_OPT_RESET`            | `GhosttyTerminalResetFn`          | Full reset (RIS, ESC c)                   |
  *
  * ### Defining a write_pty callback
  * @snippet c-vt-effects/src/main.c effects-write-pty
@@ -1042,6 +1044,180 @@ typedef void (*GhosttyTerminalProgressReportFn)(
     const GhosttyTerminalProgressReport* report);
 
 /**
+ * The step of a command that a shell integration event reports.
+ *
+ * More kinds may be added in later versions, so ignore any kind you don't
+ * handle.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Never reported. This exists so that a zeroed value is not mistaken
+   * for a real event. */
+  GHOSTTY_SEMANTIC_PROMPT_INVALID = 0,
+
+  /** The shell started drawing a prompt. `prompt_kind` says which one. */
+  GHOSTTY_SEMANTIC_PROMPT_PROMPT_START = 1,
+
+  /** The prompt is drawn and the user can start typing a command. */
+  GHOSTTY_SEMANTIC_PROMPT_INPUT_START = 2,
+
+  /** The user submitted the command and it started running. Anything the
+   * terminal receives after this is the command's output. */
+  GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START = 3,
+
+  /** The command finished running. */
+  GHOSTTY_SEMANTIC_PROMPT_COMMAND_END = 4,
+  GHOSTTY_SEMANTIC_PROMPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttySemanticPromptKind;
+
+/**
+ * Which prompt a `GHOSTTY_SEMANTIC_PROMPT_PROMPT_START` event starts.
+ *
+ * Most shells only draw a primary prompt. Some also draw a prompt on the
+ * right side of the line, or a prompt at the start of each extra line
+ * when a command spans several lines.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** The main prompt shown before each command. This is used when the
+   * shell doesn't say which prompt it is drawing. */
+  GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY = 0,
+
+  /** A prompt drawn at the right edge of the line, such as zsh's
+   * RPROMPT. */
+  GHOSTTY_SEMANTIC_PROMPT_PROMPT_RIGHT = 1,
+
+  /** A prompt at the start of an extra line of a command that spans
+   * several lines. */
+  GHOSTTY_SEMANTIC_PROMPT_PROMPT_CONTINUATION = 2,
+
+  /** Another prompt for an extra line of input, such as bash's PS2.
+   * Shells differ in whether they report extra lines as continuation or
+   * secondary prompts, so most applications should treat the two the
+   * same. */
+  GHOSTTY_SEMANTIC_PROMPT_PROMPT_SECONDARY = 3,
+  GHOSTTY_SEMANTIC_PROMPT_PROMPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttySemanticPromptPromptKind;
+
+/**
+ * A shell integration event, passed to the
+ * `GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT` callback.
+ *
+ * `kind` says which step of the command this is. The other fields only
+ * carry information for the kinds listed on each field, and are zero or
+ * empty otherwise.
+ *
+ * Strings are only valid during the callback. Copy them if you need them
+ * later.
+ *
+ * This is a sized struct. Later versions may add fields at the end, and
+ * `size` tells you which fields are present. Every field below has been
+ * present since this struct was introduced, so you only need to check
+ * `size` before reading fields added later. Two fields are likely to be
+ * added in the future:
+ *
+ * - An identifier the shell assigns to each command.
+ * - A flag on `GHOSTTY_SEMANTIC_PROMPT_PROMPT_START` that says the shell
+ *   redrew a prompt it had already drawn, instead of starting a new one.
+ *
+ * Neither exists yet.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. */
+  size_t size;
+
+  /** Which step of the command this event reports. */
+  GhosttySemanticPromptKind kind;
+
+  /** Which prompt is starting. Set for
+   * `GHOSTTY_SEMANTIC_PROMPT_PROMPT_START`. Always
+   * `GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY` for other kinds. */
+  GhosttySemanticPromptPromptKind prompt_kind;
+
+  /** True if the shell reported the command's exit code. Only ever true
+   * for `GHOSTTY_SEMANTIC_PROMPT_COMMAND_END`. */
+  bool has_exit_code;
+
+  /** The command's exit code. Only meaningful when `has_exit_code` is
+   * true. Exit codes can be negative, for example on Windows, so use
+   * `has_exit_code` rather than a special value to tell whether one was
+   * reported. */
+  int32_t exit_code;
+
+  /** The command line that is about to run, for
+   * `GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START`. The shell sends it encoded,
+   * and this is the decoded text. Empty (len=0) if the shell didn't send
+   * one or it couldn't be decoded. */
+  GhosttyString command;
+
+  /** A description of what went wrong, for
+   * `GHOSTTY_SEMANTIC_PROMPT_COMMAND_END` when the shell sent one. Empty
+   * (len=0) otherwise. Few shells send this. The exit code is the usual
+   * way to tell whether a command failed. */
+  GhosttyString error;
+} GhosttyTerminalSemanticPrompt;
+
+/**
+ * Callback function type for semantic_prompt.
+ *
+ * Called when the shell reports a step of a command. Each command goes
+ * through four steps, in this order: the prompt starts, input starts,
+ * output starts, and the command ends. Then the next prompt starts.
+ *
+ * Shells differ in what they report. Many don't send the command line or
+ * the exit code, and some skip steps, so handle each event on its own
+ * instead of expecting a strict order. A shell may also start the same
+ * prompt more than once, for example when it redraws the prompt after a
+ * resize, so treat a repeated `GHOSTTY_SEMANTIC_PROMPT_PROMPT_START` as
+ * harmless.
+ *
+ * The terminal has already updated its screen when this is called. A
+ * sequence the terminal rejects as malformed is never reported.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param event The event. It and its strings are only valid during the
+ *              call.
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalSemanticPromptFn)(
+    GhosttyTerminal terminal,
+    void* userdata,
+    const GhosttyTerminalSemanticPrompt* event);
+
+/**
+ * Callback function type for reset.
+ *
+ * Called when the running program performs a full reset (RIS, `ESC c`).
+ * A full reset clears the screen and scrollback, returns modes to their
+ * defaults, and clears the title and working directory. Use this callback
+ * to reset any state your application keeps about what's running in the
+ * terminal, such as the current command.
+ *
+ * The terminal has already reset itself when this is called. The
+ * GHOSTTY_TERMINAL_OPT_TITLE_CHANGED and GHOSTTY_TERMINAL_OPT_PWD_CHANGED
+ * callbacks are not called for the cleared title and working directory,
+ * so update anything you show for them here. A full reset also removes
+ * any progress report. If you set GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT,
+ * that callback is called before this one.
+ *
+ * A soft reset (DECSTR, `CSI ! p`) only resets a few modes and doesn't
+ * call this.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalResetFn)(GhosttyTerminal terminal,
+                                       void* userdata);
+
+/**
  * Callback function type for color scheme queries (CSI ? 996 n).
  *
  * Called when the terminal receives a color scheme device status report
@@ -1844,6 +2020,23 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalRenderHoldFn
    */
   GHOSTTY_TERMINAL_OPT_RENDER_HOLD = 41,
+
+  /**
+   * Callback invoked when the shell reports a step of a command: a prompt
+   * starts, input starts, output starts, or the command ends. Set to NULL
+   * to ignore these events.
+   *
+   * Input type: GhosttyTerminalSemanticPromptFn
+   */
+  GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT = 42,
+
+  /**
+   * Callback invoked after the running program performs a full reset
+   * (RIS, ESC c). Set to NULL to ignore resets.
+   *
+   * Input type: GhosttyTerminalResetFn
+   */
+  GHOSTTY_TERMINAL_OPT_RESET = 43,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -2315,7 +2508,8 @@ GHOSTTY_API void ghostty_terminal_reset(GhosttyTerminal terminal);
  *
  * Changes the number of columns and rows in the terminal. The primary
  * screen will reflow content if wraparound mode is enabled; the alternate
- * screen does not reflow. If the dimensions are unchanged, this is a no-op.
+ * screen does not reflow. If the dimensions are unchanged, the grid is
+ * left as is, but everything below still applies.
  *
  * This also updates the terminal's pixel dimensions (used for image
  * protocols and size reports), disables synchronized output mode (allowed

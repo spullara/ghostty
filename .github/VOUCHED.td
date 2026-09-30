@@ -83,6 +83,7 @@ cespare
 charliie-dev
 chernetskyi
 chronologos
+clemg
 cmwetherell
 crayxt
 craziestowl
@@ -149,6 +150,7 @@ gpanders
 guilhermetk
 -guysoft LLM communication (likely automated)
 h3nock
+hackattack
 hakonhagland
 halosatrio
 heaths
@@ -156,6 +158,7 @@ heddxh heddxh
 helium777
 -highimpact-dev Disrespectful AI user
 hlcfan
+howdeploy
 hqnna
 hulet
 i999rri
@@ -281,6 +284,7 @@ pouwerkerk
 poweruser64
 prakhar54-byte
 preiter93
+pressatojump
 prihlop
 priyans-hu
 pssalman
@@ -320,6 +324,7 @@ silveirapf
 simonbcn
 slowdub
 slsrepo
+stepankandrushin
 steven-tk
 sunshine-syz
 svector-anu

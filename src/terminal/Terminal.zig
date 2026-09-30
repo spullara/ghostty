@@ -4931,27 +4931,24 @@ pub fn plainStringUnwrapped(self: *Terminal, alloc: Allocator) ![]const u8 {
 pub fn fullReset(self: *Terminal) void {
     // Ensure we're back on primary screen
     self.screens.switchTo(.primary);
-    self.screens.remove(
-        self.screens.active.alloc,
-        .alternate,
-    );
 
-    // Reset our screens
+    // Remove alternate screen
+    self.screens.remove(self.screens.active.alloc, .alternate);
+
+    // Reset primary screen
     self.screens.active.reset();
 
-    // Rest our basic state
-    const visible = self.flags.visible;
-    const resize_pull_scrollback = self.flags.resize_pull_scrollback;
-    self.modes.reset();
+    // Reset our basic state
     self.flags = .{
         // Visibility belongs to the view rather than terminal state, so a
         // terminal reset must not make a hidden view potentially visible.
-        .visible = visible,
+        .visible = self.flags.visible,
 
         // This is configuration based on the pty rather than terminal
         // state, so a terminal reset must not change it.
-        .resize_pull_scrollback = resize_pull_scrollback,
+        .resize_pull_scrollback = self.flags.resize_pull_scrollback,
     };
+    self.modes.reset();
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
     self.pwd.clearRetainingCapacity();
@@ -4968,6 +4965,7 @@ pub fn fullReset(self: *Terminal) void {
         .right = self.cols - 1,
     };
     self.setCursorStyle(.default);
+    self.colors.palette.resetAll();
 
     // Always mark dirty so we redraw everything
     self.flags.dirty.clear = true;
@@ -16145,6 +16143,66 @@ test "Terminal: resize with reflow and saved cursor pending wrap" {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("1A2BX", str);
+    }
+}
+
+test "Terminal: saved cursor survives repeated widening" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try t.printString("abc\nAAA|");
+    t.saveCursor();
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
+    try t.resize(alloc, .{ .cols = 6, .rows = 5 });
+    t.restoreCursor();
+    try t.print('X');
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("abc\nAAA|X", str);
+}
+
+test "Terminal: resize pending wrap live and saved cursors" {
+    const alloc = testing.allocator;
+    const cases = [_]struct {
+        text: []const u8,
+        cols: size.CellCountInt,
+        pending_wrap: bool,
+        expected: []const u8,
+    }{
+        // Widening leaves room after the formerly full line.
+        .{ .text = "ABCD", .cols = 6, .pending_wrap = false, .expected = "ABCDX" },
+        // Narrowing can move the last character into the middle of a row.
+        .{ .text = "ABCD", .cols = 3, .pending_wrap = false, .expected = "ABC\nDX" },
+        // Keep pending wrap when the last character still fills a row.
+        .{ .text = "ABCD", .cols = 2, .pending_wrap = true, .expected = "AB\nCD\nX" },
+        // A height-only resize also preserves pending wrap.
+        .{ .text = "ABCD", .cols = 4, .pending_wrap = true, .expected = "ABCD\nX" },
+        // Reflow can merge previously wrapped rows.
+        .{ .text = "ABCDEFGH", .cols = 6, .pending_wrap = false, .expected = "ABCDEF\nGHX" },
+        // A wide character at the old right edge must not be overwritten.
+        .{ .text = "AB界", .cols = 6, .pending_wrap = false, .expected = "AB界X" },
+        // A cursor without pending wrap must not advance an extra cell.
+        .{ .text = "ABC", .cols = 6, .pending_wrap = false, .expected = "ABCX" },
+    };
+
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |restore| {
+            var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+            defer t.deinit(alloc);
+            try t.printString(case.text);
+            if (restore) t.saveCursor();
+
+            try t.resize(alloc, .{ .cols = case.cols, .rows = 6 });
+            if (restore) t.restoreCursor();
+            try testing.expectEqual(case.pending_wrap, t.screens.active.cursor.pending_wrap);
+
+            try t.print('X');
+            const str = try t.plainString(alloc);
+            defer alloc.free(str);
+            try testing.expectEqualStrings(case.expected, str);
+        }
     }
 }
 

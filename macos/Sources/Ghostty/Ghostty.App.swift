@@ -423,7 +423,6 @@ extension Ghostty {
                 surface: surfaceView,
                 contents: display,
                 kind: kind,
-                programName: c.name.map { String(cString: $0) },
                 canRemember: c.can_remember,
                 previewImage: previewImage
             ) { surfaceView, confirmed, remember in
