@@ -391,6 +391,30 @@ pub fn assertIntegrity(self: *const Screen) void {
     }
 }
 
+/// The memory held by a screen. Returned by `memoryUsage`.
+pub const MemoryUsage = struct {
+    /// Page memory, which holds every cell along with its styles,
+    /// graphemes and hyperlinks.
+    pages: PageList.MemoryUsage = .{},
+
+    /// Bytes of image data stored through the Kitty graphics protocol.
+    /// Images are stored outside of pages, so this is not part of `pages`.
+    /// Always zero when Kitty graphics is disabled at build time.
+    image_bytes: usize = 0,
+};
+
+/// Return the memory held by this screen. Like `PageList.memoryUsage`,
+/// this never restores a compressed page but does visit every page.
+pub fn memoryUsage(self: *const Screen) MemoryUsage {
+    return .{
+        .pages = self.pages.memoryUsage(),
+        .image_bytes = if (comptime build_options.kitty_graphics)
+            self.kitty_images.total_bytes
+        else
+            0,
+    };
+}
+
 /// Reset the screen according to the logic of a DEC RIS sequence.
 ///
 /// - Clears the screen and attempts to reclaim memory.

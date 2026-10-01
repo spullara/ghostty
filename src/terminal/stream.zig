@@ -132,6 +132,7 @@ pub const Action = union(Key) {
     kitty_dnd: KittyDnd,
     resize_window: ResizeWindow,
     osc_unknown: osc.Command.Unknown,
+    mouse_shape_reset,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -235,6 +236,7 @@ pub const Action = union(Key) {
             "kitty_dnd",
             "resize_window",
             "osc_unknown",
+            "mouse_shape_reset",
         },
     );
 
@@ -2664,6 +2666,11 @@ pub fn Stream(comptime H: type) type {
                 },
 
                 .mouse_shape => |v| {
+                    if (v.value.len == 0) {
+                        self.handler.vt(.mouse_shape_reset, {});
+                        return;
+                    }
+
                     const shape = MouseShape.fromString(v.value) orelse {
                         @branchHint(.unlikely);
                         log.warn("unknown cursor shape: {s}", .{v.value});

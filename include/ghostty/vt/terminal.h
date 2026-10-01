@@ -400,6 +400,114 @@ typedef struct {
 } GhosttyTerminalScrollbar;
 
 /**
+ * Memory held by a terminal.
+ *
+ * Read with ghostty_terminal_get() and
+ * `GHOSTTY_TERMINAL_DATA_MEMORY_USAGE`. This helps applications that host
+ * many terminals stay within a memory budget, for example by compressing
+ * or closing the terminals that hold the most memory first.
+ *
+ * Most of a terminal's memory goes to its screen contents and scrollback,
+ * which are stored in fixed-size blocks called pages. Resident bytes are
+ * the physical memory pages use right now, and are the figure to budget
+ * against. Virtual bytes are the address space reserved for pages.
+ * Compressing scrollback lowers the resident figure but not the virtual
+ * one, because each page's space stays reserved for decompression.
+ *
+ * This is a sized struct. Set `size` before the call, most easily with
+ * GHOSTTY_INIT_SIZED(). Later versions of libghostty-vt may add fields to
+ * the end of this struct, and the size tells the library which version
+ * your program was compiled against. This lets older programs keep working
+ * with newer versions of the library.
+ *
+ * Each screen has its own set of fields, named with a `primary_` or
+ * `alternate_` prefix. The primary screen holds shell output and all of
+ * the scrollback. The alternate screen is used by full-screen programs
+ * such as text editors, and its fields are all zero until a program first
+ * switches to it. Add the two sets together for the terminal's total.
+ *
+ * Everything the terminal displays is stored inside pages, including
+ * colors, styles and hyperlinks, so those are already part of the page
+ * figures. Images are stored separately and have their own fields. Small
+ * structures outside of pages, such as the window title and internal
+ * bookkeeping, are not counted. They are small next to the pages once a
+ * terminal has any scrollback.
+ *
+ * On macOS, the operating system takes back memory freed by compression
+ * lazily, when something else needs it. Until then, the memory use the
+ * system reports for your process (its RSS) can be higher than the
+ * resident figures here.
+ *
+ * @snippet c-vt-compression/src/main.c memory-usage
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. Set by the caller. */
+  size_t size;
+
+  /**
+   * Whether compressing scrollback can free memory on this platform. When
+   * false, ghostty_terminal_compress() reports
+   * `GHOSTTY_TERMINAL_COMPRESSION_RESULT_UNSUPPORTED` and the compressed
+   * fields are always zero. To reduce a terminal's memory on such a
+   * platform, you have to do something else, such as closing it.
+   */
+  bool compression_supported;
+
+  /** Number of pages in the primary screen, including compressed pages. */
+  uint64_t primary_pages;
+
+  /**
+   * Bytes of address space reserved for the primary screen's pages. This
+   * includes compressed pages and spare pages kept ready for reuse.
+   * Always at least `primary_resident_bytes`.
+   */
+  uint64_t primary_virtual_bytes;
+
+  /**
+   * Bytes of physical memory used by the primary screen's pages. A
+   * compressed page counts only its compressed size. Use this figure for
+   * memory budgets.
+   */
+  uint64_t primary_resident_bytes;
+
+  /** Number of the primary screen's pages that are compressed. */
+  uint64_t primary_compressed_pages;
+
+  /**
+   * Bytes of compressed data held for the primary screen's compressed
+   * pages. This is already included in `primary_resident_bytes`.
+   */
+  uint64_t primary_compressed_bytes;
+
+  /**
+   * Bytes of image data stored for the primary screen through the Kitty
+   * graphics protocol. This is not included in `primary_resident_bytes`.
+   * Always zero when libghostty-vt is built without Kitty graphics.
+   */
+  uint64_t primary_image_bytes;
+
+  /** The same as `primary_pages`, for the alternate screen. */
+  uint64_t alternate_pages;
+
+  /** The same as `primary_virtual_bytes`, for the alternate screen. */
+  uint64_t alternate_virtual_bytes;
+
+  /** The same as `primary_resident_bytes`, for the alternate screen. */
+  uint64_t alternate_resident_bytes;
+
+  /** The same as `primary_compressed_pages`, for the alternate screen. */
+  uint64_t alternate_compressed_pages;
+
+  /** The same as `primary_compressed_bytes`, for the alternate screen. */
+  uint64_t alternate_compressed_bytes;
+
+  /** The same as `primary_image_bytes`, for the alternate screen. */
+  uint64_t alternate_image_bytes;
+} GhosttyTerminalMemoryUsage;
+
+/**
  * Callback function type for bell.
  *
  * Called when the terminal receives a BEL character (0x07).
@@ -2452,6 +2560,21 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyMouseShape *
    */
   GHOSTTY_TERMINAL_DATA_MOUSE_SHAPE = 41,
+
+  /**
+   * How much memory the terminal holds. See GhosttyTerminalMemoryUsage
+   * for what each field means.
+   *
+   * Set the struct's `size` field before the call, for example with
+   * GHOSTTY_INIT_SIZED(). If `size` is too small, this returns
+   * GHOSTTY_INVALID_VALUE and leaves the struct unchanged.
+   *
+   * This never decompresses scrollback, but it does look at every page, so
+   * avoid reading it after every write.
+   *
+   * Output type: GhosttyTerminalMemoryUsage *
+   */
+  GHOSTTY_TERMINAL_DATA_MEMORY_USAGE = 42,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

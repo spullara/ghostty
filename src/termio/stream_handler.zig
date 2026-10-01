@@ -342,6 +342,9 @@ pub const StreamHandler = struct {
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
             .mouse_shape => try self.setMouseShape(value),
+            .mouse_shape_reset => try self.setMouseShape(
+                if (self.terminal.flags.mouse_event != .none) .default else .text,
+            ),
             .configure_charset => self.configureCharset(value.slot, value.charset),
             .set_attribute => {
                 @branchHint(.likely);

@@ -457,6 +457,7 @@ pub const Parser = struct {
         @"77",
         @"99",
         @"104",
+        @"105",
         @"110",
         @"111",
         @"112",
@@ -888,11 +889,7 @@ pub const Parser = struct {
             .@"10" => switch (c) {
                 ';' => if (self.ensureAllocator()) self.captureTrailing(.fixed),
                 '4' => self.state = .@"104",
-                else => self.unknownOrInvalid(c),
-            },
-
-            .@"104" => switch (c) {
-                ';' => if (self.ensureAllocator()) self.captureTrailing(.fixed),
+                '5' => self.state = .@"105",
                 else => self.unknownOrInvalid(c),
             },
 
@@ -920,6 +917,8 @@ pub const Parser = struct {
             .@"18",
             .@"19",
             .@"21",
+            .@"104",
+            .@"105",
             .@"110",
             .@"111",
             .@"112",
@@ -1110,6 +1109,7 @@ pub const Parser = struct {
             .@"18",
             .@"19",
             .@"104",
+            .@"105",
             .@"110",
             .@"111",
             .@"112",

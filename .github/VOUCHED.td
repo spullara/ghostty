@@ -87,6 +87,7 @@ clemg
 cmwetherell
 crayxt
 craziestowl
+-creativision meatproxying
 cristeahub
 curtismoncoq
 -cznorth Automated advertising + likely AI communication
@@ -248,6 +249,7 @@ mrconnorkenway
 mrmage
 mtak
 mustafa0x
+myleshen
 nagato-yuzuru
 natesmyth
 neo773

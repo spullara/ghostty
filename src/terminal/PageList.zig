@@ -4427,15 +4427,41 @@ pub const PageAllocation = struct {
         prepend,
     };
 
+    /// Options for `finalize`.
+    pub const FinalizeOptions = struct {
+        /// Compress the page after it is added, unless it is visible in the
+        /// viewport.
+        ///
+        /// Use this when adding many pages of old history one at a time,
+        /// such as when restoring a snapshot, so that the full history is
+        /// never held uncompressed in memory. Compression is best effort.
+        /// A page that does not compress well, or a platform that does not
+        /// support compression, leaves the page uncompressed without an
+        /// error. Accessing a compressed page later uncompresses it
+        /// automatically.
+        compress: bool = false,
+    };
+
     /// Finalize this complete page and transfer its ownership to the PageList.
-    /// The parameter determines where it goes into the PageList.
+    /// The location determines where it goes into the PageList.
     ///
     /// Existing pages and tracked pins keep their identity. A pinned viewport
     /// keeps showing the same content while its cached absolute row offset
     /// moves down by the number of newly inserted rows.
-    pub fn finalize(self: *PageAllocation, location: Location) FinalizeError!void {
+    ///
+    /// ```zig
+    /// var allocation = try pages.allocatePage(capacity);
+    /// defer allocation.deinit();
+    /// // ... fill in allocation.page() ...
+    /// try allocation.finalize(.prepend, .{ .compress = true });
+    /// ```
+    pub fn finalize(
+        self: *PageAllocation,
+        location: Location,
+        options: FinalizeOptions,
+    ) FinalizeError!void {
         switch (location) {
-            .prepend => return try self.prepend(),
+            .prepend => return try self.prepend(options),
         }
     }
 
@@ -4447,7 +4473,7 @@ pub const PageAllocation = struct {
         MaxLinesExceeded,
     };
 
-    fn prepend(self: *PageAllocation) FinalizeError!void {
+    fn prepend(self: *PageAllocation, options: FinalizeOptions) FinalizeError!void {
         const destination = self.destination;
         const node = self.node.?;
 
@@ -4493,6 +4519,17 @@ pub const PageAllocation = struct {
 
         destination.assertIntegrity();
         self.node = null;
+
+        // A prepended page is above every existing page, so it is never part
+        // of the active area. It is visible only when the viewport is at the
+        // top of the scrollback, which makes it the first visible page. A
+        // failed compression leaves the page uncompressed and is not an error.
+        if (options.compress and
+            terminal_mem.canReclaim(.strict) and
+            destination.getTopLeft(.viewport).node != node)
+        {
+            _ = destination.compressPage(node);
+        }
     }
 };
 
@@ -6885,6 +6922,51 @@ pub fn memoryStats(self: *const PageList) MemoryStats {
     return result;
 }
 
+/// The memory held by a page list. Returned by `memoryUsage`.
+pub const MemoryUsage = struct {
+    /// Number of pages in the list, including compressed pages.
+    pages: usize = 0,
+
+    /// Bytes of address space reserved for page memory. This counts every
+    /// page in the list at its full allocated size, whether it is resident
+    /// or compressed, plus the unused items held by the page pool. Unused
+    /// pool items have had their physical memory released, so they add to
+    /// this figure but never to `resident_bytes`.
+    virtual_bytes: usize = 0,
+
+    /// Bytes of physical memory used by pages. A resident page counts its
+    /// full allocated size. A compressed page counts its encoded data plus
+    /// any unused tail of its pool item, which compression doesn't release.
+    /// This is the same as `MemoryStats.estimatedResidentBytes`.
+    resident_bytes: usize = 0,
+
+    /// Number of pages stored compressed.
+    compressed_pages: usize = 0,
+
+    /// Total size of the encoded data of compressed pages. This is already
+    /// part of `resident_bytes`.
+    compressed_bytes: usize = 0,
+};
+
+/// Return the memory held by this page list, summarized for callers that
+/// budget memory across many terminals. See `memoryStats` for a more
+/// detailed breakdown.
+///
+/// This never restores a compressed page. It does visit every page, so its
+/// cost grows with the scrollback. Call it periodically rather than after
+/// every write.
+pub fn memoryUsage(self: *const PageList) MemoryUsage {
+    const stats = self.memoryStats();
+    return .{
+        .pages = stats.resident_pages + stats.compressed_pages,
+        .virtual_bytes = self.page_size +
+            self.pool.pages.freeCount() * PagePool.item_size,
+        .resident_bytes = stats.estimatedResidentBytes(),
+        .compressed_pages = stats.compressed_pages,
+        .compressed_bytes = stats.encoded_bytes,
+    };
+}
+
 /// Grow the number of rows available in the page list by n.
 /// This is only used for testing so it isn't optimized in any way.
 fn growRows(self: *PageList, n: usize) Allocator.Error!void {
@@ -7843,7 +7925,7 @@ test "PageList PageAllocation finalizes pages and preserves live state" {
         const page = allocation.page();
         page.size.rows = 1;
         page.getRowAndCell(0, 0).cell.* = .init('B');
-        try allocation.finalize(.prepend);
+        try allocation.finalize(.prepend, .{});
     }
     {
         var allocation = try result.allocatePage(.{ .cols = 2, .rows = 2 });
@@ -7851,7 +7933,7 @@ test "PageList PageAllocation finalizes pages and preserves live state" {
         const page = allocation.page();
         page.size.rows = 2;
         page.getRowAndCell(0, 0).cell.* = .init('A');
-        try allocation.finalize(.prepend);
+        try allocation.finalize(.prepend, .{});
     }
 
     // Repeated prepends reconstruct oldest-to-newest order without replacing
@@ -7883,6 +7965,72 @@ test "PageList PageAllocation finalizes pages and preserves live state" {
     try testing.expectEqual(@as(usize, 2), scrollbar_state.len);
 
     result.assertIntegrity();
+}
+
+test "PageList PageAllocation compresses prepended pages unless visible" {
+    const testing = std.testing;
+
+    const Case = struct {
+        /// How to position the viewport before prepending.
+        viewport: enum { active, pin, top },
+
+        /// Whether the prepended page should end up compressed.
+        compressed: bool,
+    };
+    const cases = [_]Case{
+        // The viewport shows the active area, far below the new page.
+        .{ .viewport = .active, .compressed = true },
+
+        // The viewport is pinned to existing history, which is still below
+        // the new page.
+        .{ .viewport = .pin, .compressed = true },
+
+        // The viewport follows the top of the scrollback, so the new page
+        // becomes the first visible page.
+        .{ .viewport = .top, .compressed = false },
+    };
+
+    for (cases) |case| {
+        var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+        defer s.deinit();
+        try s.growColdPagesForTest(1);
+        switch (case.viewport) {
+            .active => {},
+            .pin => s.scroll(.{ .row = 1 }),
+            .top => s.scroll(.{ .top = {} }),
+        }
+        try testing.expectEqual(
+            @as(Viewport, switch (case.viewport) {
+                .active => .active,
+                .pin => .pin,
+                .top => .top,
+            }),
+            s.viewport,
+        );
+
+        // A full-size page so compression is worthwhile.
+        const capacity = s.pages.first.?.capacity();
+        var allocation = try s.allocatePage(capacity);
+        defer allocation.deinit();
+        const page = allocation.page();
+        page.size.rows = capacity.rows;
+        page.getRowAndCell(0, 0).cell.* = .init('X');
+        try allocation.finalize(.prepend, .{ .compress = true });
+
+        const node = s.pages.first.?;
+        try testing.expectEqual(case.compressed, node.isCompressed());
+        try testing.expectEqual(
+            @as(usize, if (case.compressed) 1 else 0),
+            s.memoryStats().compressed_pages,
+        );
+
+        // Reading the page uncompresses it with its contents intact.
+        try testing.expectEqual(
+            @as(u21, 'X'),
+            node.page().getRowAndCell(0, 0).cell.codepoint(),
+        );
+        s.assertIntegrity();
+    }
 }
 
 test "PageList PageAllocation stays detached until finalize" {
@@ -7919,7 +8067,7 @@ test "PageList PageAllocation stays detached until finalize" {
     defer invalid.deinit();
     try testing.expectError(
         error.InvalidPageDimensions,
-        invalid.finalize(.prepend),
+        invalid.finalize(.prepend, .{}),
     );
 
     try testing.expectEqual(initial_first, result.pages.first.?);
@@ -7946,7 +8094,7 @@ test "PageList PageAllocation rejects limits before modifying the destination" {
         var allocation = try result.allocatePage(.{ .cols = 1, .rows = 1 });
         defer allocation.deinit();
         allocation.page().size.rows = 1;
-        try allocation.finalize(.prepend);
+        try allocation.finalize(.prepend, .{});
     }
 
     const before_first = result.pages.first.?;
@@ -7958,7 +8106,7 @@ test "PageList PageAllocation rejects limits before modifying the destination" {
     allocation.page().size.rows = 1;
     try testing.expectError(
         error.MaxSizeExceeded,
-        allocation.finalize(.prepend),
+        allocation.finalize(.prepend, .{}),
     );
 
     try testing.expectEqual(before_first, result.pages.first.?);
@@ -8855,6 +9003,63 @@ test "PageList incremental compression keeps progress after tail growth" {
     const continued = s.compress(.incremental);
     try testing.expectEqual(IncrementalCompressionResult.pending, continued);
     try testing.expect(s.page_compression.flags.verifying);
+}
+
+test "PageList memory usage" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+
+    // A fresh list holds the preheated pool items, one of which backs
+    // the only page.
+    const fresh = s.memoryUsage();
+    try testing.expectEqual(s.totalPages(), fresh.pages);
+    try testing.expectEqual(page_preheat * PagePool.item_size, fresh.virtual_bytes);
+    try testing.expectEqual(s.page_size, fresh.resident_bytes);
+    try testing.expect(fresh.resident_bytes <= fresh.virtual_bytes);
+    try testing.expectEqual(@as(usize, 0), fresh.compressed_pages);
+    try testing.expectEqual(@as(usize, 0), fresh.compressed_bytes);
+
+    try s.growColdPagesForTest(2);
+    const before = s.memoryUsage();
+    try testing.expectEqual(s.totalPages(), before.pages);
+    try testing.expectEqual(
+        s.page_size + s.pool.pages.freeCount() * PagePool.item_size,
+        before.virtual_bytes,
+    );
+    try testing.expect(before.resident_bytes <= before.virtual_bytes);
+
+    // Compression changes residency but not address space.
+    _ = s.compress(.full);
+    const compressed = s.memoryUsage();
+    try testing.expectEqual(before.pages, compressed.pages);
+    try testing.expectEqual(before.virtual_bytes, compressed.virtual_bytes);
+    try testing.expect(compressed.resident_bytes < before.resident_bytes);
+    try testing.expectEqual(@as(usize, 2), compressed.compressed_pages);
+    try testing.expect(compressed.compressed_bytes > 0);
+    try testing.expectEqual(
+        s.memoryStats().estimatedResidentBytes(),
+        compressed.resident_bytes,
+    );
+
+    // The query itself never restores a page.
+    try testing.expectEqual(compressed, s.memoryUsage());
+
+    // Reading a page restores it.
+    _ = s.pages.first.?.page();
+    const restored = s.memoryUsage();
+    try testing.expectEqual(@as(usize, 1), restored.compressed_pages);
+    try testing.expect(restored.resident_bytes > compressed.resident_bytes);
+    try testing.expectEqual(before.virtual_bytes, restored.virtual_bytes);
+
+    // Destroyed pages go back to the pool: the address space is kept but
+    // the memory is no longer resident.
+    s.eraseRows(.{ .history = .{} }, null);
+    const erased = s.memoryUsage();
+    try testing.expect(erased.pages < restored.pages);
+    try testing.expectEqual(before.virtual_bytes, erased.virtual_bytes);
+    try testing.expect(erased.resident_bytes < restored.resident_bytes);
 }
 
 test "PageList memory stats do not restore compressed pages" {
