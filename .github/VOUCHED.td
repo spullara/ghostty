@@ -163,6 +163,7 @@ helium777
 hlcfan
 howdeploy
 hqnna
+huge
 hulet
 i999rri
 ibaios
@@ -304,11 +305,13 @@ qwerasd205
 radicaltray
 ragnoroct
 raphamorim
+rayzerrek
 reo101
 rewdy
 rgehan
 rhodes-b
 rightaditya
+-riskirills66 Demonstrated indefensibly poor taste, judgement and AI steering capabilities
 rjwittams
 rkoten
 rmengelbrecht
