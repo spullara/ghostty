@@ -137,6 +137,7 @@ pub const Action = union(Key) {
     request_xt_checksum: xt_checksum.Request,
     xt_checksum_extension: XtChecksumExtension,
     program_status: ProgramStatus,
+    soft_reset,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -244,6 +245,7 @@ pub const Action = union(Key) {
             "request_xt_checksum",
             "xt_checksum_extension",
             "program_status",
+            "soft_reset",
         },
     );
 
@@ -2211,9 +2213,22 @@ pub fn Stream(comptime H: type) type {
                     }
                 },
 
-                // DECRQM - Request Mode
+                // DECRQM - Request Mode, DECSTR - Soft Terminal Reset
                 'p' => switch (input.intermediates.len) {
                     1, 2 => decrqm: {
+                        // DECSTR - Soft Terminal Reset
+                        if (input.intermediates.len == 1 and
+                            input.intermediates[0] == '!')
+                        {
+                            if (input.params.len != 0) {
+                                log.warn("invalid DECSTR command: {f}", .{input});
+                                break :decrqm;
+                            }
+
+                            self.handler.vt(.soft_reset, {});
+                            break :decrqm;
+                        }
+
                         const ansi_mode = ansi: {
                             switch (input.intermediates.len) {
                                 1 => if (input.intermediates[0] == '$') break :ansi true,
@@ -3516,6 +3531,36 @@ test "stream: ansi set mode (SM) and reset mode (RM)" {
     s.handler.mode = null;
     s.nextSlice("\x1B[>5h");
     try testing.expect(s.handler.mode == null);
+}
+
+test "stream: DECSTR dispatch" {
+    const H = struct {
+        calls: usize = 0,
+
+        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
+            _ = value;
+            switch (action) {
+                .soft_reset => self.calls += 1,
+                else => {},
+            }
+        }
+    };
+
+    const cases = [_]struct {
+        input: []const u8,
+        calls: usize,
+    }{
+        .{ .input = "\x1b[!p", .calls = 1 },
+        .{ .input = "\x1b[1!p", .calls = 0 },
+        .{ .input = "\x1b[?!p", .calls = 0 },
+        .{ .input = "\x1b[$p", .calls = 0 },
+    };
+
+    for (cases) |case| {
+        var s: Stream(H) = .init(.{ .handler = .{} });
+        s.nextSlice(case.input);
+        try testing.expectEqual(case.calls, s.handler.calls);
+    }
 }
 
 test "stream: DECRQCRA dispatch" {

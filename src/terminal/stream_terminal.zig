@@ -697,6 +697,7 @@ pub const Handler = struct {
             },
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.terminal.decaln(),
+            .soft_reset => self.terminal.softReset(),
             .full_reset => {
                 // A reset turns off synchronized output, ending its hold.
                 const sync = self.terminal.modes.get(.synchronized_output);

@@ -86,8 +86,8 @@ modes: modespkg.ModeState = .{},
 /// Terminal-level cursor state.
 cursor: Cursor = .{},
 
-/// The checksum variant DECRQCRA computes after RIS. The current variant
-/// is in `flags.xt_checksum`.
+/// The checksum variant DECRQCRA computes after RIS or DECSTR. The current
+/// variant is in `flags.xt_checksum`.
 default_xt_checksum: xt_checksum.Flags = .{},
 
 /// The most recently set mouse shape for the terminal.
@@ -270,11 +270,11 @@ pub const Cursor = struct {
     /// Whether the current cursor appearance follows the configured defaults.
     is_default: bool = true,
 
-    /// Configured style restored by DECSCUSR default and RIS.
+    /// Configured style restored by DECSCUSR default, RIS and DECSTR.
     default_style: Screen.CursorStyle = .block,
 
-    /// Configured blink restored by DECSCUSR default and RIS. Null selects
-    /// the terminal emulator default, which is blinking.
+    /// Configured blink restored by DECSCUSR default, RIS and DECSTR.
+    /// Null selects the terminal emulator default, which is blinking.
     default_blink: ?bool = false,
 };
 
@@ -297,11 +297,11 @@ pub const Options = struct {
     /// will revert back to this state.
     default_modes: modespkg.ModePacked = .{},
 
-    /// Cursor state restored by DECSCUSR default and RIS.
+    /// Cursor state restored by DECSCUSR default, RIS and DECSTR.
     default_cursor_style: Screen.CursorStyle = .block,
     default_cursor_blink: ?bool = false,
 
-    /// The checksum variant DECRQCRA computes after RIS.
+    /// The checksum variant DECRQCRA computes after RIS or DECSTR.
     default_xt_checksum: xt_checksum.Flags = .{},
 
     /// The total storage limit for Kitty images in bytes. Has no effect
@@ -410,8 +410,8 @@ pub fn vtHandler(self: *Terminal) Stream.Handler {
     return .init(self);
 }
 
-/// Set the checksum variant restored by RIS. Like `ModeState.setDefault`,
-/// this also changes the current variant.
+/// Set the checksum variant restored by RIS and DECSTR. Like
+/// `ModeState.setDefault`, this also changes the current variant.
 pub fn setDefaultXtChecksum(self: *Terminal, flags: xt_checksum.Flags) void {
     self.default_xt_checksum = flags;
     self.flags.xt_checksum = flags;
@@ -5023,6 +5023,56 @@ pub fn fullReset(self: *Terminal) void {
 
     // Always mark dirty so we redraw everything
     self.flags.dirty.clear = true;
+}
+
+/// DECSTR - Soft Terminal Reset. Resets the modes and state a program may
+/// have left behind, without clearing the screen or moving the cursor.
+/// Beyond what the VT510 manual lists, this also resets what xterm's soft
+/// reset does: left and right margins, the cursor style, the color palette,
+/// modifyOtherKeys, and the XTCHECKSUM variant.
+pub fn softReset(self: *Terminal) void {
+    const reset_modes = [_]modespkg.Mode{
+        .cursor_visible,
+        .insert,
+        .origin,
+        .wraparound,
+        .reverse_wrap,
+        .reverse_wrap_extended,
+        .disable_keyboard,
+        .cursor_keys,
+        .keypad_keys,
+        .enable_left_and_right_margin,
+    };
+    for (reset_modes) |mode| self.modes.set(mode, self.modes.getDefault(mode));
+
+    self.scrolling_region = .{
+        .top = 0,
+        .bottom = self.rows - 1,
+        .left = 0,
+        .right = self.cols - 1,
+    };
+
+    // The default style needs no allocation so this can't fail.
+    const screen: *Screen = self.screens.active;
+    screen.cursor.style = .{};
+    screen.manualStyleUpdate() catch unreachable;
+    screen.cursor.protected = false;
+    screen.charset = .{};
+
+    // A saved cursor now restores to the home position with the defaults.
+    screen.saved_cursor = null;
+
+    self.status_display = .main;
+    self.flags.modify_other_keys_2 = false;
+    self.flags.xt_checksum = self.default_xt_checksum;
+    self.setCursorStyle(.default);
+
+    // xterm resets the palette for DECSTR as well as RIS, as OSC 104
+    // with no arguments would. Dynamic colors (OSC 10-19) are kept.
+    if (self.colors.palette.mask.count() > 0) {
+        self.colors.palette.resetAll();
+        self.flags.dirty.palette = true;
+    }
 }
 
 /// Returns true if the point is dirty, used for testing.
@@ -16051,6 +16101,130 @@ test "Terminal: default xt checksum survives resets" {
     try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
     t.fullReset();
     try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
+
+    t.flags.xt_checksum = .{ .full = true };
+    t.softReset();
+    try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
+}
+
+test "Terminal: softReset modes" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.insert, true);
+    t.modes.set(.origin, true);
+    t.modes.set(.wraparound, false);
+    t.modes.set(.reverse_wrap, true);
+    t.modes.set(.cursor_visible, false);
+    t.modes.set(.cursor_keys, true);
+    t.modes.set(.keypad_keys, true);
+    t.modes.set(.bracketed_paste, true);
+    t.softReset();
+
+    try testing.expect(!t.modes.get(.insert));
+    try testing.expect(!t.modes.get(.origin));
+    try testing.expect(t.modes.get(.wraparound));
+    try testing.expect(!t.modes.get(.reverse_wrap));
+    try testing.expect(t.modes.get(.cursor_visible));
+    try testing.expect(!t.modes.get(.cursor_keys));
+    try testing.expect(!t.modes.get(.keypad_keys));
+
+    // Modes DECSTR doesn't cover are left alone.
+    try testing.expect(t.modes.get(.bracketed_paste));
+}
+
+test "Terminal: softReset margins" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setTopAndBottomMargin(3, 4);
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(5, 6);
+    t.softReset();
+
+    try testing.expect(!t.modes.get(.enable_left_and_right_margin));
+    try testing.expectEqual(ScrollingRegion{
+        .top = 0,
+        .bottom = 9,
+        .left = 0,
+        .right = 9,
+    }, t.scrolling_region);
+}
+
+test "Terminal: softReset keeps the cursor and screen" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    try t.printString("hello");
+    t.setCursorPos(6, 5);
+    t.softReset();
+
+    try testing.expectEqual(4, t.screens.active.cursor.x);
+    try testing.expectEqual(5, t.screens.active.cursor.y);
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("hello", str);
+}
+
+test "Terminal: softReset saved cursor" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setCursorPos(6, 5);
+    try t.setAttribute(.bold);
+    t.saveCursor();
+    t.softReset();
+    t.restoreCursor();
+
+    try testing.expectEqual(0, t.screens.active.cursor.x);
+    try testing.expectEqual(0, t.screens.active.cursor.y);
+    try testing.expect(!t.screens.active.cursor.style.flags.bold);
+}
+
+test "Terminal: softReset pen, protection, and charsets" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    try t.setAttribute(.bold);
+    t.setProtectedMode(.dec);
+    t.configureCharset(.G0, .dec_special);
+    t.softReset();
+
+    try testing.expectEqual(@as(style.Id, 0), t.screens.active.cursor.style_id);
+    try testing.expect(!t.screens.active.cursor.protected);
+    try testing.expectEqual(charsets.Charset.utf8, t.screens.active.charset.charsets.get(.G0));
+}
+
+test "Terminal: softReset status display and checksum" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.status_display = .status_line;
+    t.flags.xt_checksum = .{ .positive = true };
+    t.softReset();
+
+    try testing.expectEqual(.main, t.status_display);
+    try testing.expectEqual(xt_checksum.Flags{}, t.flags.xt_checksum);
+}
+
+test "Terminal: softReset palette" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    // Nothing changed, so nothing is redrawn.
+    t.softReset();
+    try testing.expect(!t.flags.dirty.palette);
+
+    const red: color.RGB = .{ .r = 0xff, .g = 0, .b = 0 };
+    t.colors.palette.set(1, red);
+    t.colors.palette.set(200, red);
+    t.softReset();
+
+    try testing.expect(t.flags.dirty.palette);
+    try testing.expectEqual(0, t.colors.palette.mask.count());
+    try testing.expectEqual(color.default[1], t.colors.palette.current[1]);
+    try testing.expectEqual(color.default[200], t.colors.palette.current[200]);
 }
 
 // https://github.com/mitchellh/ghostty/issues/272

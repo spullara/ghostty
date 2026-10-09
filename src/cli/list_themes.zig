@@ -470,11 +470,15 @@ const Preview = struct {
                             self.current = self.filtered.items.len - 1;
                         if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{}))
                             self.down(1);
-                        if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_down }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_page_down }, .{}))
+                            self.down(20);
+                        if (key.matches('d', .{ .ctrl = true }))
                             self.down(20);
                         if (key.matchesAny(&.{ 'k', '-', vaxis.Key.up, vaxis.Key.kp_up, vaxis.Key.kp_subtract }, .{}))
                             self.up(1);
                         if (key.matchesAny(&.{ vaxis.Key.page_up, vaxis.Key.kp_page_up }, .{}))
+                            self.up(20);
+                        if (key.matches('u', .{ .ctrl = true }))
                             self.up(20);
                         if (key.matchesAny(&.{ 'h', 'x' }, .{}))
                             self.hex = true;
@@ -771,10 +775,10 @@ const Preview = struct {
                     .{ .keys = "f", .help = "Cycle through theme filters." },
                     .{ .keys = "k, ↑", .help = "Move up 1 theme." },
                     .{ .keys = "ScrollUp", .help = "Move up 1 theme." },
-                    .{ .keys = "PgUp", .help = "Move up 20 themes." },
+                    .{ .keys = "PgUp, ^U", .help = "Move up 20 themes." },
                     .{ .keys = "j, ↓", .help = "Move down 1 theme." },
                     .{ .keys = "ScrollDown", .help = "Move down 1 theme." },
-                    .{ .keys = "PgDown", .help = "Move down 20 themes." },
+                    .{ .keys = "PgDown, ^D", .help = "Move down 20 themes." },
                     .{ .keys = "h, x", .help = "Show palette numbers in hexadecimal." },
                     .{ .keys = "d", .help = "Show palette numbers in decimal." },
                     .{ .keys = "c", .help = "Copy theme name to the clipboard." },

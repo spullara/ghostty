@@ -1533,8 +1533,8 @@ typedef void (*GhosttyTerminalSemanticPromptFn)(
  * GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS, those callbacks are called before
  * this one.
  *
- * A soft reset (DECSTR, `CSI ! p`) only resets a few modes and doesn't
- * call this.
+ * A soft reset (DECSTR, `CSI ! p`) keeps the screen, title and working
+ * directory, and doesn't call this.
  *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
@@ -2207,7 +2207,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Set the reset default for a terminal mode.
    *
    * This unconditionally updates both the current value and the value restored
-   * by a full terminal reset (RIS).
+   * by a terminal reset. RIS restores every mode, and DECSTR only a subset.
    *
    * Some recognized modes represent transitions or mirror additional terminal
    * state and cannot safely be configured as reset defaults. Those modes return
@@ -2221,7 +2221,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
   /**
    * Set the current value of a terminal mode.
    *
-   * This does not change the value restored by a full terminal reset (RIS).
+   * This does not change the value restored by a reset (RIS or DECSTR).
    * A NULL value pointer or unknown mode returns GHOSTTY_INVALID_VALUE.
    *
    * Input type: GhosttyTerminalModeConfig*
@@ -2382,7 +2382,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_OPT_XT_CHECKSUM_REPORT = 44,
 
   /**
-   * Set how the DECRQCRA checksum is calculated after a full reset (RIS).
+   * Set how the DECRQCRA checksum is calculated after a reset (RIS or DECSTR).
    * This also changes the current calculation.
    *
    * The value holds the same bits as XTCHECKSUM (CSI Ps # y) and xterm's
