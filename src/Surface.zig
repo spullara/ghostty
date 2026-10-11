@@ -5805,7 +5805,7 @@ fn writeScreenFile(
     var retain_tmp_dir = false;
     defer if (retain_tmp_dir) tmp_dir.close(.retain) else tmp_dir.deinit();
 
-    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const filename = try std.fmt.bufPrint(
         &filename_buf,
         "{s}.{s}",
@@ -5898,7 +5898,7 @@ fn writeScreenFile(
     try buf_writer.flush();
 
     // Get the final path
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp_dir.dir.realPathFile(
         global.io(),
         filename,
