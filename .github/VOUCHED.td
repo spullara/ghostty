@@ -143,6 +143,7 @@ fornwall
 francescarpi
 francislata
 fru1tworld
+gaborbernat
 gadgetman6
 gagbo
 ghokun
@@ -158,6 +159,7 @@ hakonhagland
 halosatrio
 heaths
 heddxh heddxh
+heitoraugustoln
 helium777
 -highimpact-dev Disrespectful AI user
 hlcfan
@@ -275,6 +277,7 @@ nolinmcfarland
 nouritsu
 nwehg
 ocean6954
+ollieatkinson
 ollioddi
 oshdubh
 otomn
