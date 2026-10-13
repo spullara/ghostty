@@ -116,7 +116,12 @@ pub fn build(b: *std.Build) !void {
             });
 
             if (b.systemIntegrationOption("freetype", .{})) {
-                lib.root_module.linkSystemLibrary("freetype2", dynamic_link_opts);
+                // The static library only gets the headers. Given -lfreetype
+                // directly, Zig puts libfreetype.so into the archive and the
+                // final link fails on it, so the shared library is linked
+                // through the module (and the test) instead.
+                addPkgConfigIncludePaths(b, lib.root_module, "freetype2");
+                mod.linkSystemLibrary("freetype2", dynamic_link_opts);
             } else {
                 const freetype_dep = b.dependency("freetype", .{
                     .target = target,
@@ -211,9 +216,29 @@ pub fn build(b: *std.Build) !void {
     });
     test_exe.root_module.addOptions("build_options", options);
     test_exe.root_module.linkLibrary(lib);
+    if (freetype and b.systemIntegrationOption("freetype", .{})) {
+        test_exe.root_module.linkSystemLibrary("freetype2", dynamic_link_opts);
+    }
     const tests_run = b.addRunArtifact(test_exe);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&tests_run.step);
+}
+
+/// Add the include paths that pkg-config reports for a package, without
+/// linking anything.
+fn addPkgConfigIncludePaths(
+    b: *std.Build,
+    module: *std.Build.Module,
+    name: []const u8,
+) void {
+    const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
+    const cflags = b.run(&.{ pkg_config, "--cflags-only-I", name });
+    var it = std.mem.tokenizeAny(u8, cflags, " \t\r\n");
+    while (it.next()) |flag| {
+        if (std.mem.startsWith(u8, flag, "-I")) {
+            module.addSystemIncludePath(.{ .cwd_relative = flag[2..] });
+        }
+    }
 }
 
 // For dynamic linking, we prefer dynamic linking and to search by
