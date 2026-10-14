@@ -119,7 +119,7 @@ pub fn build(b: *std.Build) !void {
                 // The static library only gets the headers. Given -lfreetype
                 // directly, Zig puts libfreetype.so into the archive and the
                 // final link fails on it, so the shared library is linked
-                // through the module (and the test) instead.
+                // through the module instead.
                 addPkgConfigIncludePaths(b, lib.root_module, "freetype2");
                 mod.linkSystemLibrary("freetype2", dynamic_link_opts);
             } else {
@@ -206,19 +206,12 @@ pub fn build(b: *std.Build) !void {
         .extra_args = define_flags.items,
     });
 
+    // The test uses the public module so that it sees the same imports,
+    // the translated C header among them, as anything depending on it.
     const test_exe = b.addTest(.{
         .name = "test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = mod,
     });
-    test_exe.root_module.addOptions("build_options", options);
-    test_exe.root_module.linkLibrary(lib);
-    if (freetype and b.systemIntegrationOption("freetype", .{})) {
-        test_exe.root_module.linkSystemLibrary("freetype2", dynamic_link_opts);
-    }
     const tests_run = b.addRunArtifact(test_exe);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&tests_run.step);

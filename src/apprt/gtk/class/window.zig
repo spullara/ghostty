@@ -167,6 +167,20 @@ pub const Window = extern struct {
             );
         };
 
+        pub const @"tabs-inverted" = struct {
+            pub const name = "tabs-inverted";
+            const impl = gobject.ext.defineProperty(name, Self, bool, .{
+                .default = false,
+                .accessor = gobject.ext.typedAccessor(
+                    Self,
+                    bool,
+                    .{
+                        .getter = Self.getTabsInverted,
+                    },
+                ),
+            });
+        };
+
         pub const @"tabs-wide" = struct {
             pub const name = "tabs-wide";
             const impl = gobject.ext.defineProperty(
@@ -686,6 +700,7 @@ pub const Window = extern struct {
         inline for (&.{
             "headerbar-visible",
             "tabs-autohide",
+            "tabs-inverted",
             "tabs-visible",
             "tabs-wide",
             "toolbar-style",
@@ -1137,6 +1152,12 @@ pub const Window = extern struct {
                 };
             },
         }
+    }
+
+    fn getTabsInverted(self: *Self) bool {
+        const priv = self.private();
+        const config = if (priv.config) |v| v.get() else return false;
+        return config.@"gtk-tabs-inverted";
     }
 
     fn getTabsWide(self: *Self) bool {
@@ -2338,6 +2359,7 @@ pub const Window = extern struct {
                 properties.@"headerbar-visible".impl,
                 properties.@"quick-terminal".impl,
                 properties.@"tabs-autohide".impl,
+                properties.@"tabs-inverted".impl,
                 properties.@"tabs-visible".impl,
                 properties.@"tabs-wide".impl,
                 properties.@"toolbar-style".impl,
