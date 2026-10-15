@@ -4286,6 +4286,10 @@ fn maybePromptClick(self: *Surface) !bool {
     // prompt clicks because we can't move if we're not in a prompt!
     if (!t.cursorIsAtPrompt()) return false;
 
+    // A press reported under mouse tracking resets the gesture, and its
+    // release must be reported too rather than moving the cursor.
+    if (self.mouse.selection_gesture.left_click_count == 0) return false;
+
     // If the left click moved away from its pressed cell then releasing the
     // mouse completes the drag gesture and we don't do prompt moving.
     if (self.mouse.selection_gesture.left_click_dragged) return false;

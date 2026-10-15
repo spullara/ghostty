@@ -10,7 +10,7 @@ const lib = @import("../../lib.zig");
 const Parser = @import("../../osc.zig").Parser;
 const OSCCommand = @import("../../osc.zig").Command;
 
-const log = std.log.scoped(.osc_context_signal);
+const log = std.log.scoped(.osc_hierarchical_context);
 
 /// Maximum length of a context identifier (per spec).
 const max_context_id_len = 64;
@@ -74,7 +74,7 @@ pub const UnescapedString = struct {
     }
 };
 
-/// A single OSC 3008 context signal command.
+/// A single OSC 3008 hierarchical context command.
 pub const Command = struct {
     pub const C = void;
 
@@ -86,7 +86,7 @@ pub const Command = struct {
     /// Parsed lazily via `readOption`.
     metadata: []const u8,
 
-    pub const Action = enum {
+    pub const Action = enum(c_int) {
         /// OSC 3008;start=<id> — initiates, updates, or returns to a context.
         start,
         /// OSC 3008;end=<id> — terminates a context.
@@ -318,7 +318,7 @@ pub fn parse(parser: *Parser, _: ?u8) ?*OSCCommand {
     const metadata = if (id_end < rest.len) rest[id_end + 1 ..] else "";
 
     parser.command = .{
-        .context_signal = .{
+        .hierarchical_context = .{
             .action = action,
             .id = id,
             .metadata = metadata,
@@ -340,10 +340,10 @@ test "OSC 3008: basic start command" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.action == .start);
-    try testing.expectEqualStrings("abc123", cmd.context_signal.id);
-    try testing.expectEqualStrings("", cmd.context_signal.metadata);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.action == .start);
+    try testing.expectEqualStrings("abc123", cmd.hierarchical_context.id);
+    try testing.expectEqualStrings("", cmd.hierarchical_context.metadata);
 }
 
 test "OSC 3008: basic end command" {
@@ -354,10 +354,10 @@ test "OSC 3008: basic end command" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.action == .end);
-    try testing.expectEqualStrings("abc123", cmd.context_signal.id);
-    try testing.expectEqualStrings("", cmd.context_signal.metadata);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.action == .end);
+    try testing.expectEqualStrings("abc123", cmd.hierarchical_context.id);
+    try testing.expectEqualStrings("", cmd.hierarchical_context.metadata);
 }
 
 test "OSC 3008: start with metadata fields" {
@@ -368,14 +368,14 @@ test "OSC 3008: start with metadata fields" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.action == .start);
-    try testing.expectEqualStrings("bed86fab93af4328bbed0a1224af6d40", cmd.context_signal.id);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.action == .start);
+    try testing.expectEqualStrings("bed86fab93af4328bbed0a1224af6d40", cmd.hierarchical_context.id);
 
     // Read individual fields
-    try testing.expect(cmd.context_signal.readOption(.type).? == .container);
-    try testing.expect(cmd.context_signal.readOption(.user).?.eql("lennart"));
-    try testing.expect(cmd.context_signal.readOption(.hostname).?.eql("zeta"));
+    try testing.expect(cmd.hierarchical_context.readOption(.type).? == .container);
+    try testing.expect(cmd.hierarchical_context.readOption(.user).?.eql("lennart"));
+    try testing.expect(cmd.hierarchical_context.readOption(.hostname).?.eql("zeta"));
 }
 
 test "OSC 3008: start with all common fields" {
@@ -386,15 +386,15 @@ test "OSC 3008: start with all common fields" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.readOption(.type).? == .shell);
-    try testing.expect(cmd.context_signal.readOption(.user).?.eql("root"));
-    try testing.expect(cmd.context_signal.readOption(.hostname).?.eql("myhost"));
-    try testing.expect(cmd.context_signal.readOption(.machineid).?.eql("3deb5353d3ba43d08201c136a47ead7b"));
-    try testing.expect(cmd.context_signal.readOption(.bootid).?.eql("d4a3d0fdf2e24fdea6d971ce73f4fbf2"));
-    try testing.expectEqual(@as(u64, 1062862), cmd.context_signal.readOption(.pid).?);
-    try testing.expectEqual(@as(u64, 1063162), cmd.context_signal.readOption(.pidfdid).?);
-    try testing.expect(cmd.context_signal.readOption(.comm).?.eql("bash"));
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.readOption(.type).? == .shell);
+    try testing.expect(cmd.hierarchical_context.readOption(.user).?.eql("root"));
+    try testing.expect(cmd.hierarchical_context.readOption(.hostname).?.eql("myhost"));
+    try testing.expect(cmd.hierarchical_context.readOption(.machineid).?.eql("3deb5353d3ba43d08201c136a47ead7b"));
+    try testing.expect(cmd.hierarchical_context.readOption(.bootid).?.eql("d4a3d0fdf2e24fdea6d971ce73f4fbf2"));
+    try testing.expectEqual(@as(u64, 1062862), cmd.hierarchical_context.readOption(.pid).?);
+    try testing.expectEqual(@as(u64, 1063162), cmd.hierarchical_context.readOption(.pidfdid).?);
+    try testing.expect(cmd.hierarchical_context.readOption(.comm).?.eql("bash"));
 }
 
 test "OSC 3008: end with exit metadata" {
@@ -405,11 +405,11 @@ test "OSC 3008: end with exit metadata" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.action == .end);
-    try testing.expectEqualStrings("myctx", cmd.context_signal.id);
-    try testing.expect(cmd.context_signal.readOption(.exit).? == .success);
-    try testing.expectEqual(@as(u64, 0), cmd.context_signal.readOption(.status).?);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.action == .end);
+    try testing.expectEqualStrings("myctx", cmd.hierarchical_context.id);
+    try testing.expect(cmd.hierarchical_context.readOption(.exit).? == .success);
+    try testing.expectEqual(@as(u64, 0), cmd.hierarchical_context.readOption(.status).?);
 }
 
 test "OSC 3008: end with failure exit" {
@@ -420,10 +420,10 @@ test "OSC 3008: end with failure exit" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.readOption(.exit).? == .failure);
-    try testing.expectEqual(@as(u64, 1), cmd.context_signal.readOption(.status).?);
-    try testing.expect(cmd.context_signal.readOption(.signal).?.eql("SIGKILL"));
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.readOption(.exit).? == .failure);
+    try testing.expectEqual(@as(u64, 1), cmd.hierarchical_context.readOption(.status).?);
+    try testing.expect(cmd.hierarchical_context.readOption(.signal).?.eql("SIGKILL"));
 }
 
 test "OSC 3008: numeric fields reject non-digits" {
@@ -434,10 +434,10 @@ test "OSC 3008: numeric fields reject non-digits" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.readOption(.pid) == null);
-    try testing.expect(cmd.context_signal.readOption(.pidfdid) == null);
-    try testing.expect(cmd.context_signal.readOption(.status) == null);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.readOption(.pid) == null);
+    try testing.expect(cmd.hierarchical_context.readOption(.pidfdid) == null);
+    try testing.expect(cmd.hierarchical_context.readOption(.status) == null);
 }
 
 test "OSC 3008: unknown fields are ignored" {
@@ -448,9 +448,9 @@ test "OSC 3008: unknown fields are ignored" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.readOption(.type).? == .shell);
-    try testing.expect(cmd.context_signal.readOption(.user).?.eql("root"));
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.readOption(.type).? == .shell);
+    try testing.expect(cmd.hierarchical_context.readOption(.user).?.eql("root"));
 }
 
 test "OSC 3008: missing field returns null" {
@@ -461,10 +461,10 @@ test "OSC 3008: missing field returns null" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.readOption(.type) == null);
-    try testing.expect(cmd.context_signal.readOption(.hostname) == null);
-    try testing.expect(cmd.context_signal.readOption(.pid) == null);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.readOption(.type) == null);
+    try testing.expect(cmd.hierarchical_context.readOption(.hostname) == null);
+    try testing.expect(cmd.hierarchical_context.readOption(.pid) == null);
 }
 
 test "OSC 3008: invalid prefix" {
@@ -497,8 +497,8 @@ test "OSC 3008: max length context ID" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expectEqualStrings(id, cmd.context_signal.id);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expectEqualStrings(id, cmd.hierarchical_context.id);
 }
 
 test "OSC 3008: over-length context ID" {
@@ -555,15 +555,15 @@ test "OSC 3008: spec example - container start" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.action == .start);
-    try testing.expectEqualStrings("bed86fab93af4328bbed0a1224af6d40", cmd.context_signal.id);
-    try testing.expect(cmd.context_signal.readOption(.type).? == .container);
-    try testing.expect(cmd.context_signal.readOption(.user).?.eql("lennart"));
-    try testing.expect(cmd.context_signal.readOption(.hostname).?.eql("zeta"));
-    try testing.expect(cmd.context_signal.readOption(.comm).?.eql("systemd-nspawn"));
-    try testing.expect(cmd.context_signal.readOption(.container).?.eql("foobar"));
-    try testing.expectEqual(@as(u64, 1062862), cmd.context_signal.readOption(.pid).?);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.action == .start);
+    try testing.expectEqualStrings("bed86fab93af4328bbed0a1224af6d40", cmd.hierarchical_context.id);
+    try testing.expect(cmd.hierarchical_context.readOption(.type).? == .container);
+    try testing.expect(cmd.hierarchical_context.readOption(.user).?.eql("lennart"));
+    try testing.expect(cmd.hierarchical_context.readOption(.hostname).?.eql("zeta"));
+    try testing.expect(cmd.hierarchical_context.readOption(.comm).?.eql("systemd-nspawn"));
+    try testing.expect(cmd.hierarchical_context.readOption(.container).?.eql("foobar"));
+    try testing.expectEqual(@as(u64, 1062862), cmd.hierarchical_context.readOption(.pid).?);
 }
 
 test "OSC 3008: spec example - context end" {
@@ -575,9 +575,9 @@ test "OSC 3008: spec example - context end" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.action == .end);
-    try testing.expectEqualStrings("bed86fab93af4328bbed0a1224af6d40", cmd.context_signal.id);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.action == .end);
+    try testing.expectEqualStrings("bed86fab93af4328bbed0a1224af6d40", cmd.hierarchical_context.id);
 }
 
 test "OSC 3008: cwd and cmdline fields" {
@@ -588,9 +588,9 @@ test "OSC 3008: cwd and cmdline fields" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.readOption(.cwd).?.eql("/home/user"));
-    try testing.expect(cmd.context_signal.readOption(.cmdline).?.eql("ls -la"));
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.readOption(.cwd).?.eql("/home/user"));
+    try testing.expect(cmd.hierarchical_context.readOption(.cmdline).?.eql("ls -la"));
 }
 
 test "OSC 3008: start command with no fields" {
@@ -601,12 +601,12 @@ test "OSC 3008: start command with no fields" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.action == .start);
-    try testing.expectEqualStrings("simpleid", cmd.context_signal.id);
-    try testing.expect(cmd.context_signal.readOption(.type) == null);
-    try testing.expect(cmd.context_signal.readOption(.user) == null);
-    try testing.expect(cmd.context_signal.readOption(.exit) == null);
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.action == .start);
+    try testing.expectEqualStrings("simpleid", cmd.hierarchical_context.id);
+    try testing.expect(cmd.hierarchical_context.readOption(.type) == null);
+    try testing.expect(cmd.hierarchical_context.readOption(.user) == null);
+    try testing.expect(cmd.hierarchical_context.readOption(.exit) == null);
 }
 
 test "OSC 3008: string unescaping" {
@@ -617,7 +617,7 @@ test "OSC 3008: string unescaping" {
     for (input) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
-    try testing.expect(cmd == .context_signal);
-    try testing.expect(cmd.context_signal.readOption(.cmdline).?.eql("echo ; \\"));
-    try testing.expect(cmd.context_signal.readOption(.cwd).?.eql("\\system07\\C$\\"));
+    try testing.expect(cmd == .hierarchical_context);
+    try testing.expect(cmd.hierarchical_context.readOption(.cmdline).?.eql("echo ; \\"));
+    try testing.expect(cmd.hierarchical_context.readOption(.cwd).?.eql("\\system07\\C$\\"));
 }

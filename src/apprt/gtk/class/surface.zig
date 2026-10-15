@@ -1522,20 +1522,12 @@ pub const Surface = extern struct {
         self: *Self,
         data: apprt.surface.Message.ChildExited,
     ) bool {
-        // Even if we don't support the overlay, we still keep our property
-        // up to date for anyone listening.
+        // Keep our property up to date for anyone listening.
         const priv = self.private();
         priv.child_exited = true;
         self.as(gobject.Object).notifyByPspec(
             properties.@"child-exited".impl.param_spec,
         );
-
-        // If we have the noop child exited overlay then we don't do anything
-        // for child exited. The false return will force libghostty to show
-        // the normal text-based message.
-        if (comptime @hasDecl(ChildExited, "noop")) {
-            return false;
-        }
 
         priv.child_exited_overlay.setData(&data);
         return true;
@@ -3838,7 +3830,7 @@ pub const Surface = extern struct {
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{
                     .major = 1,
-                    .minor = 2,
+                    .minor = 0,
                     .name = "surface",
                 }),
             );
