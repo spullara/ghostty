@@ -212,10 +212,10 @@ pub const LoadingImage = struct {
             return error.UnsupportedMedium;
         }
 
-        // POSIX shared memory names must begin with a slash, contain at
-        // least one character after it, contain no other slashes, and fit
-        // within NAME_MAX. Some shm_open implementations accept names
-        // without the leading slash, but the Kitty protocol does not.
+        // The Kitty protocol requires terminals to pass shared memory names
+        // unmodified to shm_open, including names without a leading slash:
+        // sandboxed macOS apps can only use names of the form
+        // `<app group id>/<name>`. We only reject clearly malformed names.
         if (!validSharedMemoryName(path, posix.NAME_MAX)) {
             log.warn("invalid shared memory name", .{});
             return error.InvalidData;
@@ -239,6 +239,11 @@ pub const LoadingImage = struct {
             .flags = .{ .nonblocking = false },
         };
 
+        // We unlink whatever name the client sent, as the Kitty protocol
+        // requires. So a client can remove any shared memory object that
+        // Ghostty can open, including another app group's on macOS if it
+        // can guess the name. This applies to any name, not just ones
+        // without a leading slash.
         defer file.close(io);
         defer _ = std.c.shm_unlink(pathz);
 
@@ -897,14 +902,12 @@ pub const Rect = struct {
     }
 };
 
-/// Returns whether a name follows the POSIX shared memory name format.
+/// Returns whether a name can be passed to shm_open. Slashes are left
+/// for shm_open to judge since the valid forms are platform specific.
 fn validSharedMemoryName(name: []const u8, name_max: usize) bool {
-    if (name.len < 2 or name.len > name_max or name[0] != '/') return false;
-    for (name[1..]) |c| {
-        if (c == '/' or c == 0) return false;
-    }
-
-    return true;
+    if (name.len == 0 or name.len > name_max) return false;
+    if (std.mem.eql(u8, name, "/")) return false;
+    return std.mem.indexOfScalar(u8, name, 0) == null;
 }
 
 /// Returns true if `path` is `dir` or is contained within it, requiring a
@@ -932,21 +935,23 @@ test "temporary file path must be inside directory" {
     try testing.expect(!isPathInDir("/custom/tmp", "/custom/tmp-suffix/tty-graphics-protocol-image.data"));
 }
 
-test "shared memory names follow POSIX rules" {
+test "shared memory names" {
     const testing = std.testing;
 
     try testing.expect(validSharedMemoryName("/kitty", 8));
     try testing.expect(validSharedMemoryName("/1234567", 8));
+    try testing.expect(validSharedMemoryName("kitty", 8));
+    try testing.expect(validSharedMemoryName("TEAMID.group/kitty", 31));
+    try testing.expect(validSharedMemoryName("/kitty/image", 16));
 
     try testing.expect(!validSharedMemoryName("", 8));
     try testing.expect(!validSharedMemoryName("/", 8));
-    try testing.expect(!validSharedMemoryName("kitty", 8));
-    try testing.expect(!validSharedMemoryName("/kitty/image", 16));
     try testing.expect(!validSharedMemoryName("/kitty\x00image", 16));
+    try testing.expect(!validSharedMemoryName("kitty\x00image", 16));
     try testing.expect(!validSharedMemoryName("/12345678", 8));
 }
 
-test "image load rejects invalid POSIX shared memory names" {
+test "image load rejects shared memory names containing NUL" {
     if (comptime builtin.abi.isAndroid() or
         builtin.target.os.tag == .windows or
         !builtin.link_libc)
@@ -965,7 +970,7 @@ test "image load rejects invalid POSIX shared memory names" {
             .height = 1,
             .image_id = 31,
         } },
-        .data = try alloc.dupe(u8, "kitty-without-leading-slash"),
+        .data = try alloc.dupe(u8, "/kitty\x00image"),
     };
     defer cmd.deinit(alloc);
 
@@ -977,6 +982,90 @@ test "image load rejects invalid POSIX shared memory names" {
             .shared_memory = true,
         }),
     );
+}
+
+test "image load accepts shared memory names without a leading slash" {
+    if (comptime builtin.abi.isAndroid() or
+        builtin.target.os.tag == .windows or
+        !builtin.link_libc)
+    {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Sandboxed macOS apps can only create names of this form. The pid
+    // keeps concurrent test runs apart; Darwin limits names to 31 bytes.
+    var buf: [32]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&buf, "{s}{d}", .{
+        if (comptime builtin.target.os.tag.isDarwin())
+            "ghostty.test/shm-"
+        else
+            "ghostty-test-shm-",
+        std.c.getpid(),
+    }, 0);
+    const data = "\x01\x02\x03";
+
+    const fd = std.c.shm_open(
+        name,
+        @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true })),
+        @as(std.c.mode_t, 0o600),
+    );
+    switch (std.posix.errno(fd)) {
+        .SUCCESS => {},
+        .ACCES, .PERM, .NOSYS => return error.SkipZigTest,
+        else => |err| {
+            log.warn("unable to create shared memory {s}: {}", .{ name, err });
+            return error.TestUnexpectedResult;
+        },
+    }
+    defer _ = std.c.close(fd);
+    defer _ = std.c.shm_unlink(name);
+    try testing.expectEqual(0, std.c.ftruncate(fd, data.len));
+    {
+        // macOS does not support write(2) on shared memory, so map it.
+        const map = try std.posix.mmap(
+            null,
+            data.len,
+            .{ .READ = true, .WRITE = true },
+            std.c.MAP{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        defer std.posix.munmap(map);
+        @memcpy(map[0..data.len], data);
+    }
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .shared_memory,
+            .width = 1,
+            .height = 1,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, name),
+    };
+    defer cmd.deinit(alloc);
+
+    var loading = try LoadingImage.init(testing.io, alloc, &cmd, .{
+        .file = false,
+        .temporary_file = .disabled,
+        .shared_memory = true,
+    });
+    defer loading.deinit(alloc);
+    try testing.expectEqualSlices(u8, data, loading.data.items);
+
+    // The terminal must unlink the object after reading it. fstat can't
+    // tell us this since macOS always reports st_nlink 0 for shared memory.
+    const reopened = std.c.shm_open(
+        name,
+        @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDONLY })),
+        @as(std.c.mode_t, 0),
+    );
+    if (reopened >= 0) _ = std.c.close(reopened);
+    try testing.expectEqual(std.posix.E.NOENT, std.posix.errno(reopened));
 }
 
 test "shared memory range with offset and size" {

@@ -52,6 +52,7 @@ anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+aredmondd
 arneshbanerjee
 arvin7liu
 athaapa
@@ -85,6 +86,7 @@ chernetskyi
 chronologos
 clemg
 cmwetherell
+complexsplit
 crayxt
 craziestowl
 -creativision meatproxying
@@ -307,6 +309,7 @@ pressatojump
 prihlop
 priyans-hu
 pssalman
+pugma
 puzza007
 pyre909
 qappell

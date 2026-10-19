@@ -1947,9 +1947,15 @@ pub fn cursorLeft(self: *Terminal, count_req: usize) void {
     var count = @max(count_req, 1);
 
     // If we are in no wrap mode, then we move the cursor left and exit
-    // since this is the fastest and most typical path.
+    // since this is the fastest and most typical path. Like cursorRight,
+    // we stop at the left margin unless the cursor is already left of it.
     if (wrap_mode == .none) {
-        self.screens.active.cursorLeft(@min(count, self.screens.active.cursor.x));
+        const x = self.screens.active.cursor.x;
+        const left_margin = if (x < self.scrolling_region.left)
+            0
+        else
+            self.scrolling_region.left;
+        self.screens.active.cursorLeft(@min(count, x - left_margin));
         self.screens.active.cursor.pending_wrap = false;
         return;
     }
@@ -2617,6 +2623,46 @@ pub fn setCursorPos(self: *Terminal, row_req: usize, col_req: usize) void {
     // If everything changed we do an absolute change which is slightly slower
     self.screens.active.cursorAbsolute(x, y);
     // log.info("set cursor position: col={} row={}", .{ self.screens.active.cursor.x, self.screens.active.cursor.y });
+}
+
+/// The cursor position in the coordinates setCursorPos takes: 1-indexed,
+/// and relative to the top-left of the scrolling region in origin mode.
+/// Handing either coordinate back to setCursorPos leaves it unchanged.
+fn cursorPosForSet(self: *const Terminal) struct { row: usize, col: usize } {
+    const cursor = &self.screens.active.cursor;
+    const origin = self.modes.get(.origin);
+    return .{
+        .row = @as(usize, cursor.y -| if (origin) self.scrolling_region.top else 0) + 1,
+        .col = @as(usize, cursor.x -| if (origin) self.scrolling_region.left else 0) + 1,
+    };
+}
+
+/// Move the cursor to the given row (1-indexed), keeping its column (VPA).
+/// In origin mode the row is relative to the top margin.
+pub fn setCursorRow(self: *Terminal, row: usize) void {
+    self.setCursorPos(row, self.cursorPosForSet().col);
+}
+
+/// Move the cursor to the given column (1-indexed), keeping its row (CHA
+/// and HPA). In origin mode the column is relative to the left margin.
+pub fn setCursorCol(self: *Terminal, col: usize) void {
+    self.setCursorPos(self.cursorPosForSet().row, col);
+}
+
+/// Move the cursor down by count rows, keeping its column (VPR). Unlike
+/// cursorDown, this stops only at the bottom of the screen, or of the
+/// scrolling region in origin mode.
+pub fn cursorRowRelative(self: *Terminal, count: usize) void {
+    const pos = self.cursorPosForSet();
+    self.setCursorPos(pos.row +| count, pos.col);
+}
+
+/// Move the cursor right by count columns, keeping its row (HPR). Unlike
+/// cursorRight, this stops only at the right edge of the screen, or of
+/// the scrolling region in origin mode.
+pub fn cursorColRelative(self: *Terminal, count: usize) void {
+    const pos = self.cursorPosForSet();
+    self.setCursorPos(pos.row, pos.col +| count);
 }
 
 /// Set Top and Bottom Margins If bottom is not specified, 0 or bigger than
@@ -5129,6 +5175,79 @@ test "Terminal: setCursorPos saturates overflowing origin offsets" {
     t.setCursorPos(std.math.maxInt(usize), std.math.maxInt(usize));
     try testing.expectEqual(@as(size.CellCountInt, 8), t.screens.active.cursor.x);
     try testing.expectEqual(@as(size.CellCountInt, 7), t.screens.active.cursor.y);
+}
+
+test "Terminal: setCursorRow and setCursorCol in origin mode" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+
+    t.scrolling_region = .{
+        .top = 2,
+        .bottom = 7,
+        .left = 3,
+        .right = 8,
+    };
+    t.modes.set(.origin, true);
+    t.setCursorPos(2, 2);
+
+    // Only the requested coordinate changes, relative to the margins.
+    t.setCursorCol(1);
+    try testing.expectEqual(@as(size.CellCountInt, 3), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 3), t.screens.active.cursor.y);
+
+    t.setCursorRow(1);
+    try testing.expectEqual(@as(size.CellCountInt, 3), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 2), t.screens.active.cursor.y);
+}
+
+test "Terminal: cursorRowRelative and cursorColRelative in origin mode" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+
+    t.scrolling_region = .{
+        .top = 2,
+        .bottom = 7,
+        .left = 3,
+        .right = 8,
+    };
+    t.modes.set(.origin, true);
+    t.setCursorPos(2, 2);
+
+    t.cursorColRelative(2);
+    try testing.expectEqual(@as(size.CellCountInt, 6), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 3), t.screens.active.cursor.y);
+
+    t.cursorRowRelative(2);
+    try testing.expectEqual(@as(size.CellCountInt, 6), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 5), t.screens.active.cursor.y);
+
+    // Large moves stop at the edges of the scrolling region.
+    t.cursorColRelative(100);
+    t.cursorRowRelative(100);
+    try testing.expectEqual(@as(size.CellCountInt, 8), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 7), t.screens.active.cursor.y);
+}
+
+test "Terminal: cursorRowRelative and cursorColRelative stop at screen edge" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+
+    t.setCursorPos(3, 4);
+    t.cursorColRelative(2);
+    t.cursorRowRelative(1);
+    try testing.expectEqual(@as(size.CellCountInt, 5), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 3), t.screens.active.cursor.y);
+
+    t.cursorColRelative(std.math.maxInt(usize));
+    t.cursorRowRelative(std.math.maxInt(usize));
+    try testing.expectEqual(@as(size.CellCountInt, 9), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 9), t.screens.active.cursor.y);
 }
 
 test "Terminal: input with no control characters" {
@@ -11271,6 +11390,60 @@ test "Terminal: cursorLeft no wrap" {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("A\nB", str);
+    }
+}
+
+test "Terminal: cursorLeft stops at left margin" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    t.scrolling_region.left = 2;
+    t.setCursorPos(1, 4);
+    t.cursorLeft(100);
+    try t.print('X');
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("  X", str);
+    }
+}
+
+test "Terminal: cursorLeft left of left margin" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    t.scrolling_region.left = 3;
+    t.setCursorPos(1, 3);
+    t.cursorLeft(100);
+    try t.print('X');
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("X", str);
+    }
+}
+
+test "Terminal: backspace at left margin" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    t.scrolling_region.left = 2;
+    t.setCursorPos(1, 3);
+    t.backspace();
+    try t.print('X');
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("  X", str);
     }
 }
 
