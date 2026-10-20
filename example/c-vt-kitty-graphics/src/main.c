@@ -63,6 +63,116 @@ void on_write_pty(GhosttyTerminal terminal,
 }
 //! [kitty-graphics-write-pty]
 
+//! [kitty-graphics-animation-tick]
+/* The shortest time between two redraws. About 8 ms suits a 120 Hz display. */
+#define MIN_FRAME_INTERVAL_MS 8
+
+/**
+ * Advance any playing animations while preparing a frame to draw.
+ *
+ * Call this once per frame, before drawing images. It returns how many
+ * milliseconds to wait before the next redraw, or -1 if no animation is
+ * playing. In that case, don't schedule a redraw for animations at all.
+ * A program that starts an animation does so by writing to the
+ * terminal, which already causes a redraw.
+ *
+ * `now_ms` comes from a clock you choose, such as milliseconds since
+ * your app started. Always use the same clock with the same starting
+ * point.
+ */
+int64_t tick_animations(GhosttyKittyGraphics graphics, uint64_t now_ms) {
+  uint64_t next_ms = 0;
+  if (ghostty_kitty_graphics_animation_tick(graphics, now_ms, &next_ms) !=
+      GHOSTTY_SUCCESS) {
+    return -1;
+  }
+
+  /* next_ms is an absolute time. Turn it into a delay from now. */
+  uint64_t delay_ms = next_ms > now_ms ? next_ms - now_ms : 0;
+  if (delay_ms < MIN_FRAME_INTERVAL_MS) delay_ms = MIN_FRAME_INTERVAL_MS;
+  return (int64_t)delay_ms;
+}
+//! [kitty-graphics-animation-tick]
+
+//! [kitty-graphics-animation-play]
+/** Print the first pixel and the generation of an image. */
+void print_image(GhosttyKittyGraphics graphics, uint32_t image_id) {
+  GhosttyKittyGraphicsImage image =
+      ghostty_kitty_graphics_image(graphics, image_id);
+  const uint8_t* pixels = NULL;
+  uint64_t generation = 0;
+  ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR,
+                                   &pixels);
+  ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_GENERATION,
+                                   &generation);
+  printf("pixel=(%u,%u,%u) generation=%llu", pixels[0], pixels[1], pixels[2],
+         (unsigned long long)generation);
+}
+
+/**
+ * Play a two-frame animation using tick_animations().
+ *
+ * A real app waits for the delay that tick_animations() returns. To keep
+ * this example quick, a pretend clock jumps ahead by that delay instead.
+ */
+int run_animation(GhosttyTerminal terminal) {
+  /*
+   * These commands set up the animation:
+   *
+   *   a=T  Send a red 1x1 RGBA image with ID 2 and display it.
+   *   a=f  Add a blue second frame that shows for 40 ms.
+   *   a=a  Make the first frame show for 30 ms. It starts at 0 ms,
+   *        which would mean the frame is skipped.
+   *   a=a  Start playing on a loop (s=3).
+   *
+   * q=2 tells the terminal not to send replies.
+   */
+  const char* cmds =
+    "\x1b_Ga=T,f=32,i=2,s=1,v=1,q=2;/wAA/w==\x1b\\"
+    "\x1b_Ga=f,f=32,i=2,s=1,v=1,z=40,q=2;AAD//w==\x1b\\"
+    "\x1b_Ga=a,i=2,r=1,z=30,q=2\x1b\\"
+    "\x1b_Ga=a,i=2,s=3,q=2\x1b\\";
+  ghostty_terminal_vt_write(terminal, (const uint8_t*)cmds, strlen(cmds));
+
+  GhosttyKittyGraphics graphics = NULL;
+  if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS,
+                           &graphics) != GHOSTTY_SUCCESS || !graphics) {
+    fprintf(stderr, "Failed to get kitty graphics storage\n");
+    return 1;
+  }
+
+  /* Draw three frames, following each delay. */
+  uint64_t now_ms = 0;
+  for (int i = 0; i < 3; i++) {
+    int64_t delay_ms = tick_animations(graphics, now_ms);
+
+    /*
+     * The tick invalidates image handles, so print_image() looks the
+     * image up again. The generation changes whenever the frame does.
+     */
+    printf("  t=%llu ms: ", (unsigned long long)now_ms);
+    print_image(graphics, 2);
+    printf(", next redraw in %lld ms\n", (long long)delay_ms);
+
+    now_ms += (uint64_t)delay_ms;
+  }
+
+  /* Stop playback (s=1). Once stopped, the tick asks for no redraws. */
+  const char* stop = "\x1b_Ga=a,i=2,s=1,q=2\x1b\\";
+  ghostty_terminal_vt_write(terminal, (const uint8_t*)stop, strlen(stop));
+
+  /* Writing to the terminal invalidates the storage handle. Get it again. */
+  ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS,
+                       &graphics);
+  if (tick_animations(graphics, now_ms) < 0) {
+    printf("  t=%llu ms: stopped, no redraw needed\n",
+           (unsigned long long)now_ms);
+  }
+
+  return 0;
+}
+//! [kitty-graphics-animation-play]
+
 //! [kitty-graphics-main]
 int main() {
   /* Install the PNG decoder via the sys interface. */
@@ -214,6 +324,10 @@ int main() {
   }
   printf("Total placements: %d\n", placement_count);
   ghostty_kitty_graphics_placement_iterator_free(iter);
+
+  /* Animate a second image by driving the animation tick. */
+  printf("\nPlaying an animation:\n");
+  if (run_animation(terminal) != 0) return 1;
 
   /* Clean up. */
   ghostty_terminal_free(terminal);

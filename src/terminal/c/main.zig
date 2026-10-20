@@ -13,6 +13,7 @@ pub const grid_ref_tracked = @import("grid_ref_tracked.zig");
 pub const io = @import("io.zig");
 pub const kitty_graphics = @import("kitty_graphics.zig");
 pub const kitty_graphics_get = kitty_graphics.get;
+pub const kitty_graphics_animation_tick = kitty_graphics.animation_tick;
 pub const kitty_graphics_image = kitty_graphics.image_get_handle;
 pub const kitty_graphics_image_get = kitty_graphics.image_get;
 pub const kitty_graphics_image_get_multi = kitty_graphics.image_get_multi;
