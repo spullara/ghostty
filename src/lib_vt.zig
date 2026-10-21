@@ -316,6 +316,11 @@ comptime {
             @export(&c.render_state_row_cells_get, .{ .name = "ghostty_render_state_row_cells_get" });
             @export(&c.render_state_row_cells_get_multi, .{ .name = "ghostty_render_state_row_cells_get_multi" });
             @export(&c.render_state_row_cells_free, .{ .name = "ghostty_render_state_row_cells_free" });
+            @export(&c.render_state_image_iterator_new, .{ .name = "ghostty_render_state_image_iterator_new" });
+            @export(&c.render_state_image_iterator_next, .{ .name = "ghostty_render_state_image_iterator_next" });
+            @export(&c.render_state_image_iterator_free, .{ .name = "ghostty_render_state_image_iterator_free" });
+            @export(&c.render_state_image_get, .{ .name = "ghostty_render_state_image_get" });
+            @export(&c.render_state_image_get_multi, .{ .name = "ghostty_render_state_image_get_multi" });
             @export(&c.render_state_free, .{ .name = "ghostty_render_state_free" });
         }
         @export(&c.terminal_new, .{ .name = "ghostty_terminal_new" });

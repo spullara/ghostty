@@ -510,6 +510,10 @@ pub fn setScrollbackMaxBytes(self: *Terminal, max: ?usize) void {
     primary.pages.setMaxBytes(max);
     primary.no_scrollback = max == 0;
 
+    // Lowering the limit can drop old history, along with any
+    // placements attached to it.
+    if (comptime build_options.kitty_graphics) primary.kitty_images.markDirty();
+
     if (primary.no_scrollback) primary.eraseHistory(null);
 }
 
@@ -520,6 +524,10 @@ pub fn setScrollbackMaxBytes(self: *Terminal, max: ?usize) void {
 pub fn setScrollbackMaxLines(self: *Terminal, max: ?usize) void {
     const primary = self.screens.get(.primary).?;
     primary.pages.setMaxLines(max);
+
+    // Lowering the limit can drop old history, along with any
+    // placements attached to it.
+    if (comptime build_options.kitty_graphics) primary.kitty_images.markDirty();
 }
 
 /// Print UTF-8 encoded string to the terminal.
@@ -2416,7 +2424,7 @@ pub fn index(self: *Terminal) !void {
     {
         if (comptime build_options.kitty_graphics) {
             // Scrolling dirties the images because it updates their placements pins.
-            screen.kitty_images.dirty = true;
+            screen.kitty_images.markDirty();
         }
 
         // If our scrolling region is at the top, we create scrollback,
@@ -2797,7 +2805,7 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
     {
         // Scrolling dirties the images because it updates their placements pins.
         if (comptime build_options.kitty_graphics) {
-            self.screens.active.kitty_images.dirty = true;
+            self.screens.active.kitty_images.markDirty();
         }
 
         // Clamp count to the scroll region height.
@@ -3053,7 +3061,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
 
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
-        self.screens.active.kitty_images.dirty = true;
+        self.screens.active.kitty_images.markDirty();
     }
 
     // At the end we need to return the cursor to the row it started on.
@@ -3227,7 +3235,7 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
 
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
-        self.screens.active.kitty_images.dirty = true;
+        self.screens.active.kitty_images.markDirty();
     }
 
     // At the end we need to return the cursor to the row it started on.
@@ -4922,10 +4930,17 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
     new.clearSelection();
 
     if (comptime build_options.kitty_graphics) {
-        // Mark kitty images as dirty so they redraw. Without this set
-        // the images will remain where they were (the dirty bit on
-        // the screen only tracks the terminal grid, not the images).
-        new.kitty_images.dirty = true;
+        // Mark kitty images as dirty so they redraw. Without this the
+        // images would stay where they were, because the screen's own
+        // dirty flags only cover the terminal grid.
+        //
+        // Each screen has its own counter. A consumer that last read the
+        // old screen will compare that value against this screen's, so
+        // the two must differ. Moving past both counters guarantees it.
+        new.kitty_images.dirty = @max(
+            new.kitty_images.dirty,
+            old.kitty_images.dirty,
+        ) +% 1;
     }
 
     // Mark our terminal as dirty to redraw the grid.
@@ -16373,6 +16388,61 @@ test "Terminal: fullReset preserves kitty graphics limits" {
             .disabled => return error.TestUnexpectedResult,
         }
     }
+}
+
+test "Terminal: kitty dirty changes on scrollback erase and limits" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    const storage = &t.screens.get(.primary).?.kitty_images;
+
+    var dirty = storage.dirty;
+    t.eraseDisplay(.scrollback, false);
+    try testing.expect(storage.dirty != dirty);
+
+    dirty = storage.dirty;
+    t.setScrollbackMaxLines(100);
+    try testing.expect(storage.dirty != dirty);
+
+    dirty = storage.dirty;
+    t.setScrollbackMaxBytes(0);
+    try testing.expect(storage.dirty != dirty);
+}
+
+test "Terminal: kitty dirty differs across screen switch" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    // Advance the primary counter past the fresh alternate screen's
+    // value so a naive bump on switch would collide with it.
+    const primary = &t.screens.get(.primary).?.kitty_images;
+    primary.markDirty();
+    primary.markDirty();
+    const primary_dirty = primary.dirty;
+
+    _ = try t.switchScreen(.alternate);
+    const alt = &t.screens.active.kitty_images;
+    try testing.expect(alt.dirty != primary_dirty);
+    const alt_dirty = alt.dirty;
+
+    _ = try t.switchScreen(.primary);
+    try testing.expect(primary.dirty != primary_dirty);
+    try testing.expect(primary.dirty != alt_dirty);
+}
+
+test "Terminal: fullReset changes kitty dirty" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    const dirty = t.screens.active.kitty_images.dirty;
+    t.fullReset();
+    try testing.expect(t.screens.active.kitty_images.dirty != dirty);
 }
 
 // https://github.com/mitchellh/ghostty/issues/1607

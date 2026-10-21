@@ -73,20 +73,39 @@ pub const ImageStorage = struct {
     const ImageMap = std.AutoHashMapUnmanaged(u32, Image);
     const PlacementMap = std.AutoHashMapUnmanaged(PlacementKey, Placement);
 
-    /// Dirty is set to true if placements or images change. This is
-    /// purely informational for the renderer and doesn't affect the
-    /// correctness of the program. The renderer must set this to false
-    /// if it cares about this value.
+    /// A change counter for anything that can affect how images are
+    /// drawn. It changes when images or placements are added, removed,
+    /// or modified, and also when placements move on screen without
+    /// changing, such as during scrolling, resizing, or erasing history.
     ///
-    /// Note that dirty is also set by scrolling and resizing (outside
-    /// of this struct) because those move placement pins, even though
-    /// the set of images/placements itself is unchanged. See generation
-    /// for a signal that only tracks content mutations.
+    /// The counter is never reset. Instead, each consumer keeps the last
+    /// value it saw and compares it to the current value. Because nothing
+    /// clears the counter, any number of consumers can watch the same
+    /// storage independently. Within Ghostty, only `RenderState` reads
+    /// it, to know when to position its placements again. A renderer
+    /// should watch `RenderState.imagePlacementsGeneration` instead. For
+    /// example, a consumer of the storage would do:
     ///
-    /// Invariant: dirty is always set when generation changes
-    /// (markMutated sets both); dirty set without a generation change
-    /// means a geometry-only event.
-    dirty: bool = false,
+    ///     if (storage.dirty != self.last_dirty) {
+    ///         self.last_dirty = storage.dirty;
+    ///         self.rebuildPlacements(storage);
+    ///     }
+    ///
+    /// Only compare values for equality. The counter wraps around on
+    /// overflow, so "greater than" has no meaning.
+    ///
+    /// The difference from `generation` is that `generation` only
+    /// changes when the contents change. Every change to `generation`
+    /// also changes `dirty`, so if `dirty` changed but `generation` did
+    /// not, the images and placements are the same and only their
+    /// positions on screen may have moved.
+    ///
+    /// Update this with `markDirty` or `markMutated` rather than writing
+    /// it directly. There are two exceptions. `Terminal.switchScreen`
+    /// sets the new screen's counter past the old screen's so that a
+    /// consumer can never see the same value on both screens, and
+    /// `Screen.reset` carries the counter over to the new storage.
+    dirty: u64 = 0,
 
     /// Generation stamp of the last content mutation to this storage:
     /// any image transmit/replace, placement add, or delete of either.
@@ -204,13 +223,25 @@ pub const ImageStorage = struct {
     /// the set of images or placements (or image contents), including
     /// the animation command handlers in graphics_exec.zig.
     ///
-    /// Do NOT call this for geometry-only events (scrolling, resizing,
-    /// screen switches); those must set only the dirty flag directly.
-    /// Bumping the generation for geometry changes would break the
-    /// contract that an unchanged generation means unchanged contents.
+    /// Do not call this when placements only move on screen (scrolling,
+    /// resizing, screen switches). Use `markDirty` for those. Changing
+    /// the generation there would break the promise that an unchanged
+    /// generation means unchanged contents.
     pub fn markMutated(self: *ImageStorage, io: std.Io) void {
-        self.dirty = true;
+        self.markDirty();
         self.generation = nextGeneration(io);
+    }
+
+    /// Record that placements may have moved on screen even though the
+    /// images and placements themselves did not change. This advances
+    /// `dirty` and leaves `generation` alone.
+    ///
+    /// Call this after anything that moves or removes the screen rows
+    /// placements are attached to, such as scrolling, resizing, erasing
+    /// history, or lowering the scrollback limit. If the images or
+    /// placements themselves changed, call `markMutated` instead.
+    pub fn markDirty(self: *ImageStorage) void {
+        self.dirty +%= 1;
     }
 
     /// Sets the limit in bytes for the total amount of image data that
@@ -2305,9 +2336,9 @@ test "storage: delete all visible placements and matching images" {
     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .all = true });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.images.count());
     try testing.expect(s.images.contains(3));
     try testing.expectEqual(@as(usize, 0), s.placements.count());
@@ -2331,9 +2362,9 @@ test "storage: delete all placements and images preserves limit" {
     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .all = true });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.images.count());
     try testing.expect(s.images.contains(3));
     try testing.expectEqual(@as(usize, 0), s.placements.count());
@@ -2442,9 +2473,9 @@ test "storage: delete all placements" {
     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .all = false });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2466,9 +2497,9 @@ test "storage: delete all placements by image id" {
     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .id = .{ .image_id = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2490,9 +2521,9 @@ test "storage: delete all placements by image id and unused images" {
     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .id = .{ .delete = true, .image_id = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2515,13 +2546,13 @@ test "storage: delete placement by specific id" {
     try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .id = .{
         .delete = true,
         .image_id = 1,
         .placement_id = 2,
     } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 2), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
@@ -2538,7 +2569,7 @@ test "storage: uppercase id delete preserves image when placement does not match
     defer s.deinit(alloc, t.screens.active);
     try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     const generation = s.generation;
     s.delete(io, alloc, &t, .{ .id = .{
         .delete = true,
@@ -2547,7 +2578,7 @@ test "storage: uppercase id delete preserves image when placement does not match
     } });
 
     try testing.expect(s.imageById(1) != null);
-    try testing.expect(!s.dirty);
+    try testing.expectEqual(dirty, s.dirty);
     try testing.expectEqual(generation, s.generation);
 }
 
@@ -2566,7 +2597,7 @@ test "storage: uppercase id delete frees image after placement matches" {
         .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
     });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .id = .{
         .delete = true,
         .image_id = 1,
@@ -2575,7 +2606,7 @@ test "storage: uppercase id delete frees image after placement matches" {
 
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 0), s.images.count());
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
 }
 
@@ -2590,14 +2621,14 @@ test "storage: uppercase id delete without placement frees unplaced image" {
     defer s.deinit(alloc, t.screens.active);
     try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .id = .{
         .delete = true,
         .image_id = 1,
     } });
 
     try testing.expectEqual(@as(usize, 0), s.images.count());
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
 }
 
 test "storage: delete intersecting cursor" {
@@ -2619,9 +2650,9 @@ test "storage: delete intersecting cursor" {
 
     t.screens.active.cursorAbsolute(12, 12);
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .intersect_cursor = false });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2707,9 +2738,9 @@ test "storage: delete intersecting cursor plus unused" {
 
     t.screens.active.cursorAbsolute(12, 12);
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .intersect_cursor = true });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2740,9 +2771,9 @@ test "storage: delete intersecting cursor hits multiple" {
 
     t.screens.active.cursorAbsolute(26, 26);
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .intersect_cursor = true });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 1), s.images.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2765,12 +2796,12 @@ test "storage: delete by column" {
     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .column = .{
         .delete = false,
         .x = 60,
     } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2833,12 +2864,12 @@ test "storage: delete by row" {
     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .row = .{
         .delete = false,
         .y = 60,
     } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2902,9 +2933,9 @@ test "storage: delete images by range 1" {
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 2), s.placements.count());
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .range = .{ .delete = false, .first = 1, .last = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2928,9 +2959,9 @@ test "storage: delete images by range 2" {
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 2), s.placements.count());
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .range = .{ .delete = true, .first = 1, .last = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 1), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2955,9 +2986,9 @@ test "storage: delete images by range 3" {
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 3), s.placements.count());
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .range = .{ .delete = false, .first = 2, .last = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 2), s.placements.count());
     try testing.expect(s.placements.get(.{
@@ -2990,9 +3021,9 @@ test "storage: delete images by range 4" {
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 3), s.placements.count());
 
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .range = .{ .delete = true, .first = 2, .last = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(@as(usize, 2), s.placements.count());
     try testing.expect(s.placements.get(.{
@@ -3445,17 +3476,17 @@ test "storage: generation bumps when setLimit evicts or disables" {
     const gen_add = s.generation;
 
     // Lowering the limit evicts the image and must mark a mutation.
-    s.dirty = false;
+    const dirty_add = s.dirty;
     s.setLimit(io, alloc, t.screens.active, 1);
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty_add);
     try testing.expect(s.generation > gen_add);
     try testing.expectEqual(@as(usize, 0), s.images.count());
     const gen_evict = s.generation;
 
     // Disabling (limit=0) resets the storage and must mark a mutation.
-    s.dirty = false;
+    const dirty_evict = s.dirty;
     s.setLimit(io, alloc, t.screens.active, 0);
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty_evict);
     try testing.expect(s.generation > gen_evict);
 }
 
@@ -3501,21 +3532,21 @@ test "storage: no-op delete does not mark a mutation" {
     // A delete-all on an empty storage (this runs on every screen
     // clear) must not dirty the state or bump the generation.
     s.delete(io, alloc, &t, .{ .all = true });
-    try testing.expect(!s.dirty);
+    try testing.expectEqual(@as(u64, 0), s.dirty);
     try testing.expectEqual(@as(u64, 0), s.generation);
 
     // Same for a delete that matches nothing.
     try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
     try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     const gen = s.generation;
-    s.dirty = false;
+    const dirty = s.dirty;
     s.delete(io, alloc, &t, .{ .id = .{ .image_id = 42 } });
-    try testing.expect(!s.dirty);
+    try testing.expectEqual(dirty, s.dirty);
     try testing.expectEqual(gen, s.generation);
 
     // But a delete that removes something does mark a mutation.
     s.delete(io, alloc, &t, .{ .id = .{ .image_id = 1 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expect(s.generation > gen);
 }
 
@@ -3554,8 +3585,9 @@ test "storage: evicts images in priority order" {
     );
 
     const gen = s.generation;
+    const dirty = s.dirty;
     const result = s.evictImage(io, alloc, t.screens.active, 96);
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expect(s.generation > gen);
     try testing.expectEqual(true, result);
     try testing.expectEqual(1, s.images.count());
@@ -3641,11 +3673,11 @@ test "storage: pending image completes once and preserves age" {
     defer alloc.free(wrong);
 
     const storage_generation = s.generation;
-    s.dirty = false;
+    const dirty = s.dirty;
     const pixels = try alloc.alloc(u8, 16);
     @memset(pixels, '*');
     try testing.expect(pending.complete(&s, io, pixels));
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
     try testing.expect(s.generation > storage_generation);
     try testing.expectEqual(pending.generation, s.imageById(1).?.generation);
     try testing.expectEqual(@as(usize, 16), s.total_bytes);
@@ -4502,14 +4534,14 @@ test "storage: animation tick advances and schedules" {
         .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
     });
     const gen1 = img.generation;
-    s.dirty = false;
+    const dirty = s.dirty;
 
     // First tick: the gapless root frame is due immediately and is
     // skipped over to frame 2, which is due again in its 40ms gap.
     try testing.expectEqual(@as(?u64, 40), s.animationTick(io, 0));
     try testing.expectEqual(@as(u32, 1), anim.current_index);
     try testing.expect(img.generation > gen1);
-    try testing.expect(s.dirty);
+    try testing.expect(s.dirty != dirty);
 
     // Nothing due yet: no advance, and the delay counts down.
     const gen2 = img.generation;

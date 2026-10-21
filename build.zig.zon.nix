@@ -4,9 +4,7 @@
   fetchgit,
   fetchurl,
   fetchzip,
-  runCommandLocal,
-  # nixpkgs has no Zig 0.17 yet, so until it does this has to be passed in:
-  # `zig_0_17 = zig-overlay.packages.${system}."0.17.0"`, for instance.
+  runCommand,
   zig_0_17,
   zstd,
   name ? "zig-packages",
@@ -226,9 +224,13 @@
     };
   };
 
-  # The packages whose own manifest declares a dependency by `.path`, which
-  # Zig 0.16.0 cannot build through `zig build --system`. Listed here too so
-  # that every version's expression offers the same things; see the README.
+  # The packages whose own manifest declares a dependency by `.path`. Zig
+  # 0.17.0 cannot build these through `zig build --system`: it roots the system
+  # package directory at its absolute store path, so a `.path` dependency
+  # inside one of these resolves to an absolute path, which it refuses with
+  # "expected path relative to build root; found absolute path". A package
+  # that wants `--system` copies each of these into its build root and passes
+  # `--fork=` with a relative path; see the README.
   pathDependencyPackages = [
   ];
 in
@@ -243,7 +245,13 @@ in
   # what the directory walk calls a file, so symlinked headers are skipped
   # without a word. Building them all in one derivation gives real files from
   # the start, without a second copy of everything.
-  runCommandLocal name
+  #
+  # `runCommand` and not `runCommandLocal`: the result is worth taking from a
+  # binary cache. Building it locally means first fetching a whole Zig, and
+  # under 0.17 compiling its fetch build runner too, which is minutes on a small
+  # CI machine; `runCommandLocal` forbids substituting it, so every job that
+  # wants the packages builds them again even when a cache already holds them.
+  runCommand name
   {
     nativeBuildInputs = [zig_0_17];
     passthru = {inherit pathDependencyPackages;};
@@ -284,9 +292,11 @@ in
     export -f unpack
 
     # Several at a time: `zig fetch` spends most of a package on one core.
+    # `-r` because otherwise xargs runs `unpack` once, with no arguments, when
+    # there are no packages at all, and the build fails.
     cores="''${NIX_BUILD_CORES:-0}"
     if [ "$cores" -le 0 ]; then cores="$(nproc)"; fi
-    xargs -P "$cores" -n 2 bash -c 'unpack "$@"' unpack <<'EOF'
+    xargs -r -P "$cores" -n 2 bash -c 'unpack "$@"' unpack <<'EOF'
     ${lib.concatStrings (lib.mapAttrsToList (hash: src: "${hash} ${src}\n") packages)}
     EOF
   ''

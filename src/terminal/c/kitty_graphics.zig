@@ -609,7 +609,9 @@ pub fn placement_render_info(
     return .success;
 }
 
-/// Compute viewport-relative position of a placement.
+/// Compute viewport-relative position of a placement, for the C API
+/// functions that inspect the storage. Drawing doesn't use this. The
+/// render state positions placements on its own.
 ///
 /// Converts the placement's internal pin to viewport-relative column
 /// and row coordinates by getting screen-absolute coordinates for
@@ -627,12 +629,11 @@ fn computeViewportPos(
     t: *Terminal,
 ) struct { col: i32, row: i32, visible: bool } {
     // Virtual placements use unicode placeholders and don't have a
-    // screen position — they are rendered inline by the text layout.
-    // Relative placements are anchored at the root of their parent
-    // chain, offset by the accumulated chain offsets. A chain rooted
-    // at a virtual placement has no resolvable position here: its
-    // origin is the parent's placeholder cells, which only a renderer
-    // scanning the screen can locate.
+    // screen position of their own. Relative placements are anchored at
+    // the root of their parent chain, offset by the accumulated chain
+    // offsets. A chain rooted at a virtual placement has no resolvable
+    // position here: its origin is the parent's placeholder cells, which
+    // the render state finds while it scans the captured rows.
     const origin: struct {
         pin: *const PageList.Pin,
         col_offset: i32 = 0,

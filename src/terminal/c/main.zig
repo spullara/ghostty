@@ -108,6 +108,11 @@ pub const render_state_row_cells_select = render.row_cells_select;
 pub const render_state_row_cells_get = render.row_cells_get;
 pub const render_state_row_cells_get_multi = render.row_cells_get_multi;
 pub const render_state_row_cells_free = render.row_cells_free;
+pub const render_state_image_iterator_new = render.image_iterator_new;
+pub const render_state_image_iterator_next = render.image_iterator_next;
+pub const render_state_image_iterator_free = render.image_iterator_free;
+pub const render_state_image_get = render.image_get;
+pub const render_state_image_get_multi = render.image_get_multi;
 
 pub const sgr_new = sgr.new;
 pub const sgr_free = sgr.free;
