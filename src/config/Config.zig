@@ -6239,7 +6239,7 @@ pub const RepeatableString = struct {
     /// Deep copy of the struct. Required by Config.
     pub fn clone(self: *const Self, alloc: Allocator) Allocator.Error!Self {
         // Copy the list and all the strings in the list.
-        var list = try std.ArrayListUnmanaged([:0]const u8).initCapacity(
+        var list = try std.ArrayList([:0]const u8).initCapacity(
             alloc,
             self.list.items.len,
         );
@@ -6481,6 +6481,21 @@ pub const SelectionWordChars = struct {
         try testing.expectEqual(@as(u21, 0), chars.codepoints[0]);
         try testing.expectEqual(@as(u21, '│'), chars.codepoints[1]);
         try testing.expectEqual(@as(u21, ';'), chars.codepoints[2]);
+    }
+
+    test "parseCLI truncated UTF-8" {
+        const testing = std.testing;
+        for ([_][]const u8{
+            "\xc2",
+            "\xe2",
+            "\xe2\x94",
+            "\xf0",
+            "\xf0\x9f",
+            "\xf0\x9f\x98",
+        }) |input| {
+            var chars: Self = .{};
+            try testing.expectError(error.InvalidValue, chars.parseCLI(testing.allocator, input));
+        }
     }
 };
 
@@ -8800,7 +8815,7 @@ pub const RepeatableLink = struct {
         // Note: we don't do any errdefers below since the allocation
         // is expected to be arena allocated.
 
-        var list = try std.ArrayListUnmanaged(inputpkg.Link).initCapacity(
+        var list = try std.ArrayList(inputpkg.Link).initCapacity(
             alloc,
             self.links.items.len,
         );
@@ -8915,8 +8930,8 @@ pub const SplitPreserveZoom = packed struct {
 pub const RepeatableCommand = struct {
     const Self = @This();
 
-    value: std.ArrayListUnmanaged(inputpkg.Command) = .empty,
-    value_c: std.ArrayListUnmanaged(inputpkg.Command.C) = .empty,
+    value: std.ArrayList(inputpkg.Command) = .empty,
+    value_c: std.ArrayList(inputpkg.Command.C) = .empty,
 
     /// ghostty_config_command_list_s
     pub const C = extern struct {
@@ -9000,7 +9015,7 @@ pub const RepeatableCommand = struct {
         // whose string pointers still reference the source config's
         // memory — the clone must stay valid after the source is
         // freed.
-        var value_c: std.ArrayListUnmanaged(inputpkg.Command.C) = .empty;
+        var value_c: std.ArrayList(inputpkg.Command.C) = .empty;
         try value_c.ensureTotalCapacityPrecise(alloc, value.items.len);
         for (value.items) |item| {
             value_c.appendAssumeCapacity(try item.cval(alloc));
