@@ -142,11 +142,14 @@ pub const Behaviors = extern struct {
 
 /// C: GhosttySelectionGestureData
 pub const Data = enum(c_int) {
-    click_count = 0,
-    dragged = 1,
-    autoscroll = 2,
-    behavior = 3,
-    anchor = 4,
+    invalid = 0,
+    click_count = 1,
+    dragged = 2,
+    autoscroll = 3,
+    behavior = 4,
+    anchor = 5,
+
+    _,
 
     pub fn OutType(comptime self: Data) type {
         return switch (self) {
@@ -155,6 +158,7 @@ pub const Data = enum(c_int) {
             .autoscroll => Autoscroll,
             .behavior => Behavior,
             .anchor => grid_ref.CGridRef,
+            .invalid, _ => void,
         };
     }
 };
@@ -170,16 +174,19 @@ pub const EventType = enum(c_int) {
 
 /// C: GhosttySelectionGestureEventOption
 pub const EventOption = enum(c_int) {
-    ref = 0,
-    position = 1,
-    repeat_distance = 2,
-    time_ns = 3,
-    repeat_interval_ns = 4,
-    word_boundary_codepoints = 5,
-    behaviors = 6,
-    rectangle = 7,
-    geometry = 8,
-    viewport = 9,
+    invalid = 0,
+    ref = 1,
+    position = 2,
+    repeat_distance = 3,
+    time_ns = 4,
+    repeat_interval_ns = 5,
+    word_boundary_codepoints = 6,
+    behaviors = 7,
+    rectangle = 8,
+    geometry = 9,
+    viewport = 10,
+
+    _,
 
     pub fn Type(comptime self: EventOption) type {
         return switch (self) {
@@ -193,6 +200,7 @@ pub const EventOption = enum(c_int) {
             .rectangle => bool,
             .geometry => Geometry,
             .viewport => point.Coordinate,
+            .invalid, _ => void,
         };
     }
 };
@@ -221,6 +229,10 @@ pub fn new(
     alloc_: ?*const CAllocator,
     out_gesture: ?*Gesture,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) {
+        if (out_gesture) |o| o.* = null;
+        return .unsupported;
+    }
     const out = out_gesture orelse return .invalid_value;
 
     const alloc = lib.alloc.default(alloc_);
@@ -238,10 +250,14 @@ pub fn new(
 pub fn event_new(
     alloc_: ?*const CAllocator,
     out_event: ?*Event,
-    event_type: EventType,
+    event_type_: lib.CEnum(EventType),
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) {
+        if (out_event) |o| o.* = null;
+        return .unsupported;
+    }
     const out = out_event orelse return .invalid_value;
-    _ = std.enums.fromInt(EventType, @backingInt(event_type)) orelse
+    const event_type = lib.enumFromC(EventType, event_type_) orelse
         return .invalid_value;
 
     const alloc = lib.alloc.default(alloc_);
@@ -262,6 +278,7 @@ pub fn free(
     gesture_: Gesture,
     terminal: terminal_c.Terminal,
 ) callconv(lib.calling_conv) void {
+    if (comptime !lib.feature(.selection)) return;
     const wrapper = gesture_ orelse return;
     if (terminal_c.zigTerminal(terminal)) |t| {
         wrapper.gesture.deinit(t);
@@ -271,6 +288,7 @@ pub fn free(
 }
 
 pub fn event_free(event_: Event) callconv(lib.calling_conv) void {
+    if (comptime !lib.feature(.selection)) return;
     const event = event_ orelse return;
     event.deinit();
     const alloc = event.alloc;
@@ -281,6 +299,7 @@ pub fn reset(
     gesture_: Gesture,
     terminal: terminal_c.Terminal,
 ) callconv(lib.calling_conv) void {
+    if (comptime !lib.feature(.selection)) return;
     const wrapper = gesture_ orelse return;
     const t = terminal_c.zigTerminal(terminal) orelse return;
     wrapper.gesture.reset(t);
@@ -292,6 +311,7 @@ pub fn handle_event(
     event_: Event,
     out_selection: ?*selection_c.CSelection,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const wrapper = gesture_ orelse return .invalid_value;
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const event_wrapper = event_ orelse return .invalid_value;
@@ -342,14 +362,10 @@ pub fn event_set(
     option: EventOption,
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(EventOption, @backingInt(option)) orelse {
-            log.warn("selection_gesture_event_set invalid option value={d}", .{@backingInt(option)});
-            return .invalid_value;
-        };
-    }
-
+    if (comptime !lib.feature(.selection)) return .unsupported;
     return switch (option) {
+        .invalid => .invalid_value,
+        _ => .unsupported,
         inline else => |comptime_option| eventSetTyped(
             event_,
             comptime_option,
@@ -364,15 +380,11 @@ pub fn get(
     data: Data,
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(Data, @backingInt(data)) orelse {
-            log.warn("selection_gesture_get invalid data value={d}", .{@backingInt(data)});
-            return .invalid_value;
-        };
-    }
-
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const out_ptr = out orelse return .invalid_value;
     return switch (data) {
+        .invalid => .invalid_value,
+        _ => .unsupported,
         inline else => |comptime_data| getTyped(
             gesture_,
             terminal,
@@ -390,6 +402,7 @@ pub fn get_multi(
     values: ?[*]?*anyopaque,
     out_written: ?*usize,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const k = keys orelse return .invalid_value;
     const v = values orelse return .invalid_value;
 
@@ -423,6 +436,7 @@ fn getTyped(
                 return .no_value;
             out.* = .fromPin(pin.*);
         },
+        .invalid, _ => comptime unreachable,
     }
 
     return .success;
@@ -471,6 +485,7 @@ fn pressSetTyped(
             .geometry,
             .viewport,
             => return .invalid_value,
+            .invalid, _ => comptime unreachable,
         }
         return .success;
     };
@@ -493,16 +508,18 @@ fn pressSetTyped(
             v,
         ),
         .behaviors => {
-            if (!validBehavior(v.single_click) or
-                !validBehavior(v.double_click) or
-                !validBehavior(v.triple_click)) return .invalid_value;
-            event.behaviors = .{ v.single_click, v.double_click, v.triple_click };
+            event.behaviors = .{
+                lib.enumFromPtr(Behavior, &v.single_click) orelse return .invalid_value,
+                lib.enumFromPtr(Behavior, &v.double_click) orelse return .invalid_value,
+                lib.enumFromPtr(Behavior, &v.triple_click) orelse return .invalid_value,
+            };
             press.behaviors = &event.behaviors;
         },
         .rectangle,
         .geometry,
         .viewport,
         => return .invalid_value,
+        .invalid, _ => comptime unreachable,
     }
 
     return .success;
@@ -532,6 +549,7 @@ fn releaseSetTyped(
         .geometry,
         .viewport,
         => return .invalid_value,
+        .invalid, _ => comptime unreachable,
     }
 
     return .success;
@@ -563,6 +581,7 @@ fn dragSetTyped(
             .repeat_interval_ns,
             .behaviors,
             => return .invalid_value,
+            .invalid, _ => comptime unreachable,
         }
         return .success;
     };
@@ -593,6 +612,7 @@ fn dragSetTyped(
         .repeat_interval_ns,
         .behaviors,
         => return .invalid_value,
+        .invalid, _ => comptime unreachable,
     }
 
     return .success;
@@ -624,6 +644,7 @@ fn autoscrollTickSetTyped(
             .repeat_interval_ns,
             .behaviors,
             => return .invalid_value,
+            .invalid, _ => comptime unreachable,
         }
         return .success;
     };
@@ -654,6 +675,7 @@ fn autoscrollTickSetTyped(
         .repeat_interval_ns,
         .behaviors,
         => return .invalid_value,
+        .invalid, _ => comptime unreachable,
     }
 
     return .success;
@@ -682,6 +704,7 @@ fn deepPressSetTyped(
             .geometry,
             .viewport,
             => return .invalid_value,
+            .invalid, _ => comptime unreachable,
         }
         return .success;
     };
@@ -703,6 +726,7 @@ fn deepPressSetTyped(
         .geometry,
         .viewport,
         => return .invalid_value,
+        .invalid, _ => comptime unreachable,
     }
 
     return .success;
@@ -740,11 +764,6 @@ fn clearWordBoundaryCodepoints(event: *EventWrapper, target: *[]const u21) void 
 
 fn instantFromNs(ns: u64) std.Io.Timestamp {
     return .fromNanoseconds(ns);
-}
-
-fn validBehavior(behavior: Behavior) bool {
-    _ = std.enums.fromInt(Behavior, @backingInt(behavior)) orelse return false;
-    return true;
 }
 
 test "selection gesture lifecycle and get" {
