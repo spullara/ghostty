@@ -64,11 +64,14 @@ pub fn build(b: *std.Build) !void {
 
         // Larger flag set for C file build within module
         const c_flags = c_flags: {
-            var len: usize = macro_flags.len + 1;
+            var len: usize = macro_flags.len + 2;
             if (windows) len += 2;
             var flag_builder: std.ArrayList([]const u8) = try .initCapacity(b.allocator, len);
 
             flag_builder.appendAssumeCapacity("-DWUFFS_IMPLEMENTATION");
+
+            // Only linked statically into libghostty-vt and the app: export nothing.
+            flag_builder.appendAssumeCapacity("-fvisibility=hidden");
 
             // Disable ubsan on Windows to avoid undefined __ubsan_handle_*
             // references: Zig's ubsan runtime can't be bundled on Windows
@@ -106,6 +109,15 @@ pub fn build(b: *std.Build) !void {
         test_module.addImport("wuffs_c", wuffs_c.mod);
     }
 
+    // The test images come from the pixels package. Only this package's own
+    // tests use them, and those only run when this package is built on its
+    // own:
+    //
+    //   cd pkg/wuffs && zig build test
+    //
+    // When another package depends on this one, as Ghostty does, we stop
+    // here, so pixels is never downloaded.
+    if (!b.isRoot()) return;
     if (b.lazyDependency("pixels", .{})) |pixels_dep| {
         inline for (.{ "000000", "FFFFFF" }) |color| {
             inline for (.{ "gif", "jpg", "png", "ppm" }) |extension| {

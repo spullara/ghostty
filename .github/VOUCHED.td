@@ -202,6 +202,7 @@ jcollie
 jesusvazquez
 jglanz
 jguthmiller
+jin-eden
 jmcgover
 jmr
 johnslavik
@@ -372,6 +373,7 @@ silveirapf
 simonbcn
 slowdub
 slsrepo
+sm010422
 stepankandrushin
 steven-tk
 sunshine-syz
