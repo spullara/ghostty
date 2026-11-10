@@ -204,6 +204,7 @@ jesusvazquez
 jglanz
 jguthmiller
 jin-eden
+-jischeng
 jmcgover
 jmr
 johnrichardrinehart
@@ -304,6 +305,7 @@ nmggithub
 noib3
 nolinmcfarland
 nouritsu
+nurpax
 nwehg
 ocean6954
 ollieatkinson
