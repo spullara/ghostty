@@ -235,6 +235,7 @@ konstantinhudyakov
 koranir
 korikhin
 kostich
+krios2146
 kristina8888
 kristofersoler
 kylesower
@@ -274,12 +275,14 @@ minorcell
 misairuzame
 mischief
 mistertea
+-misterwanted holy meat proxy
 mitchellh
 miupa
 mjbommar
 mlabbe
 mohshami
 molechowski
+montmejat
 moonmao42
 moonward
 -morgengeluk Appears to be using AI inappropriately even after it was requested they abide by the AI policy (there is clear evidence of the person-in-the-loop not attempting to clean up AI generated text, and their AI disclosure itself reads like AI-generated text and shows no signs of remorse or intent to improve).
