@@ -1223,7 +1223,7 @@ pub fn clone(
             const last = result.pages.last.?;
             const page = last.page();
             const row = &page.rows.ptr(page.memory)[last.rows() - 1];
-            page.clearCells(row, 0, result.cols);
+            page.clearCells(row, 0, page.size.cols, .{});
         }
 
         // Update our total rows to be our row size.
@@ -3007,7 +3007,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                         // If the cut splits a wide char, clear its head too.
                         const cells = row.cells.ptr(page.memory);
                         const start = if (cells[cols - 1].wide == .wide) cols - 1 else cols;
-                        page.clearCells(row, start, self.cols);
+                        page.clearCells(row, start, self.cols, .{});
                     }
 
                     page.size.cols = cols;
@@ -16014,6 +16014,35 @@ test "PageList clone less than active" {
 
     var s2 = try s.clone(alloc, .{
         .top = .{ .active = .{ .y = 5 } },
+    });
+    defer s2.deinit();
+    try testing.expectEqual(@as(usize, s.rows), s2.totalRows());
+}
+
+test "PageList clone less than active on a narrower page" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // The list has 4 columns, but its page has only 2. When the
+    // clone adds blank rows, it must clear only 2 columns per row.
+    var s: PageList = s: {
+        var builder = try Builder.init(alloc, .{
+            .cols = 4,
+            .rows = 3,
+        });
+        defer builder.deinit();
+
+        const page = try builder.allocatePage(.{
+            .cols = 2,
+            .rows = 3,
+        });
+        page.size.rows = 3;
+        break :s try builder.finish();
+    };
+    defer s.deinit();
+
+    var s2 = try s.clone(alloc, .{
+        .top = .{ .active = .{ .y = 2 } },
     });
     defer s2.deinit();
     try testing.expectEqual(@as(usize, s.rows), s2.totalRows());
