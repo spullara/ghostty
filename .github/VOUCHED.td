@@ -52,6 +52,7 @@ andrejdaskalov
 anhthang
 anmitalidev
 anthonyzhoon
+aohanhongzhi
 aprilnea
 arc-source-coder
 aredmondd
@@ -94,6 +95,7 @@ clemg
 clinta
 cmwetherell
 complexsplit
+craig-b
 crayxt
 craziestowl
 -creativision meatproxying
