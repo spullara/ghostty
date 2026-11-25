@@ -11,9 +11,12 @@ pub const post_fork = @import("gtk/post_fork.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("gtk/class/tab_color_dialog.zig");
     _ = @import("gtk/desktop_notifications.zig");
     _ = @import("gtk/ext.zig");
+    _ = @import("gtk/gsettings.zig");
     _ = @import("gtk/key.zig");
+    _ = @import("gtk/media.zig");
     _ = @import("gtk/portal.zig");
     _ = @import("gtk/scale.zig");
 }

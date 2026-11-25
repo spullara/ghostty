@@ -3,6 +3,7 @@ const assert = @import("../../quirks.zig").inlineAssert;
 
 const log = std.log.scoped(.gtk_media);
 
+const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
@@ -133,20 +134,62 @@ fn mediaFileError(
     });
 }
 
+/// Wait until GStreamer has set up `media_file`'s pipeline, as far as it
+/// will get. GTK's GStreamer backend releases the pipeline's source element
+/// on dispose without checking that it was ever created, which happens
+/// asynchronously after the MediaFile is. Disposing one before then logs
+/// "g_object_unref: assertion 'G_IS_OBJECT (object)' failed". A stream is
+/// only prepared, or given an error, once its source exists.
+///
+/// Ghostty keeps the bell's MediaFile long past this point, so only a test
+/// that creates and drops them back to back needs to wait.
+fn waitForPipeline(media_file: *gtk.MediaFile) void {
+    const stream = media_file.as(gtk.MediaStream);
+    const context = glib.MainContext.default();
+    // Give up after about five seconds. The worst that happens then is the
+    // critical message above.
+    for (0..1000) |_| {
+        if (stream.isPrepared() != 0 or stream.getError() != null) return;
+        while (context.iteration(0) != 0) {}
+        std.testing.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+}
+
 test "bellMediaFile reuses one MediaFile per path" {
     // Regression guard for the audio-bell thread leak: each bell must replay a
     // single cached MediaFile, not allocate a fresh GStreamer pipeline (which
     // leaked gstglcontext/gldisplay-event threads) per ring. We assert the
-    // reuse contract of bellMediaFile directly; this needs no display and no
-    // playback (MediaFile is lazy), only that the path comparison drives reuse.
+    // reuse contract of bellMediaFile directly; this needs no playback
+    // (MediaFile is lazy), only that the path comparison drives reuse.
     const testing = std.testing;
 
-    // The files need not exist: MediaFile only records the path until played.
-    const path_a: [:0]const u8 = "/tmp/ghostty-bell-test-a.oga";
-    const path_b: [:0]const u8 = "/tmp/ghostty-bell-test-b.oga";
+    // GtkMediaFile needs GTK initialized, which registers its media backends,
+    // and initializing GTK needs a display. initCheck only returns 0 the
+    // first time it fails to open a display, so we also check that there
+    // is a display.
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    if (gdk.Display.getDefault() == null) return error.SkipZigTest;
+    const io = testing.io;
+    const alloc = testing.allocator;
 
-    var current = bellMediaFile(null, path_a, false) orelse return error.SkipZigTest;
+    // fromFilename checks that the file is readable, so the files have to
+    // exist. They can be empty: MediaFile only records the path until played.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a.oga", "b.oga" }) |name| {
+        const file = try tmp.dir.createFile(io, name, .{});
+        file.close(io);
+    }
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(tmp_path);
+    const path_a = try std.fs.path.joinZ(alloc, &.{ tmp_path, "a.oga" });
+    defer alloc.free(path_a);
+    const path_b = try std.fs.path.joinZ(alloc, &.{ tmp_path, "b.oga" });
+    defer alloc.free(path_b);
+
+    var current = bellMediaFile(null, path_a, false).?;
     const first = current;
+    waitForPipeline(current);
     try testing.expect(isForPath(current, path_a));
 
     // Same path => identical object (the leak regression is rebuilding here).
@@ -154,9 +197,10 @@ test "bellMediaFile reuses one MediaFile per path" {
     try testing.expectEqual(first, current);
 
     // Changed path => rebuilt object targeting the new path (old one freed).
-    current = bellMediaFile(current, path_b, false) orelse return error.SkipZigTest;
+    current = bellMediaFile(current, path_b, false).?;
     try testing.expect(isForPath(current, path_b));
     try testing.expect(!isForPath(current, path_a));
 
+    waitForPipeline(current);
     current.unref();
 }
