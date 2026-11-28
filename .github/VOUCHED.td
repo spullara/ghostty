@@ -168,6 +168,7 @@ gagbo
 ghdtjdwn
 ghokun
 gmile
+goetzc
 gordonbondon
 -gotar No HITL
 gotenksin
@@ -253,6 +254,7 @@ liby
 linustalacko
 locriani
 lonsagisawa
+lordversa
 lotheac
 louisunlimited
 luisnquin
